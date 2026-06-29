@@ -185,6 +185,11 @@ cargo bench -p pagebox-wal --bench wal
 
 ## License
 
-Pagebox is free software, licensed under the **GNU Lesser General Public
-License** version 3 or later. See [`LICENSE.md`](./LICENSE.md) for the full
-text.
+Copyright Ryan Daum and contributors, 2026.
+
+Pagebox is free software: you can redistribute it and/or modify it under the
+terms of the **GNU Lesser General Public License** version 3 or (at your
+option) any later version, as published by the Free Software Foundation. See
+[`LICENSE.md`](./LICENSE.md) for the full text. This program is distributed in
+the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the
+implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
