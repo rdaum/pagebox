@@ -1,0 +1,12 @@
+# Rust build artifacts
+/target/
+
+# Cargo lockfile (library-first workspace)
+Cargo.lock
+
+# Example KV store runtime data
+/kvstore-data/
+/kvlog-data/
+
+# JetBrains IDE config
+.idea/

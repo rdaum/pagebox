@@ -1,0 +1,48 @@
+[package]
+name = "pagebox-storage"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[features]
+default = ["metrics"]
+metrics = ["dep:fast-telemetry"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(miri)', 'cfg(metrics)'] }
+
+[dependencies]
+pagebox-frame-kernel.workspace = true
+pagebox-hybrid-latch.workspace = true
+pagebox-swip-kernel.workspace = true
+pagebox-threading.workspace = true
+pagebox-wal.workspace = true
+crossbeam-queue.workspace = true
+fast-telemetry = { workspace = true, optional = true }
+libc.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+fast-telemetry.workspace = true
+criterion.workspace = true
+loom.workspace = true
+micromeasure.workspace = true
+paste.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+name = "microslottedpagebench"
+harness = false
+
+[[bench]]
+name = "microbufferpoolfaultbench"
+harness = false
+
+[[bench]]
+name = "microfreepageallocatorbench"
+harness = false
+
+[[bench]]
+name = "page_store"
+harness = false

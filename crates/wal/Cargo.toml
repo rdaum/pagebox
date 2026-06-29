@@ -1,0 +1,36 @@
+[package]
+name = "pagebox-wal"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[features]
+default = ["metrics"]
+metrics = ["dep:fast-telemetry"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(metrics)'] }
+
+[dependencies]
+pagebox-frame-kernel.workspace = true
+pagebox-threading.workspace = true
+crc-fast.workspace = true
+fast-telemetry = { workspace = true, optional = true }
+libc.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+fast-telemetry.workspace = true
+criterion.workspace = true
+micromeasure.workspace = true
+paste.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+name = "microwalbench"
+harness = false
+path = "benches/microwalbench.rs"
+
+[[bench]]
+name = "wal"
+harness = false

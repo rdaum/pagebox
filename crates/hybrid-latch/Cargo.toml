@@ -1,0 +1,25 @@
+[package]
+name = "pagebox-hybrid-latch"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[features]
+default = ["latch-metrics"]
+latch-metrics = ["dep:fast-telemetry"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(latch_metrics)'] }
+
+[dependencies]
+fast-telemetry = { workspace = true, optional = true }
+parking_lot.workspace = true
+
+[dev-dependencies]
+loom.workspace = true
+micromeasure.workspace = true
+
+[[bench]]
+name = "latchbench"
+harness = false
+path = "benches/latchbench.rs"
