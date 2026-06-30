@@ -1806,8 +1806,23 @@ fn decode_internal(mut reader: BodyReader<'_>, fence: Fence) -> Result<NodePage,
         // to the page ID via the frame header. Evicted SWIPs decode directly.
         let child_pid = match BufferFrameRef::from_hot_swip(swip) {
             Some(frame) => frame.pid(),
-            None => swip.as_page_id(),
+            None => {
+                if swip.is_evicted() {
+                    swip.as_page_id()
+                } else {
+                    0
+                }
+            }
         };
+        if child_pid > 0xFFFF_FFFF {
+            eprintln!(
+                "decode_internal: garbage child_pid=0x{child_pid:016x} swip_raw=0x{:016x}",
+                swip.raw(),
+            );
+            return Err(CowBeTreeError::CorruptPage(
+                "internal child pid is garbage",
+            ));
+        }
         children.push(child_pid);
     }
 

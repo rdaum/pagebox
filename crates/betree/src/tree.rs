@@ -9,8 +9,7 @@ use crate::metrics_stub::MetricVisitor;
 use fast_telemetry::MetricVisitor;
 use pagebox_hybrid_latch::HybridLatch;
 use pagebox_storage::buffer_frame::{
-    BufferFrame, BufferFrameRef, Lsn, PAGE_SIZE, PageWritebackPreparer, ParentFinder,
-    StableSwipRef, page_size,
+    BufferFrameRef, Lsn, PAGE_SIZE, PageWritebackPreparer, ParentFinder, StableSwipRef, page_size,
 };
 use pagebox_storage::buffer_pool::{BufferPool, BufferPoolHandle, ExclusiveFrame, PinnedFrame};
 use pagebox_storage::page_header::{self, PageType};
@@ -286,7 +285,18 @@ impl CowBeTree {
     }
 
     pub fn root_page_id(&self) -> u64 {
-        swip_page_id(self.root.load(Ordering::Acquire))
+        let swip = self.root.load(Ordering::Acquire);
+        let pid = swip_page_id(swip);
+        if pid > 0xFFFF_FFFF {
+            panic!(
+                "root_page_id: GARBAGE pid=0x{pid:016x} swip_raw=0x{:016x} is_hot={} is_cool={} is_evicted={}",
+                swip.raw(),
+                swip.is_hot(),
+                swip.is_cool(),
+                swip.is_evicted(),
+            );
+        }
+        pid
     }
 
     /// Return every page currently reachable from the tree root.
@@ -395,12 +405,15 @@ impl CowBeTree {
                     return self.try_append_leaf_into_exclusive(&mut leaf, key, value, commit_ts);
                 }
                 Ok(Some((child_swip, child_slot))) => {
-                    let child_pid = swip_page_id(child_swip);
                     if child_swip.is_evicted() {
+                        let child_pid = child_swip.as_page_id();
                         self.swizzle_child_in_parent(root_pid, child_pid, child_slot);
                     }
 
-                    let child = unsafe { self.pool().fix_orphan_frame(child_pid) };
+                    let child = self.fix_child(child_swip);
+                    if opt.validate().is_err() {
+                        continue;
+                    }
                     let child_opt = match child.optimistic() {
                         Ok(o) => o,
                         Err(_) => continue,
@@ -420,7 +433,7 @@ impl CowBeTree {
                                 .try_append_leaf_into_exclusive(&mut leaf, key, value, commit_ts);
                         }
                         Ok(Some(_)) => {
-                            if self.try_append_buffer_kv(child_pid, key, value, commit_ts)? {
+                            if self.try_append_buffer_kv(child_opt.pid(), key, value, commit_ts)? {
                                 return Ok(true);
                             }
                         }
@@ -2606,10 +2619,28 @@ impl CowBeTree {
     /// which is follow-up work tracked alongside optimistic reads.
     fn fix_child(&self, swip: Swip) -> PinnedFrame<'_> {
         if swip.is_hot() || swip.is_cool() {
-            unsafe { self.pool().pin_child(swip) }
-                .expect("hot/cool child swip must pin while parent edge is stable")
+            match unsafe { self.pool().pin_child(swip) } {
+                Some(p) => p,
+                None => {
+                    let pid = swip_page_id(swip);
+                    if pid == 0 || pid > 0xFFFF_FFFF {
+                        panic!(
+                            "fix_child: Hot/Cool swip pin failed, pid=0x{pid:016x} swip_raw=0x{:016x}",
+                            swip.raw(),
+                        );
+                    }
+                    unsafe { self.pool().fix_orphan_frame(pid) }
+                }
+            }
         } else {
-            unsafe { self.pool().fix_orphan_frame(swip.as_page_id()) }
+            let pid = swip.as_page_id();
+            if pid > 0xFFFF_FFFF {
+                panic!(
+                    "fix_child: Evicted swip has garbage pid=0x{pid:016x} swip_raw=0x{:016x}",
+                    swip.raw(),
+                );
+            }
+            unsafe { self.pool().fix_orphan_frame(pid) }
         }
     }
 
@@ -2869,10 +2900,12 @@ fn range_contains(key: &[u8], lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> bool 
 }
 
 fn swip_page_id(swip: Swip) -> u64 {
-    if swip.is_hot() || swip.is_cool() {
-        unsafe { (*swip.as_ptr::<BufferFrame>()).header.core.pid }
-    } else {
+    if swip.is_evicted() {
         swip.as_page_id()
+    } else {
+        BufferFrameRef::from_hot_swip(swip)
+            .map(|f| f.pid())
+            .unwrap_or(0)
     }
 }
 fn largest_child_batch(

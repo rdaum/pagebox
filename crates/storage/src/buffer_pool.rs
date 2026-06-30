@@ -430,8 +430,13 @@ fn is_no_steal_page(page: &[u8]) -> bool {
 }
 
 fn is_stable_index_root(page: &[u8], parent_link: ParentLink) -> bool {
-    matches!(parent_link, ParentLink::Stable(_))
-        && page_header::read_page_type(page) == PageType::Index
+    if !matches!(parent_link, ParentLink::Stable(_)) {
+        return false;
+    }
+    matches!(
+        page_header::read_page_type(page),
+        PageType::Index | PageType::BeTreeInternal | PageType::BeTreeLeaf
+    )
 }
 
 #[cfg(not(miri))]
@@ -3387,8 +3392,16 @@ impl BufferPool {
             let loading = LoadingFrameReservation::new(self, bf);
 
             let read_start = Instant::now();
-            let found = unsafe { self.page_store.read_page(page_id, (*bf).page_bytes_mut()) }
-                .expect("page store read failed");
+            let found = match unsafe { self.page_store.read_page(page_id, (*bf).page_bytes_mut()) }
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!(
+                        "fix_swip_raw: read_page failed for page_id={page_id} (0x{page_id:016x}) err={e:?}",
+                    );
+                    panic!("page store read failed for page_id={page_id} (fix_swip_raw)");
+                }
+            };
             self.record_fix_swip_sync_load(unsafe { (*bf).page_bytes() }, read_start.elapsed());
             assert!(found, "page {page_id} not found in store");
 
@@ -3583,8 +3596,16 @@ impl BufferPool {
             };
 
             let read_start = Instant::now();
-            let found = unsafe { self.page_store.read_page(page_id, (*bf).page_bytes_mut()) }
-                .expect("page store read failed");
+            let found = match unsafe { self.page_store.read_page(page_id, (*bf).page_bytes_mut()) }
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!(
+                        "fix_orphan_raw: read_page failed for page_id={page_id} (0x{page_id:016x}) err={e:?}",
+                    );
+                    panic!("page store read failed for page_id={page_id} (fix_orphan_raw)");
+                }
+            };
             self.record_fix_orphan_sync_load(unsafe { (*bf).page_bytes() }, read_start.elapsed());
             assert!(found, "page {page_id} not found in store");
 
@@ -3702,8 +3723,15 @@ impl BufferPool {
         };
 
         let read_start = Instant::now();
-        let found = unsafe { self.page_store.read_page(page_id, (*bf).page_bytes_mut()) }
-            .expect("page store read failed");
+        let found = match unsafe { self.page_store.read_page(page_id, (*bf).page_bytes_mut()) } {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!(
+                    "fix_orphan_raw: read_page failed for page_id={page_id} (0x{page_id:016x}) err={e:?}",
+                );
+                panic!("page store read failed for page_id={page_id}");
+            }
+        };
         self.record_fix_orphan_sync_load(unsafe { (*bf).page_bytes() }, read_start.elapsed());
         if !found {
             return None;
