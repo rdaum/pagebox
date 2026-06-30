@@ -405,12 +405,14 @@ impl CowBeTree {
                     return self.try_append_leaf_into_exclusive(&mut leaf, key, value, commit_ts);
                 }
                 Ok(Some((child_swip, _child_slot))) => {
+                    let root_pid = opt.pid();
+                    drop(opt);
+                    if self.try_append_buffer_kv(root_pid, key, value, commit_ts)? {
+                        return Ok(true);
+                    }
                     let Some(child) = self.fix_child_opt(child_swip) else {
                         continue;
                     };
-                    if opt.validate().is_err() {
-                        continue;
-                    }
                     let child_opt = match child.optimistic() {
                         Ok(o) => o,
                         Err(_) => continue,
