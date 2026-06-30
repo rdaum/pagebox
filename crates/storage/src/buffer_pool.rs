@@ -112,7 +112,7 @@ use crate::buffer_frame::PAGE_SIZE;
 use crate::buffer_frame::{
     BufferFrame, BufferFrameReadRef, BufferFrameRef, BufferFrameWriteRef, FrameState, PageClass,
     PageReclaimer, PageWritebackPreparer, ParentFinder, ParentLink, StableSwipRef, decode_page_id,
-    page_slot_index, physical_page_number,
+    physical_page_number,
 };
 use crate::buffer_frame::{Lsn, PageId};
 use crate::free_page_allocator::{FreeExtent, FreePageAllocator};
@@ -1307,19 +1307,13 @@ fn prefetch_worker_loop(
                 pool.record_simple_prefetch_queue_wait(req.enqueued_at.elapsed());
                 let service_start = Instant::now();
                 let class = BufferPool::page_class(req.pid);
-                let bf = if class == PageClass::Size4K {
-                    // For Size4K: use page_table to check if already resident,
-                    // otherwise pop from FreeList.
-                    if let Some(existing) = pool.page_table.lookup(req.pid) {
-                        existing
-                    } else {
-                        match pool.class_state(class).free_list.try_pop() {
-                            Some(bf) => bf,
-                            None => continue,
-                        }
-                    }
+                let bf = if let Some(existing) = pool.page_table.lookup(req.pid) {
+                    existing
                 } else {
-                    pool.slot(req.pid)
+                    match pool.class_state(class).free_list.try_pop() {
+                        Some(bf) => bf,
+                        None => continue,
+                    }
                 };
                 let Some(_inflight) = PrefetchInflightGuard::claim_if_present(&pool, req.pid)
                 else {
@@ -2163,15 +2157,8 @@ impl BufferPool {
     }
 
     fn allocated_slots(&self, class: PageClass) -> usize {
-        if class == PageClass::Size4K {
-            // Size4K frames are pre-constructed and FreeList-managed.
-            // The scan range is the arena length (= resident budget).
-            self.arena(class).len
-        } else {
-            self.class_state(class)
-                .allocated_slots
-                .load(Ordering::Acquire)
-        }
+        // All classes are pre-constructed; scan the full arena.
+        self.arena(class).len
     }
 
     fn page_class(page_id: PageId) -> PageClass {
@@ -2710,20 +2697,6 @@ impl BufferPool {
         Some(unsafe { PinnedFrame::new(self, bf) })
     }
 
-    fn slot(&self, page_id: u64) -> *mut BufferFrame {
-        let (class, idx) =
-            page_slot_index(page_id).unwrap_or_else(|| panic!("invalid encoded page id {page_id}"));
-        let arena = self.arena(class);
-        assert!(
-            idx < arena.len,
-            "page id {} exceeds {:?} arena capacity {}",
-            page_id,
-            class,
-            arena.len
-        );
-        self.ensure_slot_initialized(class, idx)
-    }
-
     fn raw_frame(&self, class: PageClass, idx: usize) -> *mut BufferFrame {
         let arena = self.arena(class);
         debug_assert!(idx < arena.len);
@@ -2731,29 +2704,9 @@ impl BufferPool {
     }
 
     fn is_slot_initialized(&self, class: PageClass, idx: usize) -> bool {
-        self.class_state(class).slot_init[idx].load(Ordering::Acquire) == 2
-    }
-
-    fn ensure_slot_initialized(&self, class: PageClass, idx: usize) -> *mut BufferFrame {
-        let init = &self.class_state(class).slot_init[idx];
-        let bf = self.raw_frame(class, idx);
-        loop {
-            match init.load(Ordering::Acquire) {
-                2 => return bf,
-                0 => {
-                    if init
-                        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
-                        unsafe { std::ptr::write(bf, BufferFrame::new()) };
-                        init.store(2, Ordering::Release);
-                        return bf;
-                    }
-                }
-                1 => std::hint::spin_loop(),
-                other => panic!("invalid slot init state {other}"),
-            }
-        }
+        // All frames are pre-constructed at init; every slot is initialized.
+        let _ = (class, idx);
+        true
     }
 
     fn try_reserve_resident_budget(&self, class: PageClass) -> bool {
@@ -2839,14 +2792,34 @@ impl BufferPool {
         }
     }
 
+    /// Pop a free frame from the FreeList. If empty, evicts to replenish.
+    /// Panics if all frames are pinned (pool exhausted).
+    fn pop_free_frame(&self, class: PageClass) -> *mut BufferFrame {
+        let mut idle = 0u32;
+        loop {
+            if let Some(bf) = self.class_state(class).free_list.try_pop() {
+                return bf;
+            }
+            if self.try_evict_any_policy(16) > 0 || self.try_evict_any_batch(16) > 0 {
+                idle = 0;
+            } else {
+                idle += 1;
+            }
+            if idle >= 100 {
+                self.panic_pool_exhausted(class);
+            }
+            if idle >= 16
+                && let Ok(flushed) = self.try_flush_dirty_batch(64)
+                && flushed > 0
+            {
+                idle = 0;
+            }
+        }
+    }
+
     unsafe fn try_fix_resident_page(&self, page_id: u64) -> Option<*mut BufferFrame> {
         let _pin_guard = self.try_lock_hot_pin()?;
-        let class = Self::page_class(page_id);
-        let bf = if class == PageClass::Size4K {
-            self.page_table.lookup(page_id)?
-        } else {
-            self.slot(page_id)
-        };
+        let bf = self.page_table.lookup(page_id)?;
         let state = unsafe { (*bf).header.core.state.load(Ordering::Acquire) };
         if state != FrameState::Resident {
             return None;
@@ -2947,26 +2920,16 @@ impl BufferPool {
         page_store: Box<dyn PageStore>,
         start_pid: PageId,
     ) -> Self {
-        #[cfg(not(miri))]
-        let slot_capacity = ((start_pid as usize) + 1)
-            .max(num_frames.saturating_mul(16))
-            .max(262_144);
-        #[cfg(miri)]
-        let slot_capacity = num_frames.max((start_pid as usize) + 1);
         let num_shards = num_cpus().max(1);
-        let base_allocated_slots = start_pid.saturating_sub(1) as usize;
         let classes = PageClass::ALL
             .iter()
             .map(|&class| {
-                // Size4K: size arena to exactly the resident budget. All
-                // frames are pre-constructed and seeded into the FreeList,
-                // eliminating slot-based addressing and MADV_DONTNEED.
-                let cap = if class == PageClass::Size4K {
-                    num_frames
-                } else {
-                    slot_capacity
-                };
-                ClassState::new(class, cap, base_allocated_slots, num_frames)
+                // Size each class arena to fit `num_frames` base pages of
+                // budget. A Size4K frame holds 1 base page, a Size64K
+                // frame holds 16, etc. This keeps the byte budget
+                // proportional across classes.
+                let frame_count = num_frames / class.base_page_count().max(1);
+                ClassState::new(class, frame_count.max(1), 0, num_frames)
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -3002,11 +2965,11 @@ impl BufferPool {
             page_provider: std::sync::Mutex::new(page_provider::PageProviderHandle::new()),
         };
 
-        // Pre-construct Size4K frames and seed the FreeList. This replaces
-        // the lazy `ensure_slot_initialized` / `slot()` mechanism: frames
-        // are recycled via the FreeList rather than addressed by page ID.
-        {
-            let cs = pool.class_state(PageClass::Size4K);
+        // Pre-construct frames for all classes and seed their FreeLists.
+        // This replaces the lazy slot-init mechanism: frames are recycled
+        // via the FreeList rather than addressed by page ID.
+        for &class in &PageClass::ALL {
+            let cs = pool.class_state(class);
             let arena = &cs.arena;
             for idx in 0..arena.len {
                 let bf = unsafe {
@@ -3142,6 +3105,7 @@ impl BufferPool {
         self.prefetch_inflight.lock().contains(&pid)
     }
 
+    #[allow(dead_code)]
     fn prefetch_inflight_take(&self, pid: PageId) -> bool {
         self.prefetch_inflight.lock().remove(&pid)
     }
@@ -3349,34 +3313,8 @@ impl BufferPool {
     pub fn allocate_and_fix_class(&self, class: PageClass) -> (u64, PinnedFrame<'_>) {
         let pid = self.allocate_page_id(class);
 
-        // For Size4K: pop a frame from the FreeList (decoupled from PID).
-        // For other classes: use slot-based addressing (lazy init).
-        let bf = if class == PageClass::Size4K {
-            let mut idle = 0u32;
-            loop {
-                if let Some(bf) = self.class_state(class).free_list.try_pop() {
-                    break bf;
-                }
-                if self.try_evict_any_policy(16) > 0 || self.try_evict_any_batch(16) > 0 {
-                    idle = 0;
-                } else {
-                    idle += 1;
-                }
-                if idle >= 100 {
-                    self.panic_pool_exhausted(class);
-                }
-                if idle >= 16
-                    && let Ok(flushed) = self.try_flush_dirty_batch(64)
-                    && flushed > 0
-                {
-                    idle = 0;
-                }
-            }
-        } else {
-            let bf = self.slot(pid);
-            self.reserve_resident_budget(class);
-            bf
-        };
+        self.reserve_resident_budget(class);
+        let bf = self.pop_free_frame(class);
         let _guard = unsafe { self.lock_frame_exclusive_at(bf, pid) };
 
         unsafe {
@@ -3503,40 +3441,14 @@ impl BufferPool {
                 swip,
             );
 
-            // For Size4K: use FreeList + page_table instead of slot(pid).
-            // For other classes: keep slot-based addressing.
-            let bf: *mut BufferFrame = if class == PageClass::Size4K {
+            let bf: *mut BufferFrame = {
                 // Check page_table: maybe another thread already loaded
                 // this page (via fix_raw or fix_orphan_raw).
                 if let Some(existing_bf) = self.page_table.lookup(page_id) {
                     existing_bf
                 } else {
-                    // Pop from FreeList. If empty, evict to replenish.
-                    let mut idle = 0u32;
-                    loop {
-                        if let Some(bf) = self.class_state(class).free_list.try_pop() {
-                            break bf;
-                        }
-                        if self.try_evict_any_policy(16) > 0 || self.try_evict_any_batch(16) > 0 {
-                            idle = 0;
-                        } else {
-                            idle += 1;
-                        }
-                        if idle >= 100 {
-                            // All frames are pinned or loading — no eviction
-                            // possible.
-                            self.panic_pool_exhausted(class);
-                        }
-                        if idle >= 16
-                            && let Ok(flushed) = self.try_flush_dirty_batch(64)
-                            && flushed > 0
-                        {
-                            idle = 0;
-                        }
-                    }
+                    self.pop_free_frame(class)
                 }
-            } else {
-                self.slot(page_id)
             };
             let _guard = unsafe { self.lock_frame_exclusive_at(bf, page_id) };
             let state = unsafe { (*bf).header.core.state.load(Ordering::Acquire) };
@@ -3556,9 +3468,9 @@ impl BufferPool {
                 continue;
             }
 
-            // For Size4K: register in page_table before loading (dedup for
-            // orphan fixes). If another thread won the race, try again.
-            if class == PageClass::Size4K && !self.page_table.try_insert(page_id, bf) {
+            // Register in page_table before loading (dedup for orphan
+            // fixes). If another thread won the race, try again.
+            if !self.page_table.try_insert(page_id, bf) {
                 // Another thread is loading this page. Release our frame
                 // and budget, then retry.
                 drop(_guard);
@@ -3639,58 +3551,14 @@ impl BufferPool {
 
         let class = Self::page_class(page_id);
         loop {
-            // For Size4K: use page_table + FreeList instead of slot addressing.
-            // The prefetch_inflight mechanism is not needed — page_table.try_insert
-            // provides the dedup that prefetch_inflight + slot Loading provided.
-            let (bf, popped_from_free_list) = if class == PageClass::Size4K {
+            // Use page_table + FreeList for all classes.
+            let (bf, popped_from_free_list) =
                 if let Some(existing) = self.page_table.lookup(page_id) {
                     (existing, false)
                 } else {
-                    // Pop from FreeList. If empty, evict to replenish.
-                    let bf = {
-                        let mut idle = 0u32;
-                        loop {
-                            if let Some(bf) = self.class_state(class).free_list.try_pop() {
-                                break bf;
-                            }
-                            if self.try_evict_any_policy(16) > 0 || self.try_evict_any_batch(16) > 0
-                            {
-                                idle = 0;
-                            } else {
-                                idle += 1;
-                            }
-                            if idle >= 100 {
-                                self.panic_pool_exhausted(class);
-                            }
-                            if idle >= 16
-                                && let Ok(flushed) = self.try_flush_dirty_batch(64)
-                                && flushed > 0
-                            {
-                                idle = 0;
-                            }
-                        }
-                    };
+                    let bf = self.pop_free_frame(class);
                     (bf, true)
-                }
-            } else {
-                // Non-Size4K: keep slot-based addressing with prefetch check.
-                if self.prefetch_inflight_contains(page_id) {
-                    let bf = self.slot(page_id);
-                    let state = unsafe { (*bf).header.core.state.load(Ordering::Acquire) };
-                    if state == FrameState::Free && self.prefetch_inflight_take(page_id) {
-                        self.metrics.simple_prefetch_demand_steals.inc();
-                        continue;
-                    }
-                    loop {
-                        let state = unsafe { (*bf).header.core.state.load(Ordering::Acquire) };
-                        if state != FrameState::Loading {
-                            break;
-                        }
-                        std::hint::spin_loop();
-                    }
-                }
-                (self.slot(page_id), false)
-            };
+                };
 
             let state = unsafe { (*bf).header.core.state.load(Ordering::Acquire) };
             if state == FrameState::Loading {
@@ -3784,10 +3652,10 @@ impl BufferPool {
                     return FixOrphanAction::YieldRetry;
                 }
 
-                // For Size4K: register in page_table before loading (dedup
-                // for concurrent orphan fixes). If another thread won the
+                // Register in page_table before loading (dedup for
+                // concurrent orphan fixes). If another thread won the
                 // race, retry with a fresh frame.
-                if class == PageClass::Size4K && !self.page_table.try_insert(page_id, bf) {
+                if !self.page_table.try_insert(page_id, bf) {
                     return FixOrphanAction::Retry;
                 }
 
@@ -3863,16 +3731,11 @@ impl BufferPool {
     /// `page_id` must refer to a valid allocated page.
     unsafe fn try_fix_orphan_raw(&self, page_id: u64) -> Option<*mut BufferFrame> {
         let class = Self::page_class(page_id);
-        // For Size4K: use page_table + FreeList instead of slot addressing.
-        let (bf, popped_from_free_list) = if class == PageClass::Size4K {
-            if let Some(existing) = self.page_table.lookup(page_id) {
-                (existing, false)
-            } else {
-                let bf = self.class_state(class).free_list.try_pop()?;
-                (bf, true)
-            }
+        let (bf, popped_from_free_list) = if let Some(existing) = self.page_table.lookup(page_id) {
+            (existing, false)
         } else {
-            (self.slot(page_id), false)
+            let bf = self.class_state(class).free_list.try_pop()?;
+            (bf, true)
         };
         let mut state = unsafe { (*bf).header.core.state.load(Ordering::Acquire) };
         if state == FrameState::Loading {
@@ -3946,7 +3809,7 @@ impl BufferPool {
                 }
                 return None;
             }
-            // For Size4K: register in page_table before loading.
+            // Register in page_table before loading.
             if popped_from_free_list && !self.page_table.try_insert(page_id, bf) {
                 return None;
             }
@@ -5054,22 +4917,11 @@ impl BufferPool {
         slot_index: u16,
         is_upper: bool,
     ) -> Option<bool> {
-        // For Size4K: use page_table to check if parent is resident.
-        let parent_class = Self::page_class(parent_pid);
-        if parent_class == PageClass::Size4K {
-            // If the parent is not in the page_table, it was evicted —
-            // no parent to unswizzle, so succeed.
-            let parent_bf = self.page_table.lookup(parent_pid)?;
-            let parent_state = unsafe { (*parent_bf).header.core.state.load(Ordering::Acquire) };
-            if parent_state == FrameState::Free {
-                return Some(true);
-            }
-        } else {
-            let parent_bf = self.slot(parent_pid);
-            let parent_state = unsafe { (*parent_bf).header.core.state.load(Ordering::Acquire) };
-            if parent_state == FrameState::Free {
-                return Some(true);
-            }
+        // Use page_table to check if parent is resident.
+        let parent_bf = self.page_table.lookup(parent_pid)?;
+        let parent_state = unsafe { (*parent_bf).header.core.state.load(Ordering::Acquire) };
+        if parent_state == FrameState::Free {
+            return Some(true);
         }
 
         let parent_bf = unsafe { self.try_fix_resident_page(parent_pid) }?;
@@ -5998,10 +5850,6 @@ mod tests {
         let swips: Vec<AtomicSwip> = (0..100).map(|_| pool.allocate_page()).collect();
 
         assert_eq!(pool.num_frames(), 4);
-        assert!(
-            pool.num_slots() > swips.len(),
-            "slot arena should exceed logical page count in this test"
-        );
 
         for swip in &swips {
             let mut bf = unsafe { pool.fix_frame(swip) }.exclusive();
