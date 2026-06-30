@@ -792,7 +792,6 @@ impl CowBeTree {
         message: BufferedMessage,
         dirty_lsn: Option<Lsn>,
     ) -> Result<(), CowBeTreeError> {
-        let _write_guard = self.write_latch.lock_exclusive();
         let root_pid = self.ensure_root_mutable(dirty_lsn)?;
         if self.try_append_leaf_message(root_pid, &message, dirty_lsn)? {
             return Ok(());
@@ -805,6 +804,7 @@ impl CowBeTree {
             return self.install_root_rewrite(root_pid, rewrite, dirty_lsn);
         }
 
+        let root_pid = self.ensure_root_mutable(dirty_lsn)?;
         let root = self.load_orphan(root_pid)?;
         let rewrite = match root {
             NodePage::Leaf { fence, entries } => {
@@ -854,7 +854,7 @@ impl CowBeTree {
         message: &BufferedMessage,
         dirty_lsn: Option<Lsn>,
     ) -> Result<Option<Rewrite>, CowBeTreeError> {
-        let src_frame = unsafe { self.pool().fix_orphan_frame(root_pid) }.shared();
+        let src_frame = unsafe { self.pool().fix_orphan_frame(root_pid) }.exclusive();
         let src = src_frame.page_bytes();
 
         let reader = match LeafPageReader::new(src) {
