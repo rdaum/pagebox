@@ -17,9 +17,10 @@ use crate::message::{
 };
 use crate::page::{
     CowBeTreeError, Fence, LeafEntry, LookupStep, NodePage, PageKindDebug, RawVisibleVersion,
-    append_internal_buffer_message, append_leaf_entry_message, append_leaf_entry_prefix,
-    apply_message_to_entries, buffer_encoded_len, decode_page, encode_internal_page,
-    encode_leaf_page, encoded_page_len, lookup_step, lower_bound_entries, route_child,
+    append_internal_buffer_kv, append_internal_buffer_message, append_leaf_entry_message,
+    append_leaf_entry_prefix, append_leaf_kv, apply_message_to_entries, buffer_encoded_len,
+    decode_page, encode_internal_page, encode_leaf_page, encoded_page_len, lookup_step,
+    lower_bound_entries, route_child,
 };
 use crate::stats::{CowBeTreeEvent, CowBeTreeStats};
 
@@ -333,7 +334,98 @@ impl CowBeTree {
         commit_ts: Timestamp,
         value: &[u8],
     ) -> Result<(), CowBeTreeError> {
-        self.write_message(BufferedMessage::put(key, commit_ts, value), None)
+        {
+            let _structural_guard = self.write_latch.lock_shared();
+            if self.try_put_page_local(key, commit_ts, value)? {
+                return Ok(());
+            }
+        }
+        let message = BufferedMessage::put(key, commit_ts, value);
+        self.write_message_structural(message, None)
+    }
+
+    fn try_put_page_local(
+        &self,
+        key: &[u8],
+        commit_ts: Timestamp,
+        value: &[u8],
+    ) -> Result<bool, CowBeTreeError> {
+        if self.forks.active_roots.load(Ordering::Acquire) > 1 {
+            return Ok(false);
+        }
+
+        let mut page_id = self.root_page_id();
+        loop {
+            match self.write_route_step(page_id, key)? {
+                WriteRouteStep::Leaf => {
+                    return self.try_append_leaf_kv_page_local(page_id, key, value, commit_ts);
+                }
+                WriteRouteStep::Internal { child_page_id } => {
+                    page_id = child_page_id;
+                    match self.write_route_step(page_id, key)? {
+                        WriteRouteStep::Leaf => {
+                            return self
+                                .try_append_leaf_kv_page_local(page_id, key, value, commit_ts);
+                        }
+                        WriteRouteStep::Internal { .. } => {
+                            if self.try_append_buffer_kv(page_id, key, value, commit_ts)? {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn try_append_leaf_kv_page_local(
+        &self,
+        page_id: u64,
+        key: &[u8],
+        value: &[u8],
+        commit_ts: Timestamp,
+    ) -> Result<bool, CowBeTreeError> {
+        let mut frame = unsafe { self.pool().fix_orphan_frame(page_id) }.exclusive();
+        if let Some(appended) = append_leaf_kv(
+            frame.page_bytes_mut(),
+            key,
+            value,
+            commit_ts,
+            self.config.max_leaf_entries,
+        )? {
+            mark_frame_dirty(&frame, None);
+            self.append_hint.store(page_id, Ordering::Release);
+            self.stats
+                .add(CowBeTreeEvent::RawLeafAppends, appended.message_count);
+            self.stats.inc(CowBeTreeEvent::RawLeafAppendBatches);
+            return Ok(true);
+        }
+
+        let mut node = decode_page(frame.page_bytes())?;
+        let NodePage::Leaf { fence, entries } = &mut node else {
+            return Ok(false);
+        };
+        let pos = lower_bound_entries(entries, key);
+        if entries.get(pos).is_none_or(|entry| entry.key != key) {
+            return Ok(false);
+        }
+
+        let message = BufferedMessage::put(key, commit_ts, value);
+        apply_message_to_entries(entries, &message);
+        if self.leaf_should_split(page_id, fence, entries) {
+            return Ok(false);
+        }
+
+        let mut image = vec![0u8; PAGE_SIZE];
+        let bytes = encode_leaf_page(&mut image, fence, entries)?;
+        let page_image_bytes = image.len();
+        frame.page_bytes_mut().copy_from_slice(&image);
+        mark_frame_dirty(&frame, None);
+        self.stats.inc(CowBeTreeEvent::InPlacePageRewrites);
+        self.stats.add_leaf_bytes(bytes);
+        self.stats
+            .add_leaf_page_image_rewrite_bytes(page_image_bytes);
+        Ok(true)
     }
 
     pub fn remove(&self, key: &[u8]) -> Result<bool, CowBeTreeError> {
@@ -1915,6 +2007,32 @@ impl CowBeTree {
         if root_append {
             self.stats.inc(CowBeTreeEvent::RootBufferAppends);
         }
+        self.stats.inc(CowBeTreeEvent::RawBufferAppends);
+        Ok(true)
+    }
+
+    fn try_append_buffer_kv(
+        &self,
+        page_id: u64,
+        key: &[u8],
+        value: &[u8],
+        commit_ts: Timestamp,
+    ) -> Result<bool, CowBeTreeError> {
+        let mut frame = unsafe { self.pool().fix_orphan_frame(page_id) }.exclusive();
+        let appended = append_internal_buffer_kv(
+            frame.page_bytes_mut(),
+            key,
+            value,
+            commit_ts,
+            self.config.flush_threshold_messages,
+            self.config.flush_threshold_bytes,
+            self.config.max_internal_children,
+        )?;
+        let Some(_appended) = appended else {
+            return Ok(false);
+        };
+
+        mark_frame_dirty(&frame, None);
         self.stats.inc(CowBeTreeEvent::RawBufferAppends);
         Ok(true)
     }

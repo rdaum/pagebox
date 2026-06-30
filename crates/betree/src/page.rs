@@ -414,12 +414,166 @@ pub(crate) fn append_internal_buffer_message(
     }))
 }
 
+pub(crate) fn append_internal_buffer_kv(
+    page: &mut [u8],
+    key: &[u8],
+    value: &[u8],
+    commit_ts: Timestamp,
+    flush_threshold_messages: usize,
+    flush_threshold_bytes: usize,
+    max_internal_children: usize,
+) -> Result<Option<InternalBufferAppend>, CowBeTreeError> {
+    let Some(layout) = internal_buffer_layout(page)? else {
+        return Ok(None);
+    };
+    if layout.child_count > max_internal_children {
+        return Ok(None);
+    }
+
+    let key_len = u16::try_from(key.len())
+        .map_err(|_| CowBeTreeError::CorruptPage("message key too large"))?;
+    let value_len = u32::try_from(value.len())
+        .map_err(|_| CowBeTreeError::CorruptPage("version value too large"))?;
+    let message_len = usize::from(key_len) + value_len as usize + 15;
+
+    let new_buffer_count =
+        layout
+            .buffer_count
+            .checked_add(1)
+            .ok_or(CowBeTreeError::CorruptPage(
+                "internal buffer count overflow",
+            ))?;
+    let new_buffer_len =
+        layout
+            .buffer_len
+            .checked_add(message_len)
+            .ok_or(CowBeTreeError::CorruptPage(
+                "internal buffer byte length overflow",
+            ))?;
+    if new_buffer_count >= flush_threshold_messages || new_buffer_len >= flush_threshold_bytes {
+        return Ok(None);
+    }
+
+    let new_body_len = layout
+        .body_len
+        .checked_add(message_len)
+        .ok_or(CowBeTreeError::CorruptPage("internal body length overflow"))?;
+    if HEADER_SIZE + new_body_len > page.len() {
+        return Ok(None);
+    }
+
+    let message_offset = HEADER_SIZE + layout.body_len;
+    encode_message_kv_at(
+        page.get_mut(message_offset..message_offset + message_len)
+            .ok_or(CowBeTreeError::CorruptPage(
+                "internal append message offset out of bounds",
+            ))?,
+        key,
+        value,
+        commit_ts,
+    )?;
+    write_u32(
+        page,
+        BODY_LEN_OFF,
+        new_body_len,
+        "internal page body too large",
+    )?;
+    write_u16(
+        page,
+        HEADER_SIZE + layout.buffer_count_offset,
+        new_buffer_count,
+        "too many buffered messages",
+    )?;
+
+    Ok(Some(InternalBufferAppend {
+        buffer_count: new_buffer_count,
+        body_len: new_body_len,
+        message_len,
+    }))
+}
+
 pub(crate) fn append_leaf_entry_message(
     page: &mut [u8],
     message: &BufferedMessage,
     max_leaf_entries: usize,
 ) -> Result<Option<LeafEntryAppend>, CowBeTreeError> {
     append_leaf_entry_batch(page, std::slice::from_ref(message), max_leaf_entries)
+}
+
+pub(crate) fn append_leaf_kv(
+    page: &mut [u8],
+    key: &[u8],
+    value: &[u8],
+    commit_ts: Timestamp,
+    max_leaf_entries: usize,
+) -> Result<Option<LeafEntryAppend>, CowBeTreeError> {
+    let Some(layout) = leaf_append_layout(page, key)? else {
+        return Ok(None);
+    };
+
+    let key_len =
+        u16::try_from(key.len()).map_err(|_| CowBeTreeError::CorruptPage("leaf key too large"))?;
+    let value_len = u32::try_from(value.len())
+        .map_err(|_| CowBeTreeError::CorruptPage("version value too large"))?;
+    let entry_bytes = usize::from(key_len) + value_len as usize + 17;
+
+    let new_entry_count = layout
+        .entry_count
+        .checked_add(1)
+        .ok_or(CowBeTreeError::CorruptPage("leaf entry count overflow"))?;
+    if new_entry_count > max_leaf_entries {
+        return Ok(None);
+    }
+
+    let directory_bytes =
+        new_entry_count
+            .checked_mul(LEAF_DIR_ENTRY_SIZE)
+            .ok_or(CowBeTreeError::CorruptPage(
+                "leaf directory length overflow",
+            ))?;
+    let new_body_len = layout
+        .directory_start
+        .checked_add(entry_bytes)
+        .ok_or(CowBeTreeError::CorruptPage("leaf body length overflow"))?;
+    let new_body_len = new_body_len
+        .checked_add(directory_bytes)
+        .ok_or(CowBeTreeError::CorruptPage("leaf body length overflow"))?;
+    if HEADER_SIZE + new_body_len > page.len() {
+        return Ok(None);
+    }
+
+    let mut entry_offset = HEADER_SIZE + layout.directory_start;
+    let mut entry_offsets = layout.entry_offsets.clone();
+    entry_offsets.push(
+        u32::try_from(entry_offset - HEADER_SIZE)
+            .map_err(|_| CowBeTreeError::CorruptPage("leaf entry offset too large"))?,
+    );
+    encode_leaf_kv_at(
+        page.get_mut(entry_offset..entry_offset + entry_bytes)
+            .ok_or(CowBeTreeError::CorruptPage(
+                "leaf append entry offset out of bounds",
+            ))?,
+        key,
+        value,
+        commit_ts,
+    )?;
+    entry_offset += entry_bytes;
+    write_leaf_directory(page, entry_offset, &entry_offsets)?;
+    write_u32(page, BODY_LEN_OFF, new_body_len, "leaf page body too large")?;
+    write_u16(page, COUNT_OFF, new_entry_count, "too many leaf entries")?;
+    write_u16(
+        page,
+        HEADER_SIZE + layout.entry_count_offset,
+        new_entry_count,
+        "too many leaf entries",
+    )?;
+
+    Ok(Some(LeafEntryAppend {
+        entry_count: new_entry_count,
+        body_len: new_body_len,
+        entry_bytes,
+        message_count: 1,
+    }))
 }
 
 pub(crate) fn append_leaf_entry_batch(
@@ -883,6 +1037,38 @@ fn encode_message_at(dst: &mut [u8], message: &BufferedMessage) -> Result<(), Co
     Ok(())
 }
 
+fn encode_message_kv_at(
+    dst: &mut [u8],
+    key: &[u8],
+    value: &[u8],
+    commit_ts: Timestamp,
+) -> Result<(), CowBeTreeError> {
+    let key_len = u16::try_from(key.len())
+        .map_err(|_| CowBeTreeError::CorruptPage("message key too large"))?;
+    let value_len = u32::try_from(value.len())
+        .map_err(|_| CowBeTreeError::CorruptPage("version value too large"))?;
+    let expected = usize::from(key_len) + value_len as usize + 15;
+    if dst.len() != expected {
+        return Err(CowBeTreeError::CorruptPage(
+            "message kv append length mismatch",
+        ));
+    }
+
+    let mut offset = 0usize;
+    dst[offset..offset + 2].copy_from_slice(&key_len.to_le_bytes());
+    offset += 2;
+    dst[offset..offset + key.len()].copy_from_slice(key);
+    offset += key.len();
+    dst[offset..offset + 8].copy_from_slice(&commit_ts.to_le_bytes());
+    offset += 8;
+    dst[offset] = 0;
+    offset += 1;
+    dst[offset..offset + 4].copy_from_slice(&value_len.to_le_bytes());
+    offset += 4;
+    dst[offset..offset + value.len()].copy_from_slice(value);
+    Ok(())
+}
+
 fn leaf_entry_message_encoded_len(message: &BufferedMessage) -> Result<usize, CowBeTreeError> {
     let key_len = u16::try_from(message.key.len())
         .map_err(|_| CowBeTreeError::CorruptPage("leaf key too large"))?;
@@ -914,6 +1100,40 @@ fn encode_leaf_entry_at(dst: &mut [u8], message: &BufferedMessage) -> Result<(),
     dst[offset..offset + 4].copy_from_slice(&value_len.to_le_bytes());
     offset += 4;
     dst[offset..offset + message.version.value.len()].copy_from_slice(&message.version.value);
+    Ok(())
+}
+
+fn encode_leaf_kv_at(
+    dst: &mut [u8],
+    key: &[u8],
+    value: &[u8],
+    commit_ts: Timestamp,
+) -> Result<(), CowBeTreeError> {
+    let key_len =
+        u16::try_from(key.len()).map_err(|_| CowBeTreeError::CorruptPage("leaf key too large"))?;
+    let value_len = u32::try_from(value.len())
+        .map_err(|_| CowBeTreeError::CorruptPage("version value too large"))?;
+    let expected = usize::from(key_len) + value_len as usize + 17;
+    if dst.len() != expected {
+        return Err(CowBeTreeError::CorruptPage(
+            "leaf kv append length mismatch",
+        ));
+    }
+
+    let mut offset = 0usize;
+    dst[offset..offset + 2].copy_from_slice(&key_len.to_le_bytes());
+    offset += 2;
+    dst[offset..offset + key.len()].copy_from_slice(key);
+    offset += key.len();
+    dst[offset..offset + 2].copy_from_slice(&1u16.to_le_bytes());
+    offset += 2;
+    dst[offset..offset + 8].copy_from_slice(&commit_ts.to_le_bytes());
+    offset += 8;
+    dst[offset] = 0;
+    offset += 1;
+    dst[offset..offset + 4].copy_from_slice(&value_len.to_le_bytes());
+    offset += 4;
+    dst[offset..offset + value.len()].copy_from_slice(value);
     Ok(())
 }
 
