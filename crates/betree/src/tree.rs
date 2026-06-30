@@ -372,21 +372,74 @@ impl CowBeTree {
             return Ok(false);
         }
 
-        let mut page_id = self.root_page_id();
-        loop {
-            match self.write_route_step(page_id, key)? {
-                WriteRouteStep::Leaf => {
-                    return self.try_append_leaf_kv_page_local(page_id, key, value, commit_ts);
-                }
-                WriteRouteStep::Internal { child_swip } => {
-                    page_id = swip_page_id(child_swip);
-                    match self.write_route_step(page_id, key)? {
-                        WriteRouteStep::Leaf => {
+        const MAX_RESTARTS: u32 = 64;
+        for _ in 0..MAX_RESTARTS {
+            let root_pid = self.root_page_id();
+            let current = unsafe { self.pool().fix_orphan_frame(root_pid) };
+            let opt = match current.optimistic() {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
+
+            match lookup_child_slot(opt.page_bytes(), key)? {
+                None => {
+                    if opt.validate().is_err() {
+                        continue;
+                    }
+                    let mut leaf = match opt.upgrade_to_exclusive() {
+                        Ok(f) => f,
+                        Err(_) => continue,
+                    };
+                    if leaf_should_chase_right(leaf.page_bytes(), key) {
+                        let right = read_right_sibling(leaf.page_bytes());
+                        if right != 0 {
+                            drop(leaf);
                             return self
-                                .try_append_leaf_kv_page_local(page_id, key, value, commit_ts);
+                                .try_append_leaf_kv_page_local(right, key, value, commit_ts);
                         }
-                        WriteRouteStep::Internal { .. } => {
-                            if self.try_append_buffer_kv(page_id, key, value, commit_ts)? {
+                    }
+                    return self.try_append_leaf_into_exclusive(&mut leaf, key, value, commit_ts);
+                }
+                Some((child_swip, child_slot)) => {
+                    if opt.validate().is_err() {
+                        continue;
+                    }
+                    let child_pid = swip_page_id(child_swip);
+                    if child_swip.is_evicted() {
+                        self.swizzle_child_in_parent(root_pid, child_pid, child_slot);
+                    }
+
+                    let child = unsafe { self.pool().fix_orphan_frame(child_pid) };
+                    let child_opt = match child.optimistic() {
+                        Ok(o) => o,
+                        Err(_) => continue,
+                    };
+                    match lookup_child_slot(child_opt.page_bytes(), key)? {
+                        None => {
+                            if child_opt.validate().is_err() {
+                                continue;
+                            }
+                            let mut leaf = match child_opt.upgrade_to_exclusive() {
+                                Ok(f) => f,
+                                Err(_) => continue,
+                            };
+                            if leaf_should_chase_right(leaf.page_bytes(), key) {
+                                let right = read_right_sibling(leaf.page_bytes());
+                                if right != 0 {
+                                    drop(leaf);
+                                    return self.try_append_leaf_kv_page_local(
+                                        right, key, value, commit_ts,
+                                    );
+                                }
+                            }
+                            return self
+                                .try_append_leaf_into_exclusive(&mut leaf, key, value, commit_ts);
+                        }
+                        Some(_) => {
+                            if child_opt.validate().is_err() {
+                                continue;
+                            }
+                            if self.try_append_buffer_kv(child_pid, key, value, commit_ts)? {
                                 return Ok(true);
                             }
                         }
@@ -394,6 +447,58 @@ impl CowBeTree {
                 }
             }
         }
+        Ok(false)
+    }
+
+    fn try_append_leaf_into_exclusive(
+        &self,
+        frame: &mut ExclusiveFrame<'_>,
+        key: &[u8],
+        value: &[u8],
+        commit_ts: Timestamp,
+    ) -> Result<bool, CowBeTreeError> {
+        if let Some(appended) = append_leaf_kv(
+            frame.page_bytes_mut(),
+            key,
+            value,
+            commit_ts,
+            self.config.max_leaf_entries,
+        )? {
+            mark_frame_dirty(frame, None);
+            self.append_hint.store(frame.pid(), Ordering::Release);
+            self.stats
+                .add(CowBeTreeEvent::RawLeafAppends, appended.message_count);
+            self.stats.inc(CowBeTreeEvent::RawLeafAppendBatches);
+            return Ok(true);
+        }
+
+        let step = lookup_step(frame.page_bytes(), key, Timestamp::MAX)?;
+        match step {
+            LookupStep::Leaf { visible: None } => return Ok(false),
+            LookupStep::Internal { .. } => return Ok(false),
+            LookupStep::Leaf { visible: Some(_) } => {}
+        }
+
+        let mut node = decode_page(frame.page_bytes())?;
+        let NodePage::Leaf { fence, entries } = &mut node else {
+            return Ok(false);
+        };
+        let message = BufferedMessage::put(key, commit_ts, value);
+        apply_message_to_entries(entries, &message);
+        if self.leaf_should_split(frame.pid(), fence, entries) {
+            return Ok(false);
+        }
+
+        let mut image = vec![0u8; PAGE_SIZE];
+        let bytes = encode_leaf_page(&mut image, fence, entries)?;
+        let page_image_bytes = image.len();
+        frame.page_bytes_mut().copy_from_slice(&image);
+        mark_frame_dirty(frame, None);
+        self.stats.inc(CowBeTreeEvent::InPlacePageRewrites);
+        self.stats.add_leaf_bytes(bytes);
+        self.stats
+            .add_leaf_page_image_rewrite_bytes(page_image_bytes);
+        Ok(true)
     }
 
     fn try_append_leaf_kv_page_local(
@@ -2406,9 +2511,16 @@ impl CowBeTree {
             self.stats.inc(CowBeTreeEvent::ColdResolves);
             self.stats.inc(CowBeTreeEvent::PageFaults);
         }
-        let frame = unsafe { self.pool().fix_frame(&self.root) }.shared();
-        let root_pid = frame.pid();
-        let step = lookup_step(frame.page_bytes(), key, read_ts)?;
+        let frame = unsafe { self.pool().fix_frame(&self.root) };
+        let opt = match frame.optimistic() {
+            Ok(o) => o,
+            Err(_) => return Ok(VisibleLookupStep::Leaf { visible: None }),
+        };
+        let root_pid = opt.pid();
+        let step = lookup_step(opt.page_bytes(), key, read_ts)?;
+        if opt.validate().is_err() {
+            return Ok(VisibleLookupStep::Leaf { visible: None });
+        }
         let mut step = own_lookup_step(step);
         if let VisibleLookupStep::Internal { parent_pid, .. } = &mut step {
             *parent_pid = root_pid;
@@ -2423,15 +2535,23 @@ impl CowBeTree {
         key: &[u8],
         read_ts: Timestamp,
     ) -> Result<VisibleLookupStep, CowBeTreeError> {
-        let frame = self.fix_child(child_swip).shared();
-        let step = lookup_step(frame.page_bytes(), key, read_ts)?;
+        let frame = self.fix_child(child_swip);
+        let opt = match frame.optimistic() {
+            Ok(o) => o,
+            Err(_) => return Ok(VisibleLookupStep::Leaf { visible: None }),
+        };
+        let child_pid = opt.pid();
+        let step = lookup_step(opt.page_bytes(), key, read_ts)?;
+        if opt.validate().is_err() {
+            return Ok(VisibleLookupStep::Leaf { visible: None });
+        }
         let mut step = own_lookup_step(step);
         if let VisibleLookupStep::Internal {
             parent_pid: step_parent_pid,
             ..
         } = &mut step
         {
-            *step_parent_pid = frame.pid();
+            *step_parent_pid = child_pid;
         }
         let _ = parent_pid;
         Ok(step)
