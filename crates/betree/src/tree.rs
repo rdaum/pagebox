@@ -1105,7 +1105,8 @@ impl CowBeTree {
     }
 
     fn swizzle_child_in_parent(&self, parent_pid: u64, child_pid: u64, child_slot: u16) {
-        let Some(child_pin) = (unsafe { self.pool().try_fix_orphan_frame(child_pid) }) else {
+        let Some(child_pin) = (unsafe { self.pool().try_fix_resident_page_frame(child_pid) })
+        else {
             return;
         };
         let child = child_pin.exclusive();
@@ -1131,7 +1132,8 @@ impl CowBeTree {
     }
 
     fn swizzle_child_read_only(&self, parent_pid: u64, child_pid: u64, child_slot: u16) {
-        let Some(child_pin) = (unsafe { self.pool().try_fix_orphan_frame(child_pid) }) else {
+        let Some(child_pin) = (unsafe { self.pool().try_fix_resident_page_frame(child_pid) })
+        else {
             return;
         };
         let child_frame = child_pin.frame_ref();
