@@ -381,29 +381,20 @@ impl CowBeTree {
                 Err(_) => continue,
             };
 
-            match lookup_child_slot(opt.page_bytes(), key)? {
-                None => {
-                    if opt.validate().is_err() {
-                        continue;
-                    }
+            let root_result = lookup_child_slot(opt.page_bytes(), key);
+            if opt.validate().is_err() {
+                continue;
+            }
+            match root_result {
+                Err(_) => continue,
+                Ok(None) => {
                     let mut leaf = match opt.upgrade_to_exclusive() {
                         Ok(f) => f,
                         Err(_) => continue,
                     };
-                    if leaf_should_chase_right(leaf.page_bytes(), key) {
-                        let right = read_right_sibling(leaf.page_bytes());
-                        if right != 0 {
-                            drop(leaf);
-                            return self
-                                .try_append_leaf_kv_page_local(right, key, value, commit_ts);
-                        }
-                    }
                     return self.try_append_leaf_into_exclusive(&mut leaf, key, value, commit_ts);
                 }
-                Some((child_swip, child_slot)) => {
-                    if opt.validate().is_err() {
-                        continue;
-                    }
+                Ok(Some((child_swip, child_slot))) => {
                     let child_pid = swip_page_id(child_swip);
                     if child_swip.is_evicted() {
                         self.swizzle_child_in_parent(root_pid, child_pid, child_slot);
@@ -414,31 +405,21 @@ impl CowBeTree {
                         Ok(o) => o,
                         Err(_) => continue,
                     };
-                    match lookup_child_slot(child_opt.page_bytes(), key)? {
-                        None => {
-                            if child_opt.validate().is_err() {
-                                continue;
-                            }
+                    let child_result = lookup_child_slot(child_opt.page_bytes(), key);
+                    if child_opt.validate().is_err() {
+                        continue;
+                    }
+                    match child_result {
+                        Err(_) => continue,
+                        Ok(None) => {
                             let mut leaf = match child_opt.upgrade_to_exclusive() {
                                 Ok(f) => f,
                                 Err(_) => continue,
                             };
-                            if leaf_should_chase_right(leaf.page_bytes(), key) {
-                                let right = read_right_sibling(leaf.page_bytes());
-                                if right != 0 {
-                                    drop(leaf);
-                                    return self.try_append_leaf_kv_page_local(
-                                        right, key, value, commit_ts,
-                                    );
-                                }
-                            }
                             return self
                                 .try_append_leaf_into_exclusive(&mut leaf, key, value, commit_ts);
                         }
-                        Some(_) => {
-                            if child_opt.validate().is_err() {
-                                continue;
-                            }
+                        Ok(Some(_)) => {
                             if self.try_append_buffer_kv(child_pid, key, value, commit_ts)? {
                                 return Ok(true);
                             }
@@ -457,6 +438,9 @@ impl CowBeTree {
         value: &[u8],
         commit_ts: Timestamp,
     ) -> Result<bool, CowBeTreeError> {
+        if leaf_should_chase_right(frame.page_bytes(), key) {
+            return Ok(false);
+        }
         if let Some(appended) = append_leaf_kv(
             frame.page_bytes_mut(),
             key,
@@ -501,6 +485,7 @@ impl CowBeTree {
         Ok(true)
     }
 
+    #[allow(dead_code)]
     fn try_append_leaf_kv_page_local(
         &self,
         page_id: u64,
@@ -1120,7 +1105,10 @@ impl CowBeTree {
     }
 
     fn swizzle_child_in_parent(&self, parent_pid: u64, child_pid: u64, child_slot: u16) {
-        let child = unsafe { self.pool().fix_orphan_frame(child_pid) }.exclusive();
+        let Some(child_pin) = (unsafe { self.pool().try_fix_orphan_frame(child_pid) }) else {
+            return;
+        };
+        let child = child_pin.exclusive();
         child
             .write_ref()
             .set_parent_link_inner(parent_pid, child_slot, false, self.dt_id);
@@ -1143,8 +1131,10 @@ impl CowBeTree {
     }
 
     fn swizzle_child_read_only(&self, parent_pid: u64, child_pid: u64, child_slot: u16) {
-        let child = unsafe { self.pool().fix_orphan_frame(child_pid) };
-        let child_frame = child.frame_ref();
+        let Some(child_pin) = (unsafe { self.pool().try_fix_orphan_frame(child_pid) }) else {
+            return;
+        };
+        let child_frame = child_pin.frame_ref();
         let Some(parent_pin) = (unsafe { self.pool().try_fix_resident_page_frame(parent_pid) })
         else {
             return;
@@ -2517,7 +2507,10 @@ impl CowBeTree {
             Err(_) => return Ok(VisibleLookupStep::Leaf { visible: None }),
         };
         let root_pid = opt.pid();
-        let step = lookup_step(opt.page_bytes(), key, read_ts)?;
+        let step = match lookup_step(opt.page_bytes(), key, read_ts) {
+            Ok(s) => s,
+            Err(_) => return Ok(VisibleLookupStep::Leaf { visible: None }),
+        };
         if opt.validate().is_err() {
             return Ok(VisibleLookupStep::Leaf { visible: None });
         }
@@ -2541,7 +2534,10 @@ impl CowBeTree {
             Err(_) => return Ok(VisibleLookupStep::Leaf { visible: None }),
         };
         let child_pid = opt.pid();
-        let step = lookup_step(opt.page_bytes(), key, read_ts)?;
+        let step = match lookup_step(opt.page_bytes(), key, read_ts) {
+            Ok(s) => s,
+            Err(_) => return Ok(VisibleLookupStep::Leaf { visible: None }),
+        };
         if opt.validate().is_err() {
             return Ok(VisibleLookupStep::Leaf { visible: None });
         }
