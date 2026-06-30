@@ -3387,10 +3387,19 @@ impl BufferPool {
             let loading = LoadingFrameReservation::new(self, bf);
 
             let read_start = Instant::now();
-            let found = unsafe { self.page_store.read_page(page_id, (*bf).page_bytes_mut()) }
-                .expect("page store read failed");
+            let found = match unsafe { self.page_store.read_page(page_id, (*bf).page_bytes_mut()) }
+            {
+                Ok(found) => found,
+                Err(_) => {
+                    loading.disarm();
+                    return std::ptr::null_mut();
+                }
+            };
             self.record_fix_swip_sync_load(unsafe { (*bf).page_bytes() }, read_start.elapsed());
-            assert!(found, "page {page_id} not found in store");
+            if !found {
+                loading.disarm();
+                return std::ptr::null_mut();
+            }
 
             unsafe {
                 self.install_loaded_frame_metadata(
@@ -3583,10 +3592,21 @@ impl BufferPool {
             };
 
             let read_start = Instant::now();
-            let found = unsafe { self.page_store.read_page(page_id, (*bf).page_bytes_mut()) }
-                .expect("page store read failed");
+            let found = match unsafe { self.page_store.read_page(page_id, (*bf).page_bytes_mut()) }
+            {
+                Ok(found) => found,
+                Err(_) => {
+                    self.state.free_list.push(bf);
+                    self.release_resident_budget(bf);
+                    return std::ptr::null_mut();
+                }
+            };
             self.record_fix_orphan_sync_load(unsafe { (*bf).page_bytes() }, read_start.elapsed());
-            assert!(found, "page {page_id} not found in store");
+            if !found {
+                self.state.free_list.push(bf);
+                self.release_resident_budget(bf);
+                return std::ptr::null_mut();
+            }
 
             unsafe {
                 self.install_loaded_frame_metadata(bf, page_id, ParentLink::None, 1);
@@ -3702,10 +3722,18 @@ impl BufferPool {
         };
 
         let read_start = Instant::now();
-        let found = unsafe { self.page_store.read_page(page_id, (*bf).page_bytes_mut()) }
-            .expect("page store read failed");
+        let found = match unsafe { self.page_store.read_page(page_id, (*bf).page_bytes_mut()) } {
+            Ok(found) => found,
+            Err(_) => {
+                self.state.free_list.push(bf);
+                self.release_resident_budget(bf);
+                return None;
+            }
+        };
         self.record_fix_orphan_sync_load(unsafe { (*bf).page_bytes() }, read_start.elapsed());
         if !found {
+            self.state.free_list.push(bf);
+            self.release_resident_budget(bf);
             return None;
         }
 

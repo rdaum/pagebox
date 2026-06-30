@@ -606,9 +606,13 @@ impl PageStore for FilePageStore {
     fn read_page(&self, pid: PageId, buf: &mut [u8]) -> io::Result<bool> {
         validate_page_buf_len(pid, buf.len())?;
         let off = Self::page_offset(pid);
+        if off < 0 {
+            return Ok(false);
+        }
         match pread_exact(self.fd, buf, off) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(false),
             Err(e) => Err(e),
         }
     }
