@@ -148,7 +148,6 @@ enum VisibleLookupStep {
     Internal {
         parent_pid: u64,
         child_swip: Swip,
-        child_slot: u16,
         visible_buffer: Option<VisibleCandidate>,
         buffer_count: usize,
     },
@@ -404,13 +403,10 @@ impl CowBeTree {
                     };
                     return self.try_append_leaf_into_exclusive(&mut leaf, key, value, commit_ts);
                 }
-                Ok(Some((child_swip, child_slot))) => {
-                    if child_swip.is_evicted() {
-                        let child_pid = child_swip.as_page_id();
-                        self.swizzle_child_in_parent(root_pid, child_pid, child_slot);
-                    }
-
-                    let child = self.fix_child(child_swip);
+                Ok(Some((child_swip, _child_slot))) => {
+                    let Some(child) = self.fix_child_opt(child_swip) else {
+                        continue;
+                    };
                     if opt.validate().is_err() {
                         continue;
                     }
@@ -731,22 +727,15 @@ impl CowBeTree {
                 VisibleLookupStep::Internal {
                     parent_pid,
                     child_swip,
-                    child_slot,
                     visible_buffer,
                     buffer_count,
+                    ..
                 } => {
                     if buffer_count > 0 {
                         saw_path_buffer = true;
                     }
                     if let Some(buffer) = visible_buffer {
                         merge_owned_visible_candidate(&mut visible, buffer);
-                    }
-                    if child_swip.is_evicted() {
-                        self.swizzle_child_read_only(
-                            parent_pid,
-                            child_swip.as_page_id(),
-                            child_slot,
-                        );
                     }
                     next_swip = child_swip;
                     next_parent = parent_pid;
@@ -1166,6 +1155,7 @@ impl CowBeTree {
         write_child_swip_at(parent.page_bytes_mut(), child_slot, hot_swip);
     }
 
+    #[allow(dead_code)]
     fn swizzle_child_read_only(&self, parent_pid: u64, child_pid: u64, child_slot: u16) {
         let Some(child_pin) = (unsafe { self.pool().try_fix_resident_page_frame(child_pid) })
         else {
@@ -2565,7 +2555,9 @@ impl CowBeTree {
         key: &[u8],
         read_ts: Timestamp,
     ) -> Result<VisibleLookupStep, CowBeTreeError> {
-        let frame = self.fix_child(child_swip);
+        let Some(frame) = self.fix_child_opt(child_swip) else {
+            return Ok(VisibleLookupStep::Leaf { visible: None });
+        };
         let opt = match frame.optimistic() {
             Ok(o) => o,
             Err(_) => return Ok(VisibleLookupStep::Leaf { visible: None }),
@@ -2617,30 +2609,25 @@ impl CowBeTree {
     /// rather than undefined behaviour. A correct swizzle-in implementation
     /// would hold the parent's latch until the child is pinned (B-link style),
     /// which is follow-up work tracked alongside optimistic reads.
-    fn fix_child(&self, swip: Swip) -> PinnedFrame<'_> {
+    fn fix_child_opt(&self, swip: Swip) -> Option<PinnedFrame<'_>> {
+        if swip.raw() == 0 {
+            return None;
+        }
         if swip.is_hot() || swip.is_cool() {
-            match unsafe { self.pool().pin_child(swip) } {
-                Some(p) => p,
-                None => {
-                    let pid = swip_page_id(swip);
-                    if pid == 0 || pid > 0xFFFF_FFFF {
-                        panic!(
-                            "fix_child: Hot/Cool swip pin failed, pid=0x{pid:016x} swip_raw=0x{:016x}",
-                            swip.raw(),
-                        );
-                    }
-                    unsafe { self.pool().fix_orphan_frame(pid) }
-                }
+            if let Some(p) = unsafe { self.pool().pin_child(swip) } {
+                return Some(p);
             }
+            let pid = swip_page_id(swip);
+            if pid == 0 || pid > 0xFFFF_FFFF {
+                return None;
+            }
+            unsafe { self.pool().fix_orphan_frame(pid) }.into()
         } else {
             let pid = swip.as_page_id();
-            if pid > 0xFFFF_FFFF {
-                panic!(
-                    "fix_child: Evicted swip has garbage pid=0x{pid:016x} swip_raw=0x{:016x}",
-                    swip.raw(),
-                );
+            if pid == 0 || pid > 0xFFFF_FFFF {
+                return None;
             }
-            unsafe { self.pool().fix_orphan_frame(pid) }
+            unsafe { self.pool().fix_orphan_frame(pid) }.into()
         }
     }
 
@@ -2828,13 +2815,12 @@ fn own_lookup_step(step: LookupStep<'_>) -> VisibleLookupStep {
         },
         LookupStep::Internal {
             child_swip,
-            child_slot,
             visible_buffer,
             buffer_count,
+            ..
         } => VisibleLookupStep::Internal {
             parent_pid: 0,
             child_swip,
-            child_slot,
             visible_buffer: visible_buffer.map(own_visible_candidate),
             buffer_count,
         },
