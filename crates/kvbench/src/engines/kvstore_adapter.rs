@@ -2,11 +2,10 @@
 
 use std::path::Path;
 
-use kvstore::{KvStore, KvStoreOptions, SyncMode as KvSyncMode};
+use kvstore::{KvStore, KvStoreOptions, SyncMode as KvSyncMode, TreeBackend};
 
 use crate::engine::{EngineOpts, EngineStats, KvEngine, SyncMode};
 
-/// Adapter wrapping `kvstore::KvStore`.
 pub struct KvstoreAdapter {
     inner: KvStore,
 }
@@ -15,12 +14,17 @@ impl KvEngine for KvstoreAdapter {
     const NAME: &'static str = "kvstore";
 
     fn open(dir: &Path, opts: &EngineOpts) -> std::io::Result<Self> {
+        let tree_backend = match opts.engine_specific.get("tree_backend").map(String::as_str) {
+            Some("betree") => TreeBackend::BeTree,
+            _ => TreeBackend::BPlusTree,
+        };
         let kv_opts = KvStoreOptions::default()
             .pool_frames(opts.buffer_budget_frames)
             .sync_mode(match opts.sync_mode {
                 SyncMode::Relaxed => KvSyncMode::Relaxed,
                 SyncMode::Strict => KvSyncMode::Strict,
-            });
+            })
+            .tree_backend(tree_backend);
         let inner = KvStore::open_with(dir, &kv_opts)?;
         Ok(Self { inner })
     }

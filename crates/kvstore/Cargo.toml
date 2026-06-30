@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 pagebox-btree.workspace = true
+pagebox-betree.workspace = true
 pagebox-storage.workspace = true
 pagebox-wal.workspace = true
 pagebox-frame-kernel.workspace = true
@@ -21,4 +22,4 @@ clap.workspace = true
 
 [features]
 default = ["metrics"]
-metrics = ["pagebox-storage/metrics", "pagebox-wal/metrics", "pagebox-btree/metrics"]
+metrics = ["pagebox-storage/metrics", "pagebox-wal/metrics", "pagebox-btree/metrics", "pagebox-betree/metrics"]

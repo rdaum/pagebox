@@ -1,0 +1,26 @@
+[package]
+name = "pagebox-betree"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[features]
+default = ["metrics"]
+metrics = ["dep:fast-telemetry"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(miri)', 'cfg(metrics)'] }
+
+[dependencies]
+fast-telemetry = { workspace = true, optional = true }
+pagebox-hybrid-latch.workspace = true
+pagebox-storage.workspace = true
+pagebox-swip-kernel.workspace = true
+
+[dev-dependencies]
+fast-telemetry.workspace = true
+micromeasure.workspace = true
+
+[[bench]]
+name = "microbetreebench"
+harness = false

@@ -167,6 +167,7 @@ fn run_spec_file(
     let dir = create_fresh_dir(tmpdir, engine_name)?;
     let report = match engine_name {
         "kvstore" => run_engine::<KvstoreAdapter>(&dir, &spec, &opts)?,
+        "betree" => run_engine_custom::<KvstoreAdapter>(&dir, &spec, &opts, "betree")?,
         #[cfg(feature = "fjall")]
         "fjall" => run_engine::<FjallAdapter>(&dir, &spec, &opts)?,
         #[cfg(feature = "redb")]
@@ -195,6 +196,46 @@ fn run_spec_file(
     print_summary(&report);
 
     Ok(())
+}
+
+fn run_engine_custom<E: KvEngine>(
+    dir: &std::path::Path,
+    spec: &WorkloadSpec,
+    opts: &EngineOpts,
+    display_name: &str,
+) -> std::io::Result<Report> {
+    let mut custom_opts = opts.clone();
+    custom_opts
+        .engine_specific
+        .insert("tree_backend".to_string(), "betree".to_string());
+    let engine = E::open(dir, &custom_opts)?;
+    let load_summary = if spec.workload.needs_load_phase() {
+        eprintln!("  Loading {} records...", spec.record_count);
+        let load_ops = generate_load_ops(spec, &custom_opts);
+        let load_stats = run_phase(&engine, &load_ops, spec.threads.max(1));
+        eprintln!(
+            "  Load: {:.0} ops/sec, {:.2}ms",
+            load_stats.ops_per_sec(),
+            load_stats.duration.as_secs_f64() * 1000.0
+        );
+        Some((&load_stats).into())
+    } else {
+        None
+    };
+    let _ = engine.sync();
+    eprintln!("  Running {} operations...", spec.operation_count);
+    let run_ops = generate_run_ops(spec, &custom_opts);
+    let run_stats = run_phase(&engine, &run_ops, spec.threads.max(1));
+    let report = Report::new(
+        display_name,
+        spec.clone(),
+        custom_opts.clone(),
+        load_summary,
+        (&run_stats).into(),
+    );
+    drop(engine);
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(report)
 }
 
 fn run_engine<E: KvEngine>(
@@ -285,7 +326,7 @@ fn read_all_reports(dir: &std::path::Path) -> std::io::Result<Vec<Report>> {
 }
 
 fn available_engines() -> String {
-    let mut engines = vec!["kvstore"];
+    let mut engines = vec!["kvstore", "betree"];
     if cfg!(feature = "fjall") {
         engines.push("fjall");
     }

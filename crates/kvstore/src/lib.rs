@@ -10,39 +10,37 @@
 use std::ops::Bound;
 use std::path::Path;
 
+use pagebox_betree::CowBeTree;
 use pagebox_btree::BTree;
 use pagebox_storage::buffer_pool::{BufferPool, BufferPoolHandle};
 use pagebox_storage::page_header::read_page_lsn;
 use pagebox_storage::page_store::{FilePageStore, PageStore};
 use pagebox_wal::Wal;
 
-/// Default buffer-pool frame count.
 pub const DEFAULT_POOL_FRAMES: usize = 1024;
 
-/// Default domain ID for the B+tree data-structure registry.
 pub const DEFAULT_DOMAIN_ID: u16 = 1;
 
-/// Write durability mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SyncMode {
-    /// Writes return after the page is modified; WAL flush is asynchronous.
-    /// Mirrors the WAL's relaxed commit mode and RocksDB's default buffering.
     #[default]
     Relaxed,
-    /// Every write blocks until the WAL has flushed it. Mirrors the WAL's
-    /// strict commit mode and the former `Put --sync` CLI flag.
     Strict,
 }
 
-/// Tunable knobs for [`KvStore::open_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TreeBackend {
+    #[default]
+    BPlusTree,
+    BeTree,
+}
+
 #[derive(Debug, Clone)]
 pub struct KvStoreOptions {
-    /// Number of buffer-pool frames (resident-page budget).
     pub pool_frames: usize,
-    /// B+tree data-structure ID for the parent-finder registry.
     pub domain_id: u16,
-    /// Write durability mode.
     pub sync_mode: SyncMode,
+    pub tree_backend: TreeBackend,
 }
 
 impl Default for KvStoreOptions {
@@ -51,42 +49,65 @@ impl Default for KvStoreOptions {
             pool_frames: DEFAULT_POOL_FRAMES,
             domain_id: DEFAULT_DOMAIN_ID,
             sync_mode: SyncMode::default(),
+            tree_backend: TreeBackend::default(),
         }
     }
 }
 
 impl KvStoreOptions {
-    /// Create a builder with defaults.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Set the buffer-pool frame count.
     #[must_use]
     pub fn pool_frames(mut self, n: usize) -> Self {
         self.pool_frames = n;
         self
     }
 
-    /// Set the B+tree domain ID.
     #[must_use]
     pub fn domain_id(mut self, id: u16) -> Self {
         self.domain_id = id;
         self
     }
 
-    /// Set the write durability mode.
     #[must_use]
     pub fn sync_mode(mut self, mode: SyncMode) -> Self {
         self.sync_mode = mode;
         self
     }
+
+    #[must_use]
+    pub fn tree_backend(mut self, backend: TreeBackend) -> Self {
+        self.tree_backend = backend;
+        self
+    }
 }
 
-/// Durable key-value store backed by the pagebox substrate.
+enum TreeHandle {
+    BPlusTree(BTree),
+    BeTree(CowBeTree),
+}
+
+impl TreeHandle {
+    fn root_page_id(&self) -> u64 {
+        match self {
+            TreeHandle::BPlusTree(t) => t.root_page_id(),
+            TreeHandle::BeTree(t) => t.root_page_id(),
+        }
+    }
+
+    fn height(&self) -> u32 {
+        match self {
+            TreeHandle::BPlusTree(t) => t.height(),
+            TreeHandle::BeTree(t) => t.height(),
+        }
+    }
+}
+
 pub struct KvStore {
     pool: BufferPoolHandle,
-    tree: BTree,
+    tree: TreeHandle,
     wal: std::sync::Arc<Wal>,
     store: std::sync::Arc<FilePageStore>,
     sync_mode: SyncMode,
@@ -98,9 +119,6 @@ impl KvStore {
         Self::open_with(dir, &KvStoreOptions::default())
     }
 
-    /// Open with explicit options. Runs WAL recovery, then either creates a
-    /// fresh B+tree or reopens an existing one from the page-store user-meta
-    /// slots.
     pub fn open_with<P: AsRef<Path>>(dir: P, opts: &KvStoreOptions) -> std::io::Result<Self> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
@@ -128,15 +146,30 @@ impl KvStore {
         let pool: BufferPoolHandle = std::sync::Arc::new(pool).into();
 
         let root = store.user_meta_0();
-        let height = store.user_meta_1() as u32;
-        let tree = if root == 0 {
-            let t = BTree::new(pool.clone(), opts.domain_id);
-            store.set_user_meta_0(t.root_page_id());
-            store.set_user_meta_1(0);
-            store.sync()?;
-            t
-        } else {
-            BTree::open(pool.clone(), root, height, opts.domain_id)
+        let tree = match opts.tree_backend {
+            TreeBackend::BPlusTree => {
+                let height = store.user_meta_1() as u32;
+                if root == 0 {
+                    let t = BTree::new(pool.clone(), opts.domain_id);
+                    store.set_user_meta_0(t.root_page_id());
+                    store.set_user_meta_1(0);
+                    store.sync()?;
+                    TreeHandle::BPlusTree(t)
+                } else {
+                    TreeHandle::BPlusTree(BTree::open(pool.clone(), root, height, opts.domain_id))
+                }
+            }
+            TreeBackend::BeTree => {
+                if root == 0 {
+                    let t = CowBeTree::new(pool.clone());
+                    store.set_user_meta_0(t.root_page_id());
+                    store.set_user_meta_1(0);
+                    store.sync()?;
+                    TreeHandle::BeTree(t)
+                } else {
+                    TreeHandle::BeTree(CowBeTree::open(pool.clone(), root))
+                }
+            }
         };
 
         Ok(Self {
@@ -148,36 +181,54 @@ impl KvStore {
         })
     }
 
-    /// Insert or update a key-value pair. Returns `true` if the key was
-    /// newly inserted, `false` if an existing value was updated.
     pub fn put(&self, key: &[u8], value: &[u8]) -> bool {
-        let inserted = self.tree.upsert(key, value);
+        let inserted = match &self.tree {
+            TreeHandle::BPlusTree(t) => t.upsert(key, value),
+            TreeHandle::BeTree(t) => {
+                t.put(key, u64::MAX, value).expect("betree put failed");
+                true
+            }
+        };
         if self.sync_mode == SyncMode::Strict {
             self.wal.flush();
         }
         inserted
     }
 
-    /// Look up a key, returning an owned copy of the value.
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.tree.lookup(key)
+        match &self.tree {
+            TreeHandle::BPlusTree(t) => t.lookup(key),
+            TreeHandle::BeTree(t) => t.lookup(key),
+        }
     }
 
-    /// Delete a key. Returns `true` if the key was present.
     pub fn del(&self, key: &[u8]) -> bool {
-        self.tree.remove(key)
+        match &self.tree {
+            TreeHandle::BPlusTree(t) => t.remove(key),
+            TreeHandle::BeTree(t) => t.remove(key).unwrap_or(false),
+        }
     }
 
-    /// Ordered scan over all entries. Calls `f` per `(key, value)` pair.
     pub fn scan_all<F: FnMut(&[u8], &[u8])>(&self, f: F) {
-        self.tree.scan(f);
+        match &self.tree {
+            TreeHandle::BPlusTree(t) => t.scan(f),
+            TreeHandle::BeTree(t) => t.scan_prefix(&[], f),
+        }
     }
 
-    /// Ordered range scan over `[start, end)` (half-open). Calls `f` per
-    /// `(key, value)` pair whose key falls within the range.
     pub fn scan_range<F: FnMut(&[u8], &[u8])>(&self, start: &[u8], end: &[u8], mut f: F) {
-        self.tree
-            .scan_range(Bound::Included(start), Bound::Excluded(end), &mut f);
+        match &self.tree {
+            TreeHandle::BPlusTree(t) => {
+                t.scan_range(Bound::Included(start), Bound::Excluded(end), &mut f);
+            }
+            TreeHandle::BeTree(t) => {
+                t.scan_prefix(start, |key, value| {
+                    if key < end {
+                        f(key, value);
+                    }
+                });
+            }
+        }
     }
 
     /// Flush the WAL (durable fsync) without flushing dirty pages. This is
@@ -194,8 +245,6 @@ impl KvStore {
         Ok(())
     }
 
-    /// Checkpoint: flush WAL + dirty pages, advance user-meta slots, reset
-    /// the WAL. This is the full recovery-point establishment.
     pub fn checkpoint(&self) -> std::io::Result<()> {
         let checkpoint_lsn = self.wal.flush();
         self.pool.flush()?;
@@ -207,12 +256,10 @@ impl KvStore {
         Ok(())
     }
 
-    /// Return the B+tree's root page ID (for persistence / tooling).
     pub fn root_page_id(&self) -> u64 {
         self.tree.root_page_id()
     }
 
-    /// Return the B+tree height (for persistence / tooling).
     pub fn height(&self) -> u32 {
         self.tree.height()
     }
