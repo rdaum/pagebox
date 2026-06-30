@@ -185,7 +185,7 @@ pub struct WalStats {
 
 /// One record surfaced by [`Wal::replay`] / [`Wal::replay_records`].
 ///
-/// `PageImage` carries the full 4 KiB page bytes for `page_id` at `lsn`;
+/// `PageImage` carries the full page bytes for `page_id` at `lsn`;
 /// `Logical` carries a (re-assembled) logical record with caller-defined
 /// `kind` and payload. The lifetime is tied to the WAL's internal replay
 /// buffer; multi-shard merged-replay copies records into an owned staging
@@ -352,7 +352,7 @@ const LOGICAL_KIND_PAGE_IMAGE_BYTES: u64 = 0x4258_5049_4D47_0001;
 const LOGICAL_KIND_PAGE_PATCH: u64 = 0x4258_5041_5443_0001;
 const PAGE_IMAGE_BYTES_HEADER_LEN: usize = 16;
 const PAGE_PATCH_HEADER_LEN: usize = 16;
-const PAGE_PATCH_RANGE_HEADER_LEN: usize = 4;
+const PAGE_PATCH_RANGE_HEADER_LEN: usize = 8;
 
 struct WalInner {
     state: Mutex<WalState>,
@@ -512,14 +512,14 @@ fn chunk_count(payload_len: usize) -> usize {
 fn validate_entry_data(entry: BatchEntry, data: &[u8]) -> Option<&[u8]> {
     match entry.kind {
         RECORD_KIND_PAGE_IMAGE => {
-            if entry.flags != 0 || usize::from(entry.len) != PAGE_SIZE {
+            if entry.flags != 0 || data.len() != PAGE_SIZE {
                 return None;
             }
             let page: &[u8; PAGE_SIZE] = data.try_into().ok()?;
             (page_crc(page) == entry.crc).then_some(data)
         }
         RECORD_KIND_LOGICAL => {
-            let len = usize::from(entry.len);
+            let len = entry.len as usize;
             if len > LOGICAL_CHUNK_MAX_LEN || len > data.len() {
                 return None;
             }
@@ -531,7 +531,7 @@ fn validate_entry_data(entry: BatchEntry, data: &[u8]) -> Option<&[u8]> {
             (payload_crc(payload) == entry.crc).then_some(payload)
         }
         RECORD_KIND_LOGICAL_PACKED => {
-            let len = usize::from(entry.len);
+            let len = entry.len as usize;
             if entry.flags != 0 || len > data.len() {
                 return None;
             }
@@ -552,12 +552,12 @@ fn encode_packed_logical_entry(
     kind: u64,
     payload: &[u8],
 ) -> Option<usize> {
-    let len = u16::try_from(payload.len()).ok()?;
+    let len = u32::try_from(payload.len()).ok()?;
     let entry_len = packed_logical_entry_len(payload.len())?;
     let entry = dst.get_mut(..entry_len)?;
     entry[..8].copy_from_slice(&lsn.to_le_bytes());
     entry[8..16].copy_from_slice(&kind.to_le_bytes());
-    entry[16..18].copy_from_slice(&len.to_le_bytes());
+    entry[16..20].copy_from_slice(&len.to_le_bytes());
     entry[PACKED_LOGICAL_ENTRY_HEADER_LEN..].copy_from_slice(payload);
     Some(entry_len)
 }
@@ -573,9 +573,9 @@ where
         };
         let lsn = u64::from_le_bytes(header[..8].try_into().expect("packed LSN header"));
         let kind = u64::from_le_bytes(header[8..16].try_into().expect("packed kind header"));
-        let len = u16::from_le_bytes(header[16..18].try_into().expect("packed len header"));
+        let len = u32::from_le_bytes(header[16..20].try_into().expect("packed len header"));
         let payload_start = offset + PACKED_LOGICAL_ENTRY_HEADER_LEN;
-        let payload_end = payload_start + usize::from(len);
+        let payload_end = payload_start + len as usize;
         let Some(record_payload) = payload.get(payload_start..payload_end) else {
             return false;
         };
@@ -654,12 +654,11 @@ fn encode_page_patch_payload(
     payload.extend_from_slice(&range_count.to_le_bytes());
     payload.extend_from_slice(&0u32.to_le_bytes());
     for (start, len) in ranges {
-        let start = u16::try_from(start).ok()?;
-        let len = u16::try_from(len).ok()?;
+        let start = u32::try_from(start).ok()?;
+        let len = u32::try_from(len).ok()?;
         payload.extend_from_slice(&start.to_le_bytes());
         payload.extend_from_slice(&len.to_le_bytes());
-        payload
-            .extend_from_slice(&after[usize::from(start)..usize::from(start) + usize::from(len)]);
+        payload.extend_from_slice(&after[start as usize..start as usize + len as usize]);
     }
     Some(payload)
 }
@@ -679,8 +678,8 @@ fn decode_page_patch_payload(payload: &[u8]) -> Option<(PageId, PagePatchRanges<
     let mut offset = PAGE_PATCH_HEADER_LEN;
     for _ in 0..range_count {
         let header = payload.get(offset..offset + PAGE_PATCH_RANGE_HEADER_LEN)?;
-        let start = usize::from(u16::from_le_bytes(header[..2].try_into().ok()?));
-        let len = usize::from(u16::from_le_bytes(header[2..4].try_into().ok()?));
+        let start = u32::from_le_bytes(header[..4].try_into().ok()?) as usize;
+        let len = u32::from_le_bytes(header[4..8].try_into().ok()?) as usize;
         offset += PAGE_PATCH_RANGE_HEADER_LEN;
         let end = start.checked_add(len)?;
         if end > PAGE_SIZE {
@@ -1655,10 +1654,8 @@ impl Wal {
     }
 
     /// Append a variable-length page image as a logical record (rather than a
-    /// fixed 4 KiB page slot). Used by the buffer pool for large-page
-    /// classes where the image is bigger than `PAGE_SIZE`. `page_len` is the
-    /// length covered by `fill_page`; `page_id` carries the encoded
-    /// `PageClass`.
+    /// fixed `PAGE_SIZE` page slot). `page_len` is the length covered by
+    /// `fill_page`; `page_id` carries the page ID.
     pub fn append_page_image_bytes_with_lsn(
         &self,
         lsn: Lsn,
@@ -2947,7 +2944,7 @@ fn finalize_buffer_records(buffer: &mut WalBuffer, len: usize) {
                         page_crc(page)
                     }
                     RECORD_KIND_LOGICAL | RECORD_KIND_LOGICAL_PACKED => {
-                        payload_crc(&data[..usize::from(entry.len)])
+                        payload_crc(&data[..entry.len as usize])
                     }
                     _ => panic!("unknown WAL record kind {}", entry.kind),
                 }

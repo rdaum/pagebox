@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "metrics")]
 use fast_telemetry::{HistogramSnapshot, MetricLabels, MetricMeta, MetricVisitor};
-use pagebox_frame_kernel::{PAGE_SIZE, PageClass, PageId, page_size};
+use pagebox_frame_kernel::{PAGE_SIZE, PageId, page_size};
 
 use crate::format::{
     BATCH_MAX_RECORDS, BatchEntry, HDR_RECORD_SIZE_OFF, HDR_VERSION_OFF, WAL_HEADER_SIZE,
@@ -516,21 +516,22 @@ fn packed_logical_records_do_not_cross_later_page_images() {
 }
 
 #[test]
-fn large_page_images_use_chunked_logical_records() {
-    let path = tmp_path("large_page_image");
+fn page_image_roundtrips_as_reassembled_record() {
+    let path = tmp_path("page_image_roundtrip");
     let _cleanup = Cleanup(path.clone());
-    let pid = PageClass::Size64K.encode_page_id(9);
-    let page_len = PageClass::Size64K.page_size();
+    // With a single page class, pid 9 maps directly to page number 9 and a
+    // page image occupies one full WAL block.
+    let pid: PageId = 9;
 
     {
         let wal = Wal::open(&path).unwrap();
         let lsn = wal.claim_lsn();
         assert_eq!(lsn, 1);
-        wal.append_page_image_bytes_with_lsn(lsn, pid, page_len, |lsn, page| {
+        wal.append_page_image_with_lsn(lsn, pid, |lsn, page| {
             write_test_page_lsn(page, lsn);
             page[0] = 17;
-            page[PAGE_SIZE] = 42;
-            page[page_len - 1] = 99;
+            page[PAGE_SIZE / 2] = 42;
+            page[PAGE_SIZE - 1] = 99;
         })
         .unwrap();
         wal.flush();
@@ -545,8 +546,8 @@ fn large_page_images_use_chunked_logical_records() {
                 page_id,
                 data.len(),
                 data[0],
-                data[PAGE_SIZE],
-                data[page_len - 1],
+                data[PAGE_SIZE / 2],
+                data[PAGE_SIZE - 1],
             ));
         }
     })
@@ -554,23 +555,23 @@ fn large_page_images_use_chunked_logical_records() {
 
     assert_eq!(
         replayed,
-        vec![(1, pid, page_len, 17, 42, 99)],
-        "large page images should replay as reassembled page-image records"
+        vec![(1, pid, PAGE_SIZE, 17, 42, 99)],
+        "page images should replay as reassembled page-image records"
     );
 
     let store = TestRecoveryStore::default();
     let report = wal.recover(&store, 0, read_test_page_lsn).unwrap();
     assert_eq!(report.records_applied, 1);
 
-    let mut recovered = vec![0u8; page_len];
+    let mut recovered = vec![0u8; PAGE_SIZE];
     assert!(
         store.read_page(pid, &mut recovered).unwrap(),
-        "recovery should write the large page image"
+        "recovery should write the page image"
     );
     assert_eq!(read_test_page_lsn(&recovered), 1);
     assert_eq!(recovered[0], 17);
-    assert_eq!(recovered[PAGE_SIZE], 42);
-    assert_eq!(recovered[page_len - 1], 99);
+    assert_eq!(recovered[PAGE_SIZE / 2], 42);
+    assert_eq!(recovered[PAGE_SIZE - 1], 99);
 }
 
 #[test]

@@ -2,11 +2,11 @@
 //! [`BufferFrameReadRef`] / [`BufferFrameWriteRef`] identity handles, and the
 //! [`ParentLink`] enum that drives eviction.
 //!
-//! A `BufferFrame` is a 4 KiB-aligned, two-page structure: the first 4 KiB
-//! holds the [`HybridLatch`], [`FrameHeader`], and the header-resident
-//! `parent_link`; the second 4 KiB is the page's data region (accessed as
-//! `&[u8; PAGE_SIZE]`). This layout keeps a frame and its page on adjacent
-//! cache lines with no indirection.
+//! A `BufferFrame` is a 4096-aligned, two-page structure: the first
+//! `PAGE_SIZE` bytes hold the [`HybridLatch`], [`FrameHeader`], and the
+//! header-resident `parent_link`; the second `PAGE_SIZE` bytes are the page's
+//! data region (accessed as `&[u8; PAGE_SIZE]`). This layout keeps a frame
+//! and its page on adjacent cache lines with no indirection.
 //!
 //! [`HybridLatch`]: pagebox_hybrid_latch::HybridLatch
 //!
@@ -56,8 +56,7 @@
 
 pub use pagebox_frame_kernel::{
     AtomicFrameState, FrameCoreHeader, FrameState, InnerParentLink, Lsn, PAGE_SIZE,
-    PaddedAtomicU32, PageClass, PageId, decode_page_id, page_base_span, page_end_base_page,
-    page_size, page_slot_index, physical_page_number,
+    PaddedAtomicU32, PageId, page_base_span, page_end_base_page, page_size, physical_page_number,
 };
 
 use pagebox_hybrid_latch::{HybridLatch, OptimisticGuard, Restart};
@@ -393,10 +392,10 @@ const _: () = assert!(HEADER_BYTES <= PAGE_SIZE);
 
 /// The per-page in-memory slot.
 ///
-/// Layout (page-aligned, two 4 KiB halves):
+/// Layout (4096-aligned, two PAGE_SIZE halves):
 ///
 /// ```text
-///   ┌──────────────────────────────┐  ← 4 KiB-aligned base
+///   ┌──────────────────────────────┐  ← 4096-aligned base
 ///   │ HybridLatch                  │
 ///   │ FrameHeader (core +          │
 ///   │              parent_link +   │
@@ -508,26 +507,12 @@ impl BufferFrame {
     ///   refine ⟨std::slice::from_raw_parts((self as *const Self).cast::<u8>().wrapping_add(PAGE_SIZE), class.page_size()), ?_⟩
     ///   rfl
     /// ```
-    pub fn page_bytes(&self, class: PageClass) -> &[u8] {
-        let page_ptr = (self as *const Self).cast::<u8>().wrapping_add(PAGE_SIZE);
-        unsafe { std::slice::from_raw_parts(page_ptr, class.page_size()) }
+    pub fn page_bytes(&self) -> &[u8] {
+        &self.page
     }
 
-    /// ```anneal
-    /// ensures:
-    ///   let page_start = (self as *mut Self).cast::<u8>().wrapping_add(PAGE_SIZE);
-    ///   ret = std::slice::from_raw_parts_mut(page_start, class.page_size())
-    /// proof (h_anon):
-    ///   unfold BufferFrame::page_bytes_mut at h_returns
-    ///   simp_all [PAGE_SIZE]
-    /// proof (h_progress):
-    ///   unfold BufferFrame::page_bytes_mut
-    ///   refine ⟨std::slice::from_raw_parts_mut((self as *mut Self).cast::<u8>().wrapping_add(PAGE_SIZE), class.page_size()), ?_⟩
-    ///   rfl
-    /// ```
-    pub fn page_bytes_mut(&mut self, class: PageClass) -> &mut [u8] {
-        let page_ptr = (self as *mut Self).cast::<u8>().wrapping_add(PAGE_SIZE);
-        unsafe { std::slice::from_raw_parts_mut(page_ptr, class.page_size()) }
+    pub fn page_bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.page
     }
 
     /// Convert `Hot`/`Cool` child swips in this frame's page bytes to
@@ -637,10 +622,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn page_id_roundtrip_preserves_class_and_slot() {
-        let pid = PageClass::Size4K.encode_page_id(42);
-        assert_eq!(decode_page_id(pid), Some((PageClass::Size4K, 42)));
-        assert_eq!(page_slot_index(pid), Some((PageClass::Size4K, 41)));
+    fn page_id_is_identity_for_plain_pids() {
+        assert_eq!(physical_page_number(42), 42);
+        assert_eq!(page_size(42), PAGE_SIZE);
+        assert_eq!(page_base_span(42), 1);
+        assert_eq!(page_end_base_page(42), 42);
     }
 
     #[test]
@@ -652,31 +638,13 @@ mod tests {
         assert_eq!(
             page - base,
             PAGE_SIZE,
-            "page bytes should start in the second 4 KiB half of the slot"
+            "page bytes should start at the PAGE_SIZE offset from the frame base"
         );
-        assert_eq!(page % PAGE_SIZE, 0, "page bytes must be 4 KiB aligned");
+        assert_eq!(page % 4096, 0, "page bytes must be 4096-aligned");
         assert_eq!(
             std::mem::size_of::<BufferFrame>(),
             PAGE_SIZE * 2,
             "buffer frame should occupy one header page plus one data page"
         );
-    }
-
-    #[test]
-    fn page_id_roundtrip_all_page_classes() {
-        for class in PageClass::ALL {
-            let page_number = 42u64;
-            let pid = class.encode_page_id(page_number);
-            assert_eq!(
-                decode_page_id(pid),
-                Some((class, page_number)),
-                "{class:?}: encode/decode roundtrip"
-            );
-            assert_eq!(
-                page_slot_index(pid),
-                Some((class, page_number as usize - 1)),
-                "{class:?}: slot index"
-            );
-        }
     }
 }

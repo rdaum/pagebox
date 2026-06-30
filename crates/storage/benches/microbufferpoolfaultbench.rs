@@ -6,7 +6,7 @@ use micromeasure::{
     ConcurrentBenchContext, ConcurrentBenchControl, ConcurrentWorker, ConcurrentWorkerResult,
     Throughput, benchmark_main, black_box,
 };
-use pagebox_storage::buffer_frame::{PAGE_SIZE, PageClass};
+use pagebox_storage::buffer_frame::PAGE_SIZE;
 use pagebox_storage::buffer_pool::BufferPool;
 use pagebox_storage::page_store::{FilePageStore, PageStore};
 
@@ -47,9 +47,8 @@ fn env_bool(name: &str, default: bool) -> bool {
 }
 
 fn shuffled(n: usize) -> Vec<u64> {
-    let mut v: Vec<u64> = (1..=n as u64)
-        .map(|page_number| PageClass::Size4K.encode_page_id(page_number))
-        .collect();
+    // With a single page class, page IDs are plain page numbers.
+    let mut v: Vec<u64> = (1..=n as u64).collect();
     for i in (1..v.len()).rev() {
         let h = (i as u64)
             .wrapping_mul(0x517c_c1b7_2722_0a95)
@@ -68,12 +67,12 @@ fn populate_store(config: FaultBenchConfig) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("data");
     let store = FilePageStore::open(&path).expect("open page store");
-    let max_pid = PageClass::Size4K.encode_page_id(config.num_pages as u64);
+    let max_pid = config.num_pages as u64;
     store.allocate(max_pid).expect("allocate benchmark pages");
 
     let mut page = AlignedPage([0u8; PAGE_SIZE]);
     for page_number in 1..=config.num_pages as u64 {
-        let pid = PageClass::Size4K.encode_page_id(page_number);
+        let pid = page_number;
         page.0[0..8].copy_from_slice(&pid.to_le_bytes());
         page.0[8..16].copy_from_slice(&page_number.to_le_bytes());
         store

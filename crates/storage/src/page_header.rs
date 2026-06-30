@@ -5,8 +5,6 @@
 //! residency policy. Higher-level page formats own everything past this
 //! prefix.
 
-use crate::buffer_frame::PAGE_SIZE;
-
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PageType {
@@ -35,8 +33,8 @@ impl PageType {
     }
 }
 
-const FLAGS_OFF: usize = 6;
-const PAGE_LSN_OFF: usize = 8;
+const FLAGS_OFF: usize = 18;
+const PAGE_LSN_OFF: usize = 0;
 const PAGE_LSN_LEN: usize = 8;
 const PAGE_TYPE_SHIFT: u32 = 8;
 const PAGE_TYPE_MASK: u16 = 0x0F00;
@@ -87,5 +85,5 @@ pub fn should_remain_resident(page: &[u8]) -> bool {
 }
 
 pub fn classify_loaded_page(page: &[u8]) -> PageType {
-    read_page_type(page.get(..PAGE_SIZE).unwrap_or(page))
+    read_page_type(page)
 }

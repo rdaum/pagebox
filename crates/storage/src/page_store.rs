@@ -819,49 +819,47 @@ mod tests {
     }
 
     #[test]
-    fn large_page_class_roundtrips_through_file_store() {
-        let path = tmp_path("large_page_class");
+    fn page_roundtrips_through_file_store() {
+        let path = tmp_path("page_roundtrip");
         let _c = Cleanup(path.clone());
-        let class = crate::buffer_frame::PageClass::Size64K;
-        let pid = class.encode_page_id(1);
+        // With a single page class, pid 1 maps directly to page number 1.
+        let pid: PageId = 1;
 
         {
             let store = FilePageStore::open(&path).unwrap();
             PageStore::allocate(&store, pid).unwrap();
 
-            let mut data = vec![0u8; class.page_size()];
+            let mut data = vec![0u8; PAGE_SIZE];
             data[0] = 7;
-            data[PAGE_SIZE] = 8;
-            data[class.page_size() - 1] = 9;
+            data[PAGE_SIZE - 1] = 9;
             PageStore::write_page(&store, pid, &data).unwrap();
             PageStore::sync(&store).unwrap();
 
             assert_eq!(
                 store.len(),
-                class.base_page_count(),
-                "large page allocation should consume the full base-page span"
+                1,
+                "page allocation should consume one base page"
             );
             assert_eq!(
                 PageStore::next_page_id(&store),
-                class.base_page_count() as u64 + 1,
-                "next page id should advance past the large page span"
+                2,
+                "next page id should advance past the allocated page"
             );
         }
 
         {
             let store = FilePageStore::open(&path).unwrap();
-            let mut buf = vec![0u8; class.page_size()];
+            let mut buf = vec![0u8; PAGE_SIZE];
 
             assert!(
                 PageStore::read_page(&store, pid, &mut buf).unwrap(),
-                "large class page should be readable after reopen"
+                "page should be readable after reopen"
             );
             assert_eq!(buf[0], 7, "first byte should roundtrip");
-            assert_eq!(buf[PAGE_SIZE], 8, "second base page should roundtrip");
             assert_eq!(
-                buf[class.page_size() - 1],
+                buf[PAGE_SIZE - 1],
                 9,
-                "last byte of the large page should roundtrip"
+                "last byte of the page should roundtrip"
             );
         }
     }
@@ -1060,12 +1058,12 @@ mod tests {
 
     #[test]
     fn write_page_to_unallocated_pid_extends_file() {
-        use crate::buffer_frame::PageClass;
         let path = tmp_path("write_unallocated");
         let _c = Cleanup(path.clone());
 
         let store = FilePageStore::open(&path).unwrap();
-        let pid = PageClass::Size4K.encode_page_id(99);
+        // With a single page class, pid 99 maps directly to page number 99.
+        let pid: PageId = 99;
 
         // Writing without allocating first — the store should extend or accept.
         let data = [0xAB; PAGE_SIZE];

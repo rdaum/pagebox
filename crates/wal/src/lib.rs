@@ -21,19 +21,19 @@
 //!
 //! Each shard file starts with a header page (`WAL_MAGIC`, version, flags,
 //! record size) followed by an append-only sequence of *batches*. A batch is
-//! one 4 KiB *batch-meta page* followed by up to `BATCH_MAX_RECORDS` (170)
-//! 4 KiB *data pages*:
+//! one *batch-meta page* followed by up to `BATCH_MAX_RECORDS` *data pages*:
 //!
 //! ```text
 //!   ┌─────────┬───────────────┬───────────────┬─────┬───────────────┐
 //!   │ header  │ batch meta[0] │ data page[0]  │ ... │ batch meta[1] │ ...
-//!   │ 4 KiB   │  4 KiB        │  4 KiB        │     │
+//!   │PAGE_SIZE│  PAGE_SIZE    │  PAGE_SIZE    │     │
 //!   └─────────┴───────────────┴───────────────┴─────┴───────────────┘
 //! ```
 //!
-//! The batch-meta page holds a fixed-size array of 24-byte `BatchEntry`
-//! records (LSN, arg, CRC, kind, flags, len); each data page holds one
-//! page-image payload or one (possibly multi-chunk) logical-record payload.
+//! The batch-meta page holds a fixed-size array of `BATCH_ENTRY_SIZE`-byte
+//! `BatchEntry` records (LSN, arg, CRC, len, kind, flags); each data page
+//! holds one page-image payload or one (possibly multi-chunk) logical-record
+//! payload.
 //! CRC32 (ISO-HDLC) covers the batch-meta page (excluding the CRC field
 //! itself); a missing or wrong-CRC batch terminates replay at the previous
 //! batch (so a torn tail is silently truncated at open time).

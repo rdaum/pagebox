@@ -1,8 +1,8 @@
 //! The concurrent buffer pool: page fixing, residency, eviction, prefetch, and
 //! dirty-page tracking.
 //!
-//! This is the heart of `pagebox-storage`. The [`BufferPool`] owns a
-//! `PageClass`-partitioned array of [`BufferFrame`]s and serves four kinds of
+//! This is the heart of `pagebox-storage`. The [`BufferPool`] owns an
+//! array of [`BufferFrame`]s and serves four kinds of
 //! caller request against a page:
 //!
 //! 1. **fix** — make a page resident (load it from the page store if needed)
@@ -103,15 +103,15 @@ use fast_telemetry::{
 use pagebox_hybrid_latch::{ExclusiveGuard, OptimisticGuard, Restart, SharedGuard};
 use pagebox_threading as threading;
 #[cfg(not(miri))]
-use pagebox_wal::{BufferedWalRecord, CommitMode, Wal};
+use pagebox_wal::{BufferedWalRecord, Wal};
 
 #[cfg(not(feature = "metrics"))]
 use crate::metrics_stub::{Counter, Gauge, Histogram, LabeledCounter, LabeledGauge, MetricVisitor};
 
 use crate::buffer_frame::PAGE_SIZE;
 use crate::buffer_frame::{
-    BufferFrame, BufferFrameReadRef, BufferFrameRef, BufferFrameWriteRef, FrameState, PageClass,
-    PageReclaimer, PageWritebackPreparer, ParentFinder, ParentLink, StableSwipRef, decode_page_id,
+    BufferFrame, BufferFrameReadRef, BufferFrameRef, BufferFrameWriteRef, FrameState,
+    PageReclaimer, PageWritebackPreparer, ParentFinder, ParentLink, StableSwipRef,
     physical_page_number,
 };
 use crate::buffer_frame::{Lsn, PageId};
@@ -237,24 +237,27 @@ impl PageTable {
 }
 
 // ---------------------------------------------------------------------------
-// ClassArena — mmap on real builds, Vec fallback under miri
+// Arena — mmap on real builds, Vec fallback under miri
 // ---------------------------------------------------------------------------
 
-struct ClassArena {
-    class: PageClass,
+// With a single page class, every frame has the same stride: one header page
+// plus one data page (both PAGE_SIZE). This equals `size_of::<BufferFrame>()`.
+const FRAME_STRIDE: usize = 2 * PAGE_SIZE;
+
+struct Arena {
     ptr: *mut BufferFrame,
     len: usize,
     byte_len: usize,
     frame_stride: usize,
 }
 
-unsafe impl Send for ClassArena {}
-unsafe impl Sync for ClassArena {}
+unsafe impl Send for Arena {}
+unsafe impl Sync for Arena {}
 
 #[cfg(not(miri))]
-impl ClassArena {
-    fn new(class: PageClass, num_frames: usize) -> Self {
-        let frame_stride = class_frame_stride(class);
+impl Arena {
+    fn new(num_frames: usize) -> Self {
+        let frame_stride = FRAME_STRIDE;
         let byte_len = frame_stride * num_frames;
         assert!(byte_len > 0, "cannot create empty frame array");
 
@@ -275,8 +278,8 @@ impl ClassArena {
         assert_ne!(ptr, libc::MAP_FAILED, "mmap failed");
 
         // Request Transparent Huge Pages for the frame arena to reduce TLB
-        // pressure. The arena is large (16× the resident budget per class)
-        // and accessed frequently on the hot path.
+        // pressure. The arena is large (16× the resident budget) and accessed
+        // frequently on the hot path.
         #[cfg(target_os = "linux")]
         {
             let ret = unsafe { libc::madvise(ptr, byte_len, libc::MADV_HUGEPAGE) };
@@ -303,8 +306,7 @@ impl ClassArena {
 
         let ptr = ptr as *mut BufferFrame;
 
-        ClassArena {
-            class,
+        Arena {
             ptr,
             len: num_frames,
             byte_len,
@@ -314,22 +316,21 @@ impl ClassArena {
 }
 
 #[cfg(not(miri))]
-impl Drop for ClassArena {
+impl Drop for Arena {
     fn drop(&mut self) {
         unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.byte_len) };
     }
 }
 
 #[cfg(miri)]
-impl ClassArena {
-    fn new(class: PageClass, num_frames: usize) -> Self {
-        let frame_stride = class_frame_stride(class);
+impl Arena {
+    fn new(num_frames: usize) -> Self {
+        let frame_stride = FRAME_STRIDE;
         let byte_len = frame_stride * num_frames;
         let layout = std::alloc::Layout::from_size_align(byte_len, PAGE_SIZE).unwrap();
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut BufferFrame };
         assert!(!ptr.is_null(), "frame arena allocation failed");
-        ClassArena {
-            class,
+        Arena {
             ptr,
             len: num_frames,
             byte_len,
@@ -339,7 +340,7 @@ impl ClassArena {
 }
 
 #[cfg(miri)]
-impl Drop for ClassArena {
+impl Drop for Arena {
     fn drop(&mut self) {
         let layout = std::alloc::Layout::from_size_align(self.byte_len, PAGE_SIZE).unwrap();
         unsafe { std::alloc::dealloc(self.ptr as *mut u8, layout) };
@@ -348,10 +349,6 @@ impl Drop for ClassArena {
 
 // Compile-time checks for alignment compatibility with mmap/madvise.
 const _: () = assert!(align_of::<BufferFrame>() <= 4096);
-
-fn class_frame_stride(class: PageClass) -> usize {
-    PAGE_SIZE + class.page_size()
-}
 
 struct AlignedPageCopy {
     ptr: std::ptr::NonNull<u8>,
@@ -481,11 +478,10 @@ impl ParentChildEdge {
     }
 }
 
-struct ClassState {
-    arena: ClassArena,
+struct PoolState {
+    arena: Arena,
     slot_init: Box<[AtomicU8]>,
     free_list: FreeList,
-    allocated_slots: AtomicUsize,
     eviction_hand: AtomicUsize,
 }
 
@@ -519,7 +515,7 @@ struct ClassState {
 ///   logged before being written to the data file.
 pub struct BufferPool {
     self_weak: OnceLock<Weak<BufferPool>>,
-    classes: Box<[ClassState]>,
+    state: PoolState,
     page_table: PageTable,
     page_store: Box<dyn PageStore>,
     next_page_id: AtomicU64,
@@ -528,8 +524,6 @@ pub struct BufferPool {
     resident_base_pages_available: AtomicUsize,
     #[cfg(not(miri))]
     wal: Option<Arc<Wal>>,
-    #[cfg(not(miri))]
-    dirty_wal_images: parking_lot::Mutex<HashMap<PageId, Box<[u8; PAGE_SIZE]>>>,
     prefetch_workers: std::sync::Mutex<PrefetchWorkers>,
     prefetch_inflight: parking_lot::Mutex<HashSet<PageId>>,
     metrics: BufferPoolMetrics,
@@ -870,17 +864,6 @@ fn eviction_policy() -> EvictionPolicy {
     })
 }
 
-#[cfg(not(miri))]
-fn wal_page_patches_enabled() -> bool {
-    static VALUE: OnceLock<bool> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        matches!(
-            std::env::var("PAGEBOX_WAL_PAGE_PATCHES").ok().as_deref(),
-            Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
-        )
-    })
-}
-
 /// Name of the eviction policy in effect for this process.
 ///
 /// Resolved once from `PAGEBOX_EVICTION_POLICY` at first call; one of
@@ -1007,16 +990,14 @@ impl Drop for PrefetchInflightGuard<'_> {
 
 struct LoadingFrameReservation<'a> {
     pool: &'a BufferPool,
-    class: PageClass,
     bf: *mut BufferFrame,
     active: bool,
 }
 
 impl<'a> LoadingFrameReservation<'a> {
-    fn new(pool: &'a BufferPool, class: PageClass, bf: *mut BufferFrame) -> Self {
+    fn new(pool: &'a BufferPool, bf: *mut BufferFrame) -> Self {
         Self {
             pool,
-            class,
             bf,
             active: true,
         }
@@ -1030,7 +1011,7 @@ impl<'a> LoadingFrameReservation<'a> {
 impl Drop for LoadingFrameReservation<'_> {
     fn drop(&mut self) {
         if self.active {
-            unsafe { self.pool.release_loading_frame(self.class, self.bf) };
+            unsafe { self.pool.release_loading_frame(self.bf) };
         }
     }
 }
@@ -1131,7 +1112,6 @@ impl BufferPool {
     unsafe fn install_loaded_frame_metadata(
         &self,
         bf: *mut BufferFrame,
-        class: PageClass,
         pid: PageId,
         parent_link: ParentLink,
         pin_count: u32,
@@ -1147,7 +1127,7 @@ impl BufferPool {
             (*bf).header.core.referenced.store(true, Ordering::Relaxed);
             (*bf).header.core.dirty.store(false, Ordering::Relaxed);
 
-            let on_disk_lsn = page_header::read_page_lsn((*bf).page_bytes(class));
+            let on_disk_lsn = page_header::read_page_lsn((*bf).page_bytes());
             (*bf)
                 .header
                 .core
@@ -1166,7 +1146,7 @@ impl BufferPool {
         }
     }
 
-    unsafe fn release_loading_frame(&self, class: PageClass, bf: *mut BufferFrame) {
+    unsafe fn release_loading_frame(&self, bf: *mut BufferFrame) {
         let pid = unsafe { (*bf).header.core.pid };
         if pid != 0 {
             self.page_table.remove(pid);
@@ -1180,9 +1160,9 @@ impl BufferPool {
                 .state
                 .store(FrameState::Free, Ordering::Release);
         }
-        self.release_resident_budget(class, bf);
+        self.release_resident_budget(bf);
         // Recycle the frame to the FreeList (eliminates MADV_DONTNEED).
-        self.class_state(class).free_list.push(bf);
+        self.state.free_list.push(bf);
     }
 
     fn enter_loading_frame_wait(&self, page_id: u64) {
@@ -1306,11 +1286,10 @@ fn prefetch_worker_loop(
                 };
                 pool.record_simple_prefetch_queue_wait(req.enqueued_at.elapsed());
                 let service_start = Instant::now();
-                let class = BufferPool::page_class(req.pid);
                 let bf = if let Some(existing) = pool.page_table.lookup(req.pid) {
                     existing
                 } else {
-                    match pool.class_state(class).free_list.try_pop() {
+                    match pool.state.free_list.try_pop() {
                         Some(bf) => bf,
                         None => continue,
                     }
@@ -1319,18 +1298,17 @@ fn prefetch_worker_loop(
                 else {
                     continue;
                 };
-                let class = BufferPool::page_class(req.pid);
                 let Some(_guard) = (unsafe { pool.try_lock_frame_exclusive_at(bf, req.pid) })
                 else {
                     continue;
                 };
-                let Some(loading) = try_claim_prefetch_frame(&pool, bf, req.pid, class) else {
+                let Some(loading) = try_claim_prefetch_frame(&pool, bf, req.pid) else {
                     continue;
                 };
 
                 let read_start = Instant::now();
-                let found = read_prefetch_page(&pool, bf, req.pid, class);
-                finish_prefetch_frame(&pool, bf, class, found, read_start.elapsed(), loading);
+                let found = read_prefetch_page(&pool, bf, req.pid);
+                finish_prefetch_frame(&pool, bf, found, read_start.elapsed(), loading);
                 pool.record_simple_prefetch_service(service_start.elapsed());
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -1347,13 +1325,12 @@ fn try_claim_prefetch_frame(
     pool: &BufferPool,
     bf: *mut BufferFrame,
     pid: PageId,
-    class: PageClass,
 ) -> Option<LoadingFrameReservation<'_>> {
     let state = unsafe { (*bf).header.core.state.load(Ordering::Acquire) };
     if state != FrameState::Free {
         return None;
     }
-    if !pool.try_reserve_resident_budget(class) {
+    if !pool.try_reserve_resident_budget() {
         return None;
     }
 
@@ -1368,16 +1345,11 @@ fn try_claim_prefetch_frame(
         (*bf).header.core.dirty.store(false, Ordering::Relaxed);
         (*bf).header.parent_link = ParentLink::None;
     }
-    Some(LoadingFrameReservation::new(pool, class, bf))
+    Some(LoadingFrameReservation::new(pool, bf))
 }
 
-fn read_prefetch_page(
-    pool: &BufferPool,
-    bf: *mut BufferFrame,
-    pid: PageId,
-    class: PageClass,
-) -> bool {
-    let page = unsafe { (*bf).page_bytes_mut(class) };
+fn read_prefetch_page(pool: &BufferPool, bf: *mut BufferFrame, pid: PageId) -> bool {
+    let page = unsafe { (*bf).page_bytes_mut() };
     pool.page_store
         .read_page(pid, page)
         .expect("prefetch read failed")
@@ -1386,15 +1358,14 @@ fn read_prefetch_page(
 fn finish_prefetch_frame(
     pool: &BufferPool,
     bf: *mut BufferFrame,
-    class: PageClass,
     found: bool,
     read_elapsed: Duration,
     loading: LoadingFrameReservation<'_>,
 ) {
     if found {
-        pool.record_simple_prefetch_load(unsafe { (*bf).page_bytes(class) }, read_elapsed);
+        pool.record_simple_prefetch_load(unsafe { (*bf).page_bytes() }, read_elapsed);
         unsafe {
-            let on_disk_lsn = page_header::read_page_lsn((*bf).page_bytes(class));
+            let on_disk_lsn = page_header::read_page_lsn((*bf).page_bytes());
             (*bf)
                 .header
                 .core
@@ -1484,7 +1455,7 @@ impl<'a> PinnedFrame<'a> {
     }
 
     pub fn page_bytes(&self) -> &[u8] {
-        unsafe { (*self.bf).page_bytes(BufferPool::frame_class(self.bf)) }
+        unsafe { (*self.bf).page_bytes() }
     }
 
     pub fn mark_dirty(&self) {
@@ -1506,19 +1477,8 @@ impl<'a> PinnedFrame<'a> {
     }
 }
 
-impl ClassArena {
-    fn class(&self) -> PageClass {
-        self.class
-    }
-}
-
-impl ClassState {
-    fn new(
-        class: PageClass,
-        slot_capacity: usize,
-        allocated_slots: usize,
-        _resident_budget: usize,
-    ) -> Self {
+impl PoolState {
+    fn new(slot_capacity: usize) -> Self {
         #[cfg(not(miri))]
         let slot_init = (0..slot_capacity)
             .map(|_| AtomicU8::new(0))
@@ -1530,10 +1490,9 @@ impl ClassState {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self {
-            arena: ClassArena::new(class, slot_capacity),
+            arena: Arena::new(slot_capacity),
             slot_init,
             free_list: FreeList::new(),
-            allocated_slots: AtomicUsize::new(allocated_slots),
             eviction_hand: AtomicUsize::new(0),
         }
     }
@@ -1706,7 +1665,7 @@ impl<'a> ResidentSharedFrame<'a> {
     }
 
     pub fn page_bytes(&self) -> &[u8] {
-        unsafe { (*self.bf).page_bytes(BufferPool::frame_class(self.bf)) }
+        unsafe { (*self.bf).page_bytes() }
     }
 }
 
@@ -1786,7 +1745,7 @@ impl ResidentOptimisticFrame<'_> {
     }
 
     pub fn page_bytes(&self) -> &[u8] {
-        unsafe { (*self.bf).page_bytes(BufferPool::frame_class(self.bf)) }
+        unsafe { (*self.bf).page_bytes() }
     }
 
     pub fn validate(&self) -> Result<(), Restart> {
@@ -1868,7 +1827,7 @@ impl<'a> ExclusiveFrame<'a> {
 
     pub fn page_bytes_mut(&mut self) -> &mut [u8] {
         let bf = self.raw();
-        unsafe { (*bf).page_bytes_mut(BufferPool::frame_class(bf)) }
+        unsafe { (*bf).page_bytes_mut() }
     }
 
     pub fn page_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
@@ -2148,28 +2107,13 @@ impl BufferPool {
         unsafe { (*bf).header.core.referenced.store(true, Ordering::Relaxed) };
     }
 
-    fn class_state(&self, class: PageClass) -> &ClassState {
-        &self.classes[class.tag() as usize]
+    fn arena(&self) -> &Arena {
+        &self.state.arena
     }
 
-    fn arena(&self, class: PageClass) -> &ClassArena {
-        &self.class_state(class).arena
-    }
-
-    fn allocated_slots(&self, class: PageClass) -> usize {
-        // All classes are pre-constructed; scan the full arena.
-        self.arena(class).len
-    }
-
-    fn page_class(page_id: PageId) -> PageClass {
-        decode_page_id(page_id)
-            .map(|(class, _)| class)
-            .unwrap_or_else(|| panic!("invalid encoded page id {page_id}"))
-    }
-
-    fn frame_class(bf: *mut BufferFrame) -> PageClass {
-        let page_id = unsafe { (*bf).header.core.pid };
-        Self::page_class(page_id)
+    fn allocated_slots(&self) -> usize {
+        // The full arena is pre-constructed at init.
+        self.arena().len
     }
 
     /// Pin a child frame referenced by `swip`, handling HOT/COOL/EVICTED
@@ -2697,25 +2641,24 @@ impl BufferPool {
         Some(unsafe { PinnedFrame::new(self, bf) })
     }
 
-    fn raw_frame(&self, class: PageClass, idx: usize) -> *mut BufferFrame {
-        let arena = self.arena(class);
+    fn raw_frame(&self, idx: usize) -> *mut BufferFrame {
+        let arena = self.arena();
         debug_assert!(idx < arena.len);
         unsafe { (arena.ptr as *mut u8).add(idx * arena.frame_stride) as *mut BufferFrame }
     }
 
-    fn is_slot_initialized(&self, class: PageClass, idx: usize) -> bool {
+    fn is_slot_initialized(&self, _idx: usize) -> bool {
         // All frames are pre-constructed at init; every slot is initialized.
-        let _ = (class, idx);
         true
     }
 
-    fn try_reserve_resident_budget(&self, class: PageClass) -> bool {
-        let needed = class.base_page_count();
+    fn try_reserve_resident_budget(&self) -> bool {
+        // With a single page class, each frame consumes one base page.
         let mut available = self.resident_base_pages_available.load(Ordering::Relaxed);
-        while available >= needed {
+        while available >= 1 {
             match self.resident_base_pages_available.compare_exchange_weak(
                 available,
-                available - needed,
+                available - 1,
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
@@ -2726,7 +2669,7 @@ impl BufferPool {
         false
     }
 
-    fn wait_for_resident_budget(&self, class: PageClass) {
+    fn wait_for_resident_budget(&self) {
         // When the background page provider is enabled, it handles eviction
         // and dirty-page flushing. Workers just wake it and wait.
         // Otherwise, workers do inline eviction.
@@ -2740,8 +2683,7 @@ impl BufferPool {
 
         let mut idle = 0u32;
         loop {
-            if self.resident_base_pages_available.load(Ordering::Relaxed) >= class.base_page_count()
-            {
+            if self.resident_base_pages_available.load(Ordering::Relaxed) >= 1 {
                 return;
             }
             idle += 1;
@@ -2750,9 +2692,7 @@ impl BufferPool {
             // safety valve when it's on).
             if self.try_evict_any_policy(16) > 0 || self.try_evict_any_batch(16) > 0 {
                 idle = 0;
-                if self.resident_base_pages_available.load(Ordering::Relaxed)
-                    >= class.base_page_count()
-                {
+                if self.resident_base_pages_available.load(Ordering::Relaxed) >= 1 {
                     return;
                 }
             }
@@ -2766,7 +2706,7 @@ impl BufferPool {
             }
 
             if idle >= 100 {
-                self.panic_pool_exhausted(class);
+                self.panic_pool_exhausted();
             }
 
             if let Some(frames_available) = &frames_available {
@@ -2783,21 +2723,21 @@ impl BufferPool {
         }
     }
 
-    fn reserve_resident_budget(&self, class: PageClass) {
+    fn reserve_resident_budget(&self) {
         loop {
-            if self.try_reserve_resident_budget(class) {
+            if self.try_reserve_resident_budget() {
                 return;
             }
-            self.wait_for_resident_budget(class);
+            self.wait_for_resident_budget();
         }
     }
 
     /// Pop a free frame from the FreeList. If empty, evicts to replenish.
     /// Panics if all frames are pinned (pool exhausted).
-    fn pop_free_frame(&self, class: PageClass) -> *mut BufferFrame {
+    fn pop_free_frame(&self) -> *mut BufferFrame {
         let mut idle = 0u32;
         loop {
-            if let Some(bf) = self.class_state(class).free_list.try_pop() {
+            if let Some(bf) = self.state.free_list.try_pop() {
                 return bf;
             }
             if self.try_evict_any_policy(16) > 0 || self.try_evict_any_batch(16) > 0 {
@@ -2806,7 +2746,7 @@ impl BufferPool {
                 idle += 1;
             }
             if idle >= 100 {
-                self.panic_pool_exhausted(class);
+                self.panic_pool_exhausted();
             }
             if idle >= 16
                 && let Ok(flushed) = self.try_flush_dirty_batch(64)
@@ -2896,14 +2836,12 @@ impl BufferPool {
 
     fn contains_frame_ptr(&self, bf: *mut BufferFrame) -> bool {
         let addr = bf as usize;
-        PageClass::ALL.iter().any(|&class| {
-            let arena = self.arena(class);
-            let base = arena.ptr as usize;
-            let byte_len = arena.len.saturating_mul(arena.frame_stride);
-            addr >= base
-                && addr < base.saturating_add(byte_len)
-                && (addr - base).is_multiple_of(arena.frame_stride)
-        })
+        let arena = self.arena();
+        let base = arena.ptr as usize;
+        let byte_len = arena.len.saturating_mul(arena.frame_stride);
+        addr >= base
+            && addr < base.saturating_add(byte_len)
+            && (addr - base).is_multiple_of(arena.frame_stride)
     }
 
     pub fn new(num_frames: usize) -> Self {
@@ -2921,22 +2859,12 @@ impl BufferPool {
         start_pid: PageId,
     ) -> Self {
         let num_shards = num_cpus().max(1);
-        let classes = PageClass::ALL
-            .iter()
-            .map(|&class| {
-                // Size each class arena to fit `num_frames` base pages of
-                // budget. A Size4K frame holds 1 base page, a Size64K
-                // frame holds 16, etc. This keeps the byte budget
-                // proportional across classes.
-                let frame_count = num_frames / class.base_page_count().max(1);
-                ClassState::new(class, frame_count.max(1), 0, num_frames)
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        let frame_count = num_frames.max(1);
+        let state = PoolState::new(frame_count);
 
         let pool = BufferPool {
             self_weak: OnceLock::new(),
-            classes,
+            state,
             page_table: PageTable::new(),
             page_store,
             next_page_id: AtomicU64::new(start_pid),
@@ -2945,8 +2873,6 @@ impl BufferPool {
             resident_base_pages_available: AtomicUsize::new(num_frames),
             #[cfg(not(miri))]
             wal: None,
-            #[cfg(not(miri))]
-            dirty_wal_images: parking_lot::Mutex::new(HashMap::new()),
             prefetch_workers: std::sync::Mutex::new(PrefetchWorkers::new()),
             prefetch_inflight: parking_lot::Mutex::new(HashSet::new()),
             metrics: BufferPoolMetrics::new(num_shards),
@@ -2965,20 +2891,16 @@ impl BufferPool {
             page_provider: std::sync::Mutex::new(page_provider::PageProviderHandle::new()),
         };
 
-        // Pre-construct frames for all classes and seed their FreeLists.
+        // Pre-construct frames for all slots and seed the FreeList.
         // This replaces the lazy slot-init mechanism: frames are recycled
         // via the FreeList rather than addressed by page ID.
-        for &class in &PageClass::ALL {
-            let cs = pool.class_state(class);
-            let arena = &cs.arena;
-            for idx in 0..arena.len {
-                let bf = unsafe {
-                    (arena.ptr as *mut u8).add(idx * arena.frame_stride) as *mut BufferFrame
-                };
-                unsafe { bf.write(BufferFrame::new()) };
-                cs.slot_init[idx].store(2, Ordering::Release);
-                cs.free_list.push(bf);
-            }
+        let arena = &pool.state.arena;
+        for idx in 0..arena.len {
+            let bf =
+                unsafe { (arena.ptr as *mut u8).add(idx * arena.frame_stride) as *mut BufferFrame };
+            unsafe { bf.write(BufferFrame::new()) };
+            pool.state.slot_init[idx].store(2, Ordering::Release);
+            pool.state.free_list.push(bf);
         }
 
         pool
@@ -3036,18 +2958,16 @@ impl BufferPool {
 
     fn current_frame_state_counts(&self) -> BufferPoolFrameStateCounts {
         let mut counts = BufferPoolFrameStateCounts::default();
-        for &class in &PageClass::ALL {
-            for i in 0..self.allocated_slots(class) {
-                if !self.is_slot_initialized(class, i) {
-                    continue;
-                }
-                let bf = self.raw_frame(class, i);
-                match unsafe { (*bf).header.core.state.load(Ordering::Relaxed) } {
-                    FrameState::Free => {}
-                    FrameState::Resident => counts.resident += 1,
-                    FrameState::Loading => counts.loading += 1,
-                    FrameState::Evicting => counts.evicting += 1,
-                }
+        for i in 0..self.allocated_slots() {
+            if !self.is_slot_initialized(i) {
+                continue;
+            }
+            let bf = self.raw_frame(i);
+            match unsafe { (*bf).header.core.state.load(Ordering::Relaxed) } {
+                FrameState::Free => {}
+                FrameState::Resident => counts.resident += 1,
+                FrameState::Loading => counts.loading += 1,
+                FrameState::Evicting => counts.evicting += 1,
             }
         }
         counts
@@ -3116,7 +3036,6 @@ impl BufferPool {
 
     unsafe fn prepare_orphan_loading_frame(
         &self,
-        class: PageClass,
         bf: *mut BufferFrame,
         page_id: PageId,
     ) -> LoadingFrameReservation<'_> {
@@ -3130,7 +3049,7 @@ impl BufferPool {
                 .state
                 .store(FrameState::Loading, Ordering::Release);
         }
-        LoadingFrameReservation::new(self, class, bf)
+        LoadingFrameReservation::new(self, bf)
     }
 
     fn try_reclaim_before_evict(&self, page_pid: u64, page_bf: *mut BufferFrame) {
@@ -3216,14 +3135,7 @@ impl BufferPool {
     /// any other durable owner metadata.
     pub unsafe fn retire_unlinked_exclusive_frame(&self, frame: ExclusiveFrame<'_>) -> PageId {
         let bf = frame.raw();
-        let class = Self::frame_class(bf);
         let pid = frame.pid();
-        let (pid_class, _) =
-            decode_page_id(pid).unwrap_or_else(|| panic!("invalid retired page id {pid}"));
-        assert_eq!(
-            pid_class, class,
-            "retired frame class must match encoded page id class"
-        );
         assert!(
             !matches!(Self::frame_parent_link(bf), ParentLink::Stable(_)),
             "stable-root pages cannot be retired through unlink retirement"
@@ -3254,29 +3166,23 @@ impl BufferPool {
                 .store(FrameState::Free, Ordering::Release);
         }
         self.page_table.remove(pid);
-        self.release_resident_budget(class, bf);
-        self.class_state(class).free_list.push(bf);
+        self.release_resident_budget(bf);
+        self.state.free_list.push(bf);
 
         drop(frame);
 
-        self.pending_reusable_extents.lock().push(FreeExtent::new(
-            physical_page_number(pid),
-            class.base_page_count() as u64,
-        ));
+        // With a single page class, one page retires one base page.
+        self.pending_reusable_extents
+            .lock()
+            .push(FreeExtent::new(physical_page_number(pid), 1));
         pid
     }
 
-    fn allocate_page_id(&self, class: PageClass) -> PageId {
+    fn allocate_page_id(&self) -> PageId {
         let prior_next_page_number = self.free_page_allocator.next_page_number();
         let pid = self
             .free_page_allocator
-            .allocate_page(class, thread_alloc_shard_hint());
-        let (allocated_class, page_number) =
-            decode_page_id(pid).unwrap_or_else(|| panic!("invalid encoded page id {pid}"));
-        assert_eq!(
-            allocated_class, class,
-            "free page allocator returned a page id with the wrong class"
-        );
+            .allocate_page(thread_alloc_shard_hint());
         self.next_page_id.fetch_max(
             self.free_page_allocator.next_page_number(),
             Ordering::Release,
@@ -3284,16 +3190,13 @@ impl BufferPool {
         self.page_store
             .allocate(pid)
             .expect("page store allocate failed");
+        let page_number = physical_page_number(pid);
         if page_number < prior_next_page_number {
-            let zeros = vec![0u8; class.page_size()];
+            let zeros = vec![0u8; PAGE_SIZE];
             self.page_store
                 .write_page(pid, &zeros)
                 .expect("page store zero reused page failed");
         }
-        self.class_state(class)
-            .allocated_slots
-            .fetch_max(page_number as usize, Ordering::Release);
-
         pid
     }
 
@@ -3307,20 +3210,16 @@ impl BufferPool {
     /// Returns `(page_id, frame)`. The frame is pinned (pin_count=1),
     /// NOT exclusively latched, in Resident state.
     pub fn allocate_and_fix(&self) -> (u64, PinnedFrame<'_>) {
-        self.allocate_and_fix_class(PageClass::Size4K)
-    }
+        let pid = self.allocate_page_id();
 
-    pub fn allocate_and_fix_class(&self, class: PageClass) -> (u64, PinnedFrame<'_>) {
-        let pid = self.allocate_page_id(class);
-
-        self.reserve_resident_budget(class);
-        let bf = self.pop_free_frame(class);
+        self.reserve_resident_budget();
+        let bf = self.pop_free_frame();
         let _guard = unsafe { self.lock_frame_exclusive_at(bf, pid) };
 
         unsafe {
             (*bf).header.core.pid = pid;
             (*bf).header.parent_link = ParentLink::None;
-            (*bf).page_bytes_mut(class).fill(0);
+            (*bf).page_bytes_mut().fill(0);
             (*bf).header.core.pin_count.store(1, Ordering::Relaxed);
             (*bf).header.core.referenced.store(true, Ordering::Relaxed);
             (*bf).header.core.dirty.store(false, Ordering::Relaxed);
@@ -3353,11 +3252,7 @@ impl BufferPool {
     /// Allocate a new page, returning an evicted swip for it.
     /// The page is written to the store but not loaded into a frame.
     pub fn allocate_page(&self) -> AtomicSwip {
-        self.allocate_page_class(PageClass::Size4K)
-    }
-
-    pub fn allocate_page_class(&self, class: PageClass) -> AtomicSwip {
-        AtomicSwip::new(Swip::evicted(self.allocate_page_id(class)))
+        AtomicSwip::new(Swip::evicted(self.allocate_page_id()))
     }
 
     /// Fix a swip: ensure its page is resident and return a pointer to the frame.
@@ -3428,8 +3323,8 @@ impl BufferPool {
             }
 
             let page_id = s.as_page_id();
-            let (class, page_number) = decode_page_id(page_id)
-                .unwrap_or_else(|| panic!("invalid encoded page id {page_id}"));
+            let page_number = physical_page_number(page_id);
+            assert!(page_id > 0, "invalid encoded page id {page_id}");
             let next_pid = self.next_page_id.load(Ordering::Relaxed);
             assert!(
                 page_number > 0 && page_number < next_pid,
@@ -3447,7 +3342,7 @@ impl BufferPool {
                 if let Some(existing_bf) = self.page_table.lookup(page_id) {
                     existing_bf
                 } else {
-                    self.pop_free_frame(class)
+                    self.pop_free_frame()
                 }
             };
             let _guard = unsafe { self.lock_frame_exclusive_at(bf, page_id) };
@@ -3474,12 +3369,12 @@ impl BufferPool {
                 // Another thread is loading this page. Release our frame
                 // and budget, then retry.
                 drop(_guard);
-                self.class_state(class).free_list.push(bf);
-                self.release_resident_budget(class, bf);
+                self.state.free_list.push(bf);
+                self.release_resident_budget(bf);
                 continue;
             }
 
-            self.reserve_resident_budget(class);
+            self.reserve_resident_budget();
             unsafe {
                 (*bf).header.core.pid = page_id;
                 (*bf).header.core.referenced.store(true, Ordering::Relaxed);
@@ -3489,24 +3384,17 @@ impl BufferPool {
                     .state
                     .store(FrameState::Loading, Ordering::Relaxed);
             }
-            let loading = LoadingFrameReservation::new(self, class, bf);
+            let loading = LoadingFrameReservation::new(self, bf);
 
             let read_start = Instant::now();
-            let found = unsafe {
-                self.page_store
-                    .read_page(page_id, (*bf).page_bytes_mut(class))
-            }
-            .expect("page store read failed");
-            self.record_fix_swip_sync_load(
-                unsafe { (*bf).page_bytes(class) },
-                read_start.elapsed(),
-            );
+            let found = unsafe { self.page_store.read_page(page_id, (*bf).page_bytes_mut()) }
+                .expect("page store read failed");
+            self.record_fix_swip_sync_load(unsafe { (*bf).page_bytes() }, read_start.elapsed());
             assert!(found, "page {page_id} not found in store");
 
             unsafe {
                 self.install_loaded_frame_metadata(
                     bf,
-                    class,
                     page_id,
                     ParentLink::Stable(StableSwipRef::from_ref(swip)),
                     1,
@@ -3549,14 +3437,13 @@ impl BufferPool {
             Load(LoadingFrameReservation<'a>),
         }
 
-        let class = Self::page_class(page_id);
         loop {
-            // Use page_table + FreeList for all classes.
+            // Use page_table + FreeList.
             let (bf, popped_from_free_list) =
                 if let Some(existing) = self.page_table.lookup(page_id) {
                     (existing, false)
                 } else {
-                    let bf = self.pop_free_frame(class);
+                    let bf = self.pop_free_frame();
                     (bf, true)
                 };
 
@@ -3567,8 +3454,8 @@ impl BufferPool {
                     .inc(BufferPoolFixOrphanEvent::LoadingRetry);
                 self.wait_for_loading_frame_transition(bf);
                 if popped_from_free_list {
-                    self.class_state(class).free_list.push(bf);
-                    self.release_resident_budget(class, bf);
+                    self.state.free_list.push(bf);
+                    self.release_resident_budget(bf);
                 }
                 continue;
             }
@@ -3579,15 +3466,15 @@ impl BufferPool {
                 self.sample_fix_orphan_evicting_retry_page(page_id);
                 if unsafe { self.try_rescue_evicting_orphan(bf, page_id) } {
                     if popped_from_free_list {
-                        self.class_state(class).free_list.push(bf);
-                        self.release_resident_budget(class, bf);
+                        self.state.free_list.push(bf);
+                        self.release_resident_budget(bf);
                     }
                     continue;
                 }
                 Self::yield_for_contention();
                 if popped_from_free_list {
-                    self.class_state(class).free_list.push(bf);
-                    self.release_resident_budget(class, bf);
+                    self.state.free_list.push(bf);
+                    self.release_resident_budget(bf);
                 }
                 continue;
             }
@@ -3615,7 +3502,7 @@ impl BufferPool {
                 // the page_table entry would have been found.
                 debug_assert!(!popped_from_free_list || state == FrameState::Resident);
                 if popped_from_free_list {
-                    self.class_state(class).free_list.push(bf);
+                    self.state.free_list.push(bf);
                 }
                 return bf;
             }
@@ -3659,11 +3546,9 @@ impl BufferPool {
                     return FixOrphanAction::Retry;
                 }
 
-                self.reserve_resident_budget(class);
+                self.reserve_resident_budget();
 
-                FixOrphanAction::Load(unsafe {
-                    self.prepare_orphan_loading_frame(class, bf, page_id)
-                })
+                FixOrphanAction::Load(unsafe { self.prepare_orphan_loading_frame(bf, page_id) })
             });
 
             let loading = match action {
@@ -3673,15 +3558,15 @@ impl BufferPool {
                 }
                 FixOrphanAction::Retry => {
                     if popped_from_free_list {
-                        self.class_state(class).free_list.push(bf);
-                        self.release_resident_budget(class, bf);
+                        self.state.free_list.push(bf);
+                        self.release_resident_budget(bf);
                     }
                     continue;
                 }
                 FixOrphanAction::YieldRetry => {
                     if popped_from_free_list {
-                        self.class_state(class).free_list.push(bf);
-                        self.release_resident_budget(class, bf);
+                        self.state.free_list.push(bf);
+                        self.release_resident_budget(bf);
                     }
                     Self::yield_for_contention();
                     continue;
@@ -3689,8 +3574,8 @@ impl BufferPool {
                 FixOrphanAction::WaitLoading => {
                     self.wait_for_loading_frame_transition(bf);
                     if popped_from_free_list {
-                        self.class_state(class).free_list.push(bf);
-                        self.release_resident_budget(class, bf);
+                        self.state.free_list.push(bf);
+                        self.release_resident_budget(bf);
                     }
                     continue;
                 }
@@ -3698,19 +3583,13 @@ impl BufferPool {
             };
 
             let read_start = Instant::now();
-            let found = unsafe {
-                self.page_store
-                    .read_page(page_id, (*bf).page_bytes_mut(class))
-            }
-            .expect("page store read failed");
-            self.record_fix_orphan_sync_load(
-                unsafe { (*bf).page_bytes(class) },
-                read_start.elapsed(),
-            );
+            let found = unsafe { self.page_store.read_page(page_id, (*bf).page_bytes_mut()) }
+                .expect("page store read failed");
+            self.record_fix_orphan_sync_load(unsafe { (*bf).page_bytes() }, read_start.elapsed());
             assert!(found, "page {page_id} not found in store");
 
             unsafe {
-                self.install_loaded_frame_metadata(bf, class, page_id, ParentLink::None, 1);
+                self.install_loaded_frame_metadata(bf, page_id, ParentLink::None, 1);
                 (*bf)
                     .header
                     .core
@@ -3730,17 +3609,16 @@ impl BufferPool {
     /// # Safety
     /// `page_id` must refer to a valid allocated page.
     unsafe fn try_fix_orphan_raw(&self, page_id: u64) -> Option<*mut BufferFrame> {
-        let class = Self::page_class(page_id);
         let (bf, popped_from_free_list) = if let Some(existing) = self.page_table.lookup(page_id) {
             (existing, false)
         } else {
-            let bf = self.class_state(class).free_list.try_pop()?;
+            let bf = self.state.free_list.try_pop()?;
             (bf, true)
         };
         let mut state = unsafe { (*bf).header.core.state.load(Ordering::Acquire) };
         if state == FrameState::Loading {
             if popped_from_free_list {
-                self.class_state(class).free_list.push(bf);
+                self.state.free_list.push(bf);
             }
             return None;
         }
@@ -3751,7 +3629,7 @@ impl BufferPool {
             self.sample_fix_orphan_evicting_retry_page(page_id);
             if !unsafe { self.try_rescue_evicting_orphan(bf, page_id) } {
                 if popped_from_free_list {
-                    self.class_state(class).free_list.push(bf);
+                    self.state.free_list.push(bf);
                 }
                 return None;
             }
@@ -3790,7 +3668,7 @@ impl BufferPool {
                             .fix_orphan_events
                             .inc(BufferPoolFixOrphanEvent::HotPinWait);
                         if popped_from_free_list {
-                            self.class_state(class).free_list.push(bf);
+                            self.state.free_list.push(bf);
                         }
                         return None;
                     }
@@ -3805,7 +3683,7 @@ impl BufferPool {
             };
             if state == FrameState::Loading || state == FrameState::Evicting {
                 if popped_from_free_list {
-                    self.class_state(class).free_list.push(bf);
+                    self.state.free_list.push(bf);
                 }
                 return None;
             }
@@ -3813,29 +3691,26 @@ impl BufferPool {
             if popped_from_free_list && !self.page_table.try_insert(page_id, bf) {
                 return None;
             }
-            if !self.try_reserve_resident_budget(class) {
+            if !self.try_reserve_resident_budget() {
                 if popped_from_free_list {
-                    self.class_state(class).free_list.push(bf);
+                    self.state.free_list.push(bf);
                 }
                 return None;
             }
 
-            unsafe { self.prepare_orphan_loading_frame(class, bf, page_id) }
+            unsafe { self.prepare_orphan_loading_frame(bf, page_id) }
         };
 
         let read_start = Instant::now();
-        let found = unsafe {
-            self.page_store
-                .read_page(page_id, (*bf).page_bytes_mut(class))
-        }
-        .expect("page store read failed");
-        self.record_fix_orphan_sync_load(unsafe { (*bf).page_bytes(class) }, read_start.elapsed());
+        let found = unsafe { self.page_store.read_page(page_id, (*bf).page_bytes_mut()) }
+            .expect("page store read failed");
+        self.record_fix_orphan_sync_load(unsafe { (*bf).page_bytes() }, read_start.elapsed());
         if !found {
             return None;
         }
 
         unsafe {
-            self.install_loaded_frame_metadata(bf, class, page_id, ParentLink::None, 1);
+            self.install_loaded_frame_metadata(bf, page_id, ParentLink::None, 1);
             (*bf)
                 .header
                 .core
@@ -3880,8 +3755,7 @@ impl BufferPool {
         #[cfg(not(miri))]
         if let Some(ref wal) = self.wal {
             let pid = unsafe { (*bf).header.core.pid };
-            let class = Self::page_class(pid);
-            let page = unsafe { (*bf).page_bytes_mut(class) };
+            let page = unsafe { (*bf).page_bytes_mut() };
             if page.len() == PAGE_SIZE {
                 Self::record_page_kind(page, &self.metrics.dirty_wal_page_image_pages);
                 if was_dirty {
@@ -3900,18 +3774,14 @@ impl BufferPool {
                         shard_idx: prev_shard_idx,
                     },
                 );
-                let use_page_patch = was_dirty
-                    && wal_page_patches_enabled()
-                    && wal.commit_mode() == CommitMode::Strict;
-                let shadow = use_page_patch
-                    .then(|| self.dirty_wal_images.lock().get(&pid).cloned())
-                    .flatten();
                 let lsn = wal.claim_lsn();
                 page_header::write_page_lsn(page, lsn);
                 let mut page_copy = AlignedPageCopy::copy_from(page);
                 prepare_page_copy_for_writeback(page_copy.as_mut_slice(), self);
-                let prepared_page: &mut [u8; PAGE_SIZE] =
-                    page_copy.as_mut_slice().try_into().expect("4 KiB page");
+                let prepared_page: &mut [u8; PAGE_SIZE] = page_copy
+                    .as_mut_slice()
+                    .try_into()
+                    .expect("page-sized copy");
                 let mut record = BufferedWalRecord {
                     epoch: 0,
                     offset: 0,
@@ -3935,24 +3805,12 @@ impl BufferPool {
                     }
                 }
 
-                if !logged && let Some(shadow) = shadow.as_deref() {
-                    logged = wal
-                        .append_page_patch_with_lsn(lsn, pid, shadow, prepared_page)
-                        .expect("WAL page patch append failed");
-                }
-
                 if !logged {
                     record = wal
                         .append_page_image_with_lsn(lsn, pid, |_lsn, page_image| {
                             page_image.copy_from_slice(prepared_page);
                         })
                         .expect("WAL append failed");
-                }
-
-                if wal_page_patches_enabled() && wal.commit_mode() == CommitMode::Strict {
-                    self.dirty_wal_images
-                        .lock()
-                        .insert(pid, Box::new(*prepared_page));
                 }
                 unsafe {
                     (*bf).header.core.page_lsn.store(lsn, Ordering::Relaxed);
@@ -4020,9 +3878,7 @@ impl BufferPool {
         }
         self.mark_referenced(bf);
 
-        let pid = unsafe { (*bf).header.core.pid };
-        let class = Self::page_class(pid);
-        let page = unsafe { (*bf).page_bytes_mut(class) };
+        let page = unsafe { (*bf).page_bytes_mut() };
         page_header::write_page_lsn(page, lsn);
         unsafe {
             (*bf).header.core.page_lsn.store(lsn, Ordering::Relaxed);
@@ -4043,9 +3899,9 @@ impl BufferPool {
     /// Panic with a detailed snapshot of slot-state distribution.
     /// Called when resident-budget waiting detects true exhaustion:
     /// no budget tokens available and no evictable resident slot.
-    fn panic_pool_exhausted(&self, class: PageClass) -> ! {
-        let class_state = self.class_state(class);
-        let num_slots = self.allocated_slots(class);
+    fn panic_pool_exhausted(&self) -> ! {
+        let arena = self.arena();
+        let num_slots = self.allocated_slots();
         let mut pinned = 0usize;
         #[cfg_attr(miri, allow(unused_mut))]
         let mut inner = 0usize;
@@ -4055,11 +3911,11 @@ impl BufferPool {
         let mut evicting = 0usize;
         let mut loading = 0usize;
         for i in 0..num_slots {
-            if !self.is_slot_initialized(class, i) {
+            if !self.is_slot_initialized(i) {
                 free_actual += 1;
                 continue;
             }
-            let bf = self.raw_frame(class, i);
+            let bf = self.raw_frame(i);
             let state = unsafe { (*bf).header.core.state.load(Ordering::Relaxed) };
             match state {
                 FrameState::Free => free_actual += 1,
@@ -4082,11 +3938,10 @@ impl BufferPool {
         }
         panic!(
             "buffer pool exhausted: all frames pinned \
-             (class={:?}, total={}, allocated={}, free_counter={}, free_actual={}, resident={}, \
+             (total={}, allocated={}, free_counter={}, free_actual={}, resident={}, \
              pinned={}, dirty={}, inner_idx={}, \
              evicting={}, loading={})",
-            class_state.arena.class(),
-            class_state.arena.len,
+            arena.len,
             num_slots,
             self.resident_base_pages_available.load(Ordering::Relaxed),
             free_actual,
@@ -4099,10 +3954,11 @@ impl BufferPool {
         )
     }
 
-    pub(crate) fn release_resident_budget(&self, class: PageClass, bf: *mut BufferFrame) {
-        self.resident_base_pages_available
-            .fetch_add(class.base_page_count(), Ordering::Relaxed);
+    pub(crate) fn release_resident_budget(&self, bf: *mut BufferFrame) {
         let _ = bf;
+        // With a single page class, each frame consumes one base page.
+        self.resident_base_pages_available
+            .fetch_add(1, Ordering::Relaxed);
         // Notify any worker waiting in pop_free_frame/wait_for_resident_budget.
         if background_page_provider_enabled()
             && let Ok(pp) = self.page_provider.lock()
@@ -4135,19 +3991,19 @@ impl BufferPool {
     /// was evicted and released a resident-budget token. Used by the
     /// page provider thread to proactively replenish available budget.
     #[cfg(not(miri))]
-    pub fn try_evict_one(&self, class: PageClass) -> bool {
-        let num_slots = self.allocated_slots(class);
+    pub fn try_evict_one(&self) -> bool {
+        let num_slots = self.allocated_slots();
         if num_slots == 0 {
             return false;
         }
         let idx = thread_rng() as usize % num_slots;
-        if !self.is_slot_initialized(class, idx) {
+        if !self.is_slot_initialized(idx) {
             return false;
         }
-        let bf = self.raw_frame(class, idx);
-        self.with_single_evict_candidate(class, bf, |pid| {
-            self.writeback_evicting_frame_if_dirty(class, bf, pid);
-            self.finish_latched_evicting_frame(class, bf, pid)
+        let bf = self.raw_frame(idx);
+        self.with_single_evict_candidate(bf, |pid| {
+            self.writeback_evicting_frame_if_dirty(bf, pid);
+            self.finish_latched_evicting_frame(bf, pid)
         })
         .unwrap_or(false)
     }
@@ -4155,14 +4011,13 @@ impl BufferPool {
     #[cfg(not(miri))]
     fn with_single_evict_candidate<T>(
         &self,
-        class: PageClass,
         bf: *mut BufferFrame,
         f: impl FnOnce(u64) -> T,
     ) -> Option<T> {
         if unsafe { (*bf).header.core.state.load(Ordering::Relaxed) } != FrameState::Resident {
             return None;
         }
-        if !Self::frame_page_allows_eviction(class, bf) {
+        if !Self::frame_page_allows_eviction(bf) {
             return None;
         }
 
@@ -4201,13 +4056,13 @@ impl BufferPool {
 
         let pid = unsafe { (*bf).header.core.pid };
         if unsafe { (*bf).header.core.dirty.load(Ordering::Relaxed) }
-            && is_no_steal_page(unsafe { (*bf).page_bytes(class) })
+            && is_no_steal_page(unsafe { (*bf).page_bytes() })
         {
             Self::revert_frame_to_resident(bf);
             return None;
         }
 
-        if page_header::read_page_type(unsafe { (*bf).page_bytes(class) }) == PageType::Delta {
+        if page_header::read_page_type(unsafe { (*bf).page_bytes() }) == PageType::Delta {
             self.try_reclaim_before_evict(pid, bf);
         }
 
@@ -4215,7 +4070,7 @@ impl BufferPool {
     }
 
     #[cfg(not(miri))]
-    fn writeback_evicting_frame_if_dirty(&self, class: PageClass, bf: *mut BufferFrame, pid: u64) {
+    fn writeback_evicting_frame_if_dirty(&self, bf: *mut BufferFrame, pid: u64) {
         if !unsafe { (*bf).header.core.dirty.load(Ordering::Relaxed) } {
             return;
         }
@@ -4226,7 +4081,7 @@ impl BufferPool {
                 wal.flush_at_least(page_lsn);
             }
         }
-        let mut disk_page = AlignedPageCopy::copy_from(unsafe { (*bf).page_bytes(class) });
+        let mut disk_page = AlignedPageCopy::copy_from(unsafe { (*bf).page_bytes() });
         prepare_page_copy_for_writeback(disk_page.as_mut_slice(), self);
         self.page_store
             .write_page(pid, disk_page.as_slice())
@@ -4235,43 +4090,38 @@ impl BufferPool {
     }
 
     #[cfg(not(miri))]
-    fn finish_latched_evicting_frame(
-        &self,
-        class: PageClass,
-        bf: *mut BufferFrame,
-        pid: u64,
-    ) -> bool {
+    fn finish_latched_evicting_frame(&self, bf: *mut BufferFrame, pid: u64) -> bool {
         let parent_updated = self.unswizzle_parent(bf, pid);
-        if !self.parent_link_allows_free(class, bf, parent_updated) {
+        if !self.parent_link_allows_free(bf, parent_updated) {
             Self::revert_frame_to_resident(bf);
             return false;
         }
 
-        self.free_evicting_frame(class, bf);
+        self.free_evicting_frame(bf);
         true
     }
 
-    pub(crate) fn try_evict_policy(&self, class: PageClass, max_batch: usize) -> usize {
+    pub(crate) fn try_evict_policy(&self, max_batch: usize) -> usize {
         match eviction_policy() {
             EvictionPolicy::BatchClock => {
                 #[cfg(miri)]
                 {
-                    return usize::from(self.try_evict_one(class));
+                    return usize::from(self.try_evict_one());
                 }
                 #[cfg(not(miri))]
                 {
-                    let evicted = self.try_evict_batch(class, max_batch);
+                    let evicted = self.try_evict_batch(max_batch);
                     if evicted > 0 {
                         return evicted;
                     }
-                    usize::from(self.try_evict_one(class))
+                    usize::from(self.try_evict_one())
                 }
             }
             EvictionPolicy::RandomSecondChance => {
                 let attempts = (max_batch.saturating_mul(4)).max(8);
                 let mut evicted = 0usize;
                 for _ in 0..attempts {
-                    if self.try_evict_one(class) {
+                    if self.try_evict_one() {
                         evicted += 1;
                         if evicted >= max_batch {
                             break;
@@ -4285,14 +4135,8 @@ impl BufferPool {
 
     #[cfg(not(miri))]
     fn try_evict_any_policy(&self, max_batch: usize) -> usize {
-        let mut evicted = 0usize;
-        for &class in &PageClass::ALL {
-            evicted += self.try_evict_policy(class, max_batch.saturating_sub(evicted));
-            if evicted >= max_batch {
-                break;
-            }
-        }
-        evicted
+        // With a single page class there is one arena to evict from.
+        self.try_evict_policy(max_batch)
     }
 
     #[cfg(miri)]
@@ -4302,14 +4146,8 @@ impl BufferPool {
 
     #[cfg(not(miri))]
     fn try_evict_any_batch(&self, max_batch: usize) -> usize {
-        let mut evicted = 0usize;
-        for &class in &PageClass::ALL {
-            evicted += self.try_evict_batch(class, max_batch.saturating_sub(evicted));
-            if evicted >= max_batch {
-                break;
-            }
-        }
-        evicted
+        // With a single page class there is one arena to evict from.
+        self.try_evict_batch(max_batch)
     }
 
     #[cfg(miri)]
@@ -4358,7 +4196,6 @@ impl BufferPool {
 
         fn try_copy_dirty_resident_page(
             pool: &BufferPool,
-            class: PageClass,
             bf: *mut BufferFrame,
         ) -> Option<DirtyPageCopy> {
             if unsafe { (*bf).header.core.state.load(Ordering::Acquire) } != FrameState::Resident {
@@ -4376,7 +4213,7 @@ impl BufferPool {
             }
 
             let page_lsn = unsafe { (*bf).header.core.page_lsn.load(Ordering::Relaxed) };
-            let mut copy = AlignedPageCopy::copy_from(unsafe { (*bf).page_bytes(class) });
+            let mut copy = AlignedPageCopy::copy_from(unsafe { (*bf).page_bytes() });
             prepare_page_copy_for_writeback(copy.as_mut_slice(), pool);
 
             let page = DirtyPage {
@@ -4399,27 +4236,25 @@ impl BufferPool {
         let mut copies: Vec<AlignedPageCopy> = Vec::with_capacity(max_batch);
         let mut max_lsn = 0u64;
 
-        for &class in &PageClass::ALL {
-            let state = self.class_state(class);
-            for i in 0..state.arena.len {
-                if dirty_pages.len() >= max_batch {
-                    break;
-                }
-                if !self.is_slot_initialized(class, i) {
-                    continue;
-                }
-
-                let bf = self.raw_frame(class, i);
-                let Some(mut dirty_copy) = try_copy_dirty_resident_page(self, class, bf) else {
-                    continue;
-                };
-
-                max_lsn = max_lsn.max(dirty_copy.latched.page.page_lsn);
-                let copy_idx = copies.len();
-                dirty_copy.latched.page.copy_idx = copy_idx;
-                copies.push(dirty_copy.copy);
-                dirty_pages.push(dirty_copy.latched);
+        let num_slots = self.allocated_slots();
+        for i in 0..num_slots {
+            if dirty_pages.len() >= max_batch {
+                break;
             }
+            if !self.is_slot_initialized(i) {
+                continue;
+            }
+
+            let bf = self.raw_frame(i);
+            let Some(mut dirty_copy) = try_copy_dirty_resident_page(self, bf) else {
+                continue;
+            };
+
+            max_lsn = max_lsn.max(dirty_copy.latched.page.page_lsn);
+            let copy_idx = copies.len();
+            dirty_copy.latched.page.copy_idx = copy_idx;
+            copies.push(dirty_copy.copy);
+            dirty_pages.push(dirty_copy.latched);
             if dirty_pages.len() >= max_batch {
                 break;
             }
@@ -4459,7 +4294,7 @@ impl BufferPool {
 
     /// Stub for miri — try_evict_one is not supported under miri.
     #[cfg(miri)]
-    pub fn try_evict_one(&self, _class: PageClass) -> bool {
+    pub fn try_evict_one(&self) -> bool {
         false
     }
 
@@ -4468,15 +4303,15 @@ impl BufferPool {
     /// pages, unswizzle parents, and release resident-budget tokens.
     /// Returns the number of slots successfully evicted.
     #[cfg(not(miri))]
-    pub fn try_evict_batch(&self, class: PageClass, max_batch: usize) -> usize {
+    pub fn try_evict_batch(&self, max_batch: usize) -> usize {
         use pagebox_hybrid_latch::ExclusiveGuard;
 
-        let class_state = self.class_state(class);
-        let num_slots = self.allocated_slots(class);
+        let num_slots = self.allocated_slots();
         if num_slots == 0 {
             return 0;
         }
-        let start = class_state
+        let start = self
+            .state
             .eviction_hand
             .fetch_add(max_batch * 2, Ordering::Relaxed)
             % num_slots;
@@ -4518,14 +4353,13 @@ impl BufferPool {
 
         fn try_select_evict_candidate(
             pool: &BufferPool,
-            class: PageClass,
             bf: *mut BufferFrame,
         ) -> Option<(LatchedCandidate, bool)> {
             if unsafe { (*bf).header.core.state.load(Ordering::Relaxed) } != FrameState::Resident {
                 return None;
             }
 
-            if !BufferPool::frame_page_allows_eviction(class, bf) {
+            if !BufferPool::frame_page_allows_eviction(bf) {
                 return None;
             }
 
@@ -4540,7 +4374,7 @@ impl BufferPool {
             }
 
             let is_dirty = unsafe { (*bf).header.core.dirty.load(Ordering::Relaxed) };
-            if is_dirty && is_no_steal_page(unsafe { (*bf).page_bytes(class) }) {
+            if is_dirty && is_no_steal_page(unsafe { (*bf).page_bytes() }) {
                 return None;
             }
 
@@ -4556,7 +4390,7 @@ impl BufferPool {
             };
 
             let pid = unsafe { (*bf).header.core.pid };
-            if page_header::read_page_type(unsafe { (*bf).page_bytes(class) }) == PageType::Delta {
+            if page_header::read_page_type(unsafe { (*bf).page_bytes() }) == PageType::Delta {
                 pool.try_reclaim_before_evict(pid, bf);
             }
             let page_lsn = if is_dirty {
@@ -4574,11 +4408,7 @@ impl BufferPool {
             Some((unsafe { LatchedCandidate::new(candidate, guard) }, is_dirty))
         }
 
-        fn try_finalize_evicting_candidate(
-            pool: &BufferPool,
-            class: PageClass,
-            candidate: &Candidate,
-        ) -> bool {
+        fn try_finalize_evicting_candidate(pool: &BufferPool, candidate: &Candidate) -> bool {
             let Some(_guard) = (unsafe { (*candidate.bf).latch.try_lock_exclusive() }) else {
                 BufferPool::revert_frame_to_resident(candidate.bf);
                 return false;
@@ -4613,7 +4443,7 @@ impl BufferPool {
                 BufferPool::clear_frame_dirty_metadata(candidate.bf);
             }
 
-            pool.unswizzle_and_free(class, candidate.bf, candidate.pid)
+            pool.unswizzle_and_free(candidate.bf, candidate.pid)
         }
 
         let mut clean_pending: Vec<LatchedCandidate> = Vec::with_capacity(max_batch);
@@ -4626,11 +4456,11 @@ impl BufferPool {
                 break;
             }
             let idx = (start + i) % num_slots;
-            if !self.is_slot_initialized(class, idx) {
+            if !self.is_slot_initialized(idx) {
                 continue;
             }
-            let bf = self.raw_frame(class, idx);
-            let Some((latched, is_dirty)) = try_select_evict_candidate(self, class, bf) else {
+            let bf = self.raw_frame(idx);
+            let Some((latched, is_dirty)) = try_select_evict_candidate(self, bf) else {
                 continue;
             };
 
@@ -4659,8 +4489,7 @@ impl BufferPool {
             if candidate.page_lsn > max_lsn {
                 max_lsn = candidate.page_lsn;
             }
-            let mut page_copy =
-                AlignedPageCopy::copy_from(unsafe { (*candidate.bf).page_bytes(class) });
+            let mut page_copy = AlignedPageCopy::copy_from(unsafe { (*candidate.bf).page_bytes() });
             prepare_page_copy_for_writeback(page_copy.as_mut_slice(), self);
             let idx = dirty_bufs.len();
             dirty_bufs.push(page_copy);
@@ -4710,7 +4539,7 @@ impl BufferPool {
         // Phase 3: unswizzle parents and release resident-budget tokens.
         let mut evicted = 0usize;
         for c in &candidates {
-            if try_finalize_evicting_candidate(self, class, c) {
+            if try_finalize_evicting_candidate(self, c) {
                 evicted += 1;
             }
         }
@@ -4751,28 +4580,23 @@ impl BufferPool {
     }
 
     #[cfg(not(miri))]
-    fn frame_is_index_page(class: PageClass, bf: *mut BufferFrame) -> bool {
-        page_header::read_page_type(unsafe { (*bf).page_bytes(class) }) == PageType::Index
+    fn frame_is_index_page(bf: *mut BufferFrame) -> bool {
+        page_header::read_page_type(unsafe { (*bf).page_bytes() }) == PageType::Index
     }
 
     #[cfg(not(miri))]
-    fn frame_page_allows_eviction(class: PageClass, bf: *mut BufferFrame) -> bool {
-        let page = unsafe { (*bf).page_bytes(class) };
+    fn frame_page_allows_eviction(bf: *mut BufferFrame) -> bool {
+        let page = unsafe { (*bf).page_bytes() };
         !page_header::is_inner_index_page(page)
             && !page_header::should_remain_resident(page)
             && !is_stable_index_root(page, Self::frame_parent_link(bf))
     }
 
     #[cfg(not(miri))]
-    fn parent_link_allows_free(
-        &self,
-        class: PageClass,
-        bf: *mut BufferFrame,
-        parent_updated: bool,
-    ) -> bool {
+    fn parent_link_allows_free(&self, bf: *mut BufferFrame, parent_updated: bool) -> bool {
         match Self::frame_parent_link(bf) {
             ParentLink::InnerNode(_) => parent_updated,
-            ParentLink::None => !Self::frame_is_index_page(class, bf),
+            ParentLink::None => !Self::frame_is_index_page(bf),
             ParentLink::Stable(_) => true,
         }
     }
@@ -4785,7 +4609,7 @@ impl BufferPool {
     }
 
     #[cfg(not(miri))]
-    fn free_evicting_frame(&self, class: PageClass, bf: *mut BufferFrame) {
+    fn free_evicting_frame(&self, bf: *mut BufferFrame) {
         let pid = unsafe { (*bf).header.core.pid };
         self.page_table.remove(pid);
         unsafe {
@@ -4800,9 +4624,9 @@ impl BufferPool {
         self.metrics
             .eviction_events
             .inc(BufferPoolEvictionEvent::Evictions);
-        self.release_resident_budget(class, bf);
+        self.release_resident_budget(bf);
         // Recycle the frame to the FreeList (eliminates MADV_DONTNEED).
-        self.class_state(class).free_list.push(bf);
+        self.state.free_list.push(bf);
     }
 
     /// Unswizzle the parent pointer and free the frame. Returns true if
@@ -4810,10 +4634,10 @@ impl BufferPool {
     /// to Resident. Uses non-blocking latch acquisition on the parent
     /// to avoid deadlock when multiple frames are batch-evicted.
     #[cfg(not(miri))]
-    fn unswizzle_and_free(&self, class: PageClass, bf: *mut BufferFrame, pid: u64) -> bool {
+    fn unswizzle_and_free(&self, bf: *mut BufferFrame, pid: u64) -> bool {
         let parent_updated = self.unswizzle_parent(bf, pid);
 
-        if !self.parent_link_allows_free(class, bf, parent_updated) {
+        if !self.parent_link_allows_free(bf, parent_updated) {
             Self::revert_frame_to_resident(bf);
             return false;
         }
@@ -4834,7 +4658,7 @@ impl BufferPool {
             return false;
         }
 
-        self.free_evicting_frame(class, bf);
+        self.free_evicting_frame(bf);
         true
     }
 
@@ -5005,12 +4829,7 @@ impl BufferPool {
         hinted_slot: u16,
         hinted_upper: bool,
     ) -> Option<ParentChildEdge> {
-        if Self::frame_class(parent_bf) != PageClass::Size4K {
-            return None;
-        }
-        if page_header::read_page_type(unsafe { (*parent_bf).page_bytes(PageClass::Size4K) })
-            != PageType::Index
-        {
+        if page_header::read_page_type(unsafe { (*parent_bf).page_bytes() }) != PageType::Index {
             return None;
         }
 
@@ -5062,34 +4881,25 @@ impl BufferPool {
     }
 
     pub fn num_slots(&self) -> usize {
-        PageClass::ALL
-            .iter()
-            .map(|&class| self.class_state(class).arena.len)
-            .sum()
+        self.state.arena.len
     }
 
     pub fn num_occupied(&self) -> usize {
-        PageClass::ALL
-            .iter()
-            .map(|&class| {
-                let state = self.class_state(class);
-                (0..state.arena.len)
-                    .filter(|&i| {
-                        if !self.is_slot_initialized(class, i) {
-                            return false;
-                        }
-                        let s = unsafe {
-                            (*self.raw_frame(class, i))
-                                .header
-                                .core
-                                .state
-                                .load(Ordering::Relaxed)
-                        };
-                        s != FrameState::Free
-                    })
-                    .count()
+        (0..self.state.arena.len)
+            .filter(|&i| {
+                if !self.is_slot_initialized(i) {
+                    return false;
+                }
+                let s = unsafe {
+                    (*self.raw_frame(i))
+                        .header
+                        .core
+                        .state
+                        .load(Ordering::Relaxed)
+                };
+                s != FrameState::Free
             })
-            .sum()
+            .count()
     }
 
     pub fn num_occupied_estimate(&self) -> usize {
@@ -5133,36 +4943,33 @@ impl BufferPool {
         // Collect dirty frames under exclusive latches.  Guards are held
         // for the duration so page data pointers remain valid through the
         // batched write_pages_and_sync call.
-        let mut dirty: Vec<(ExclusiveGuard<'_>, PageClass, *mut BufferFrame)> = Vec::new();
+        let mut dirty: Vec<(ExclusiveGuard<'_>, *mut BufferFrame)> = Vec::new();
 
-        for &class in &PageClass::ALL {
-            let state = self.class_state(class);
-            for i in 0..state.arena.len {
-                if !self.is_slot_initialized(class, i) {
-                    continue;
-                }
-                let bf = self.raw_frame(class, i);
-                if unsafe { (*bf).header.core.state.load(Ordering::Relaxed) } == FrameState::Free {
-                    continue;
-                }
-                if !unsafe { (*bf).header.core.dirty.load(Ordering::Relaxed) } {
-                    continue;
-                }
-                let guard = unsafe { (*bf).latch.lock_exclusive() };
-                // Re-check dirty under exclusive latch.
-                if !unsafe { (*bf).header.core.dirty.load(Ordering::Relaxed) } {
-                    continue;
-                }
-                // WAL-before-data: ensure this page's WAL record is durable.
-                #[cfg(not(miri))]
-                if let Some(ref wal) = self.wal {
-                    let page_lsn = unsafe { (*bf).header.core.page_lsn.load(Ordering::Relaxed) };
-                    if page_lsn > 0 {
-                        wal.flush_at_least(page_lsn);
-                    }
-                }
-                dirty.push((guard, class, bf));
+        for i in 0..self.state.arena.len {
+            if !self.is_slot_initialized(i) {
+                continue;
             }
+            let bf = self.raw_frame(i);
+            if unsafe { (*bf).header.core.state.load(Ordering::Relaxed) } == FrameState::Free {
+                continue;
+            }
+            if !unsafe { (*bf).header.core.dirty.load(Ordering::Relaxed) } {
+                continue;
+            }
+            let guard = unsafe { (*bf).latch.lock_exclusive() };
+            // Re-check dirty under exclusive latch.
+            if !unsafe { (*bf).header.core.dirty.load(Ordering::Relaxed) } {
+                continue;
+            }
+            // WAL-before-data: ensure this page's WAL record is durable.
+            #[cfg(not(miri))]
+            if let Some(ref wal) = self.wal {
+                let page_lsn = unsafe { (*bf).header.core.page_lsn.load(Ordering::Relaxed) };
+                if page_lsn > 0 {
+                    wal.flush_at_least(page_lsn);
+                }
+            }
+            dirty.push((guard, bf));
         }
 
         if dirty.is_empty() {
@@ -5172,9 +4979,9 @@ impl BufferPool {
 
         let mut page_copies: Vec<(u64, AlignedPageCopy)> = dirty
             .iter()
-            .map(|(_guard, class, bf)| unsafe {
+            .map(|(_guard, bf)| unsafe {
                 let pid = (**bf).header.core.pid;
-                let mut copy = AlignedPageCopy::copy_from((**bf).page_bytes(*class));
+                let mut copy = AlignedPageCopy::copy_from((**bf).page_bytes());
                 prepare_page_copy_for_writeback(copy.as_mut_slice(), self);
                 (pid, copy)
             })
@@ -5187,7 +4994,7 @@ impl BufferPool {
         self.page_store.write_pages_and_sync(&pages)?;
 
         // Clear dirty flags now that all pages are durable.
-        for (_guard, _class, bf) in &dirty {
+        for (_guard, bf) in &dirty {
             unsafe {
                 (**bf).header.core.dirty.store(false, Ordering::Relaxed);
                 (**bf)
@@ -5308,7 +5115,7 @@ mod tests {
     #[test]
     fn retire_unlinked_exclusive_frame_reuses_page_id_and_frame() {
         let pool = BufferPool::new(4);
-        let (retired_pid, retired_frame) = pool.allocate_and_fix_class(PageClass::Size4K);
+        let (retired_pid, retired_frame) = pool.allocate_and_fix();
         let retired_raw = retired_frame.raw();
         let retired_frame = retired_frame.exclusive();
 
@@ -5323,7 +5130,7 @@ mod tests {
             0
         );
 
-        let (before_flush_pid, before_flush_frame) = pool.allocate_and_fix_class(PageClass::Size4K);
+        let (before_flush_pid, before_flush_frame) = pool.allocate_and_fix();
         assert_ne!(
             before_flush_pid, retired_pid,
             "retired page id must not be reusable before the next flush"
@@ -5333,7 +5140,7 @@ mod tests {
         let high_water = pool.next_page_id.load(Ordering::Acquire);
         pool.flush().unwrap();
 
-        let (reused_pid, reused_frame) = pool.allocate_and_fix_class(PageClass::Size4K);
+        let (reused_pid, reused_frame) = pool.allocate_and_fix();
         assert_eq!(reused_pid, retired_pid);
         // Under FreeList addressing, the frame pointer is decoupled from
         // the page ID — we only assert the page ID is reused, not the frame.
@@ -5351,27 +5158,24 @@ mod tests {
 
     #[test]
     #[cfg(not(miri))]
-    fn allocate_and_fix_class_reuses_promoted_large_extent() {
+    fn allocate_and_fix_reuses_promoted_extent() {
         let pool = BufferPool::new(32);
-        let class = PageClass::Size64K;
-        let (retired_pid, retired_bf) = pool.allocate_and_fix_class(class);
+        let (retired_pid, retired_bf) = pool.allocate_and_fix();
         drop(retired_bf);
         let high_water = pool.next_page_id.load(Ordering::Acquire);
 
-        pool.promote_reusable_extent(FreeExtent::new(
-            physical_page_number(retired_pid),
-            class.base_page_count() as u64,
-        ));
-        let (reused_pid, reused_bf) = pool.allocate_and_fix_class(class);
+        // With a single page class, one retired page yields one base page.
+        pool.promote_reusable_extent(FreeExtent::new(physical_page_number(retired_pid), 1));
+        let (reused_pid, reused_bf) = pool.allocate_and_fix();
 
         assert_eq!(
             reused_pid, retired_pid,
-            "large-class allocation should reuse a matching promoted extent"
+            "allocation should reuse a matching promoted extent"
         );
         assert_eq!(
             pool.next_page_id.load(Ordering::Acquire),
             high_water,
-            "large-class reuse must not advance the monotonic high-water mark"
+            "reuse must not advance the monotonic high-water mark"
         );
         assert_eq!(reused_bf.pid(), retired_pid);
     }
@@ -5503,19 +5307,17 @@ mod tests {
 
     #[test]
     #[cfg(not(miri))]
-    fn large_page_class_allocates_single_swip_sized_frame() {
-        let class = PageClass::Size64K;
-        let pool = BufferPool::new(class.base_page_count());
-        let (pid, bf) = pool.allocate_and_fix_class(class);
+    fn page_frame_roundtrips_through_evict_and_reload() {
+        let pool = BufferPool::new(1);
+        let (pid, bf) = pool.allocate_and_fix();
 
-        assert_eq!(decode_page_id(pid), Some((class, 1)));
+        assert_eq!(pid, 1);
         let raw = bf.raw();
         let mut bf = bf.exclusive();
         let page = bf.page_bytes_mut();
-        assert_eq!(page.len(), class.page_size());
+        assert_eq!(page.len(), PAGE_SIZE);
         page[0] = 11;
-        page[PAGE_SIZE] = 22;
-        page[class.page_size() - 1] = 33;
+        page[PAGE_SIZE - 1] = 33;
         bf.mark_dirty();
         drop(bf);
         unsafe {
@@ -5527,33 +5329,33 @@ mod tests {
         }
 
         assert!(
-            pool.try_evict_one(class),
-            "large page should evict as one class-sized frame"
+            pool.try_evict_one(),
+            "page should evict as one frame-sized unit"
         );
         assert_eq!(
             pool.approx_available_budget(),
-            class.base_page_count(),
-            "evicting one 64 KiB page should return its full base-page budget"
+            1,
+            "evicting one page should return its full base-page budget"
         );
 
         let bf = unsafe { pool.fix_orphan_frame(pid) };
         let page = bf.page_bytes();
         assert_eq!(page[0], 11);
-        assert_eq!(page[PAGE_SIZE], 22);
-        assert_eq!(page[class.page_size() - 1], 33);
+        assert_eq!(page[PAGE_SIZE - 1], 33);
     }
 
     #[test]
     #[cfg(not(miri))]
-    fn large_page_can_be_marked_dirty_with_logical_lsn() {
-        let class = PageClass::Size64K;
-        let pool = BufferPool::new(class.base_page_count());
-        let (pid, bf) = pool.allocate_and_fix_class(class);
+    fn page_can_be_marked_dirty_with_logical_lsn() {
+        let pool = BufferPool::new(1);
+        let (pid, bf) = pool.allocate_and_fix();
 
         let raw = bf.raw();
         let mut bf = bf.exclusive();
         let page = bf.page_bytes_mut();
-        page[0] = 17;
+        // Avoid bytes [0, 8): the page-LSN field lives there and is
+        // overwritten by mark_dirty_with_lsn.
+        page[64] = 17;
         bf.mark_dirty_with_lsn(123);
         assert_eq!(
             unsafe { (*raw).header.core.page_lsn.load(Ordering::Relaxed) },
@@ -5575,25 +5377,24 @@ mod tests {
         }
 
         assert!(
-            pool.try_evict_one(class),
-            "large logically logged page should remain evictable"
+            pool.try_evict_one(),
+            "logically logged page should remain evictable"
         );
         let bf = unsafe { pool.fix_orphan_frame(pid) };
         let page = bf.page_bytes();
-        assert_eq!(page[0], 17, "large page payload should survive reload");
+        assert_eq!(page[64], 17, "page payload should survive reload");
         assert_eq!(
             page_header::read_page_lsn(page),
             123,
-            "large page LSN should survive reload"
+            "page LSN should survive reload"
         );
     }
 
     #[test]
     #[cfg(not(miri))]
     fn dirty_betree_page_is_not_stolen_before_checkpoint_flush() {
-        let class = PageClass::Size64K;
-        let pool = BufferPool::new(class.base_page_count());
-        let (pid, bf) = pool.allocate_and_fix_class(class);
+        let pool = BufferPool::new(1);
+        let (pid, bf) = pool.allocate_and_fix();
 
         let raw = bf.raw();
         let mut bf = bf.exclusive();
@@ -5611,12 +5412,12 @@ mod tests {
         }
 
         assert!(
-            !pool.try_evict_one(class),
+            !pool.try_evict_one(),
             "dirty B-e pages are logically logged and must not be stolen before checkpoint"
         );
         #[cfg(not(miri))]
         assert_eq!(
-            pool.try_evict_batch(class, 1),
+            pool.try_evict_batch(1),
             0,
             "batch eviction must honour the dirty B-e no-steal rule"
         );
@@ -5630,7 +5431,7 @@ mod tests {
                 .store(false, Ordering::Relaxed);
         }
         assert!(
-            pool.try_evict_one(class),
+            pool.try_evict_one(),
             "checkpoint-flushed B-e pages should become evictable"
         );
 
@@ -5643,9 +5444,8 @@ mod tests {
     #[test]
     #[cfg(not(miri))]
     fn dirty_betree_page_flush_batch_makes_page_evictable() {
-        let class = PageClass::Size64K;
-        let pool = BufferPool::new(class.base_page_count());
-        let (pid, bf) = pool.allocate_and_fix_class(class);
+        let pool = BufferPool::new(1);
+        let (pid, bf) = pool.allocate_and_fix();
 
         let raw = bf.raw();
         let mut bf = bf.exclusive();
@@ -5663,7 +5463,7 @@ mod tests {
         }
 
         assert!(
-            !pool.try_evict_one(class),
+            !pool.try_evict_one(),
             "dirty B-e page should not be stolen before it is flushed"
         );
         assert_eq!(
@@ -5679,7 +5479,7 @@ mod tests {
                 .store(false, Ordering::Relaxed);
         }
         assert!(
-            pool.try_evict_one(class),
+            pool.try_evict_one(),
             "flushed B-e page should become evictable"
         );
 
@@ -5713,11 +5513,11 @@ mod tests {
             drop(bf);
 
             assert!(
-                !pool.try_evict_one(PageClass::Size4K),
+                !pool.try_evict_one(),
                 "B-tree root pages must stay resident for eviction parent search"
             );
             assert_eq!(
-                pool.try_evict_batch(PageClass::Size4K, 1),
+                pool.try_evict_batch(1),
                 0,
                 "batch eviction should also skip B-tree roots"
             );
@@ -5742,7 +5542,7 @@ mod tests {
 
             let _shared = (*raw).latch.lock_shared();
             assert!(
-                !pool.try_evict_one(PageClass::Size4K),
+                !pool.try_evict_one(),
                 "opportunistic eviction should skip frames with contended latch upgrades"
             );
             assert_eq!(
@@ -5785,22 +5585,6 @@ mod tests {
             pool.approx_available_budget() > 0,
             "batch fallback should return resident budget tokens"
         );
-    }
-
-    #[test]
-    #[cfg(not(miri))]
-    fn mixed_page_classes_use_distinct_arenas() {
-        let pool = BufferPool::new(64);
-        let (_small_pid, small_bf) = pool.allocate_and_fix_class(PageClass::Size4K);
-        let (_large_pid, large_bf) = pool.allocate_and_fix_class(PageClass::Size64K);
-
-        assert_ne!(
-            small_bf.frame_ref(),
-            large_bf.frame_ref(),
-            "different page classes must not alias the same frame address"
-        );
-        assert_eq!(small_bf.page_bytes().len(), PAGE_SIZE);
-        assert_eq!(large_bf.page_bytes().len(), 64 * 1024);
     }
 
     #[test]
@@ -6190,7 +5974,7 @@ mod tests {
         // try_evict_one should either skip it (clearing referenced) or
         // evict it. The key invariant: after one attempt, either the
         // frame is evicted or the referenced bit is cleared.
-        let evicted = pool.try_evict_one(PageClass::Size4K);
+        let evicted = pool.try_evict_one();
 
         if !evicted {
             // If not evicted, referenced should have been cleared
@@ -6204,7 +5988,7 @@ mod tests {
 
             // Second attempt should now succeed.
             assert!(
-                pool.try_evict_one(PageClass::Size4K),
+                pool.try_evict_one(),
                 "eviction should succeed after referenced bit is cleared"
             );
         }

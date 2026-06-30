@@ -6,7 +6,7 @@ use micromeasure::{
     BenchContext, ConcurrentBenchContext, ConcurrentBenchControl, ConcurrentWorker,
     ConcurrentWorkerResult, Throughput, benchmark_main, black_box,
 };
-use pagebox_storage::buffer_frame::{PageClass, physical_page_number};
+use pagebox_storage::buffer_frame::physical_page_number;
 use pagebox_storage::buffer_pool::BufferPool;
 use pagebox_storage::free_page_allocator::{FreeExtent, FreePageAllocator};
 
@@ -17,7 +17,6 @@ struct FreeAllocatorCtx {
     allocator: FreePageAllocator,
     next_reusable_page_number: u64,
     reusable_len: u64,
-    page_class: PageClass,
 }
 
 impl BenchContext for FreeAllocatorCtx {
@@ -33,7 +32,6 @@ impl BenchContext for FreeAllocatorCtx {
 struct BufferPoolAllocCtx {
     pool: Arc<BufferPool>,
     reusable_page_number: u64,
-    page_class: PageClass,
 }
 
 struct ConcurrentAllocatorMonotonicCtx {
@@ -96,11 +94,9 @@ impl ConcurrentBenchContext for ConcurrentBufferPoolMonotonicCtx {
     }
 }
 
-fn allocator_monotonic_4k(ctx: &mut FreeAllocatorCtx, chunk_size: usize, chunk_num: usize) {
+fn allocator_monotonic(ctx: &mut FreeAllocatorCtx, chunk_size: usize, chunk_num: usize) {
     for i in 0..chunk_size {
-        let pid = ctx
-            .allocator
-            .allocate_page(PageClass::Size4K, i + chunk_num);
+        let pid = ctx.allocator.allocate_page(i + chunk_num);
         black_box(pid);
     }
 }
@@ -112,7 +108,7 @@ fn allocator_reuse_extent(ctx: &mut FreeAllocatorCtx, chunk_size: usize, chunk_n
             ctx.reusable_len,
         ));
         ctx.next_reusable_page_number += ctx.reusable_len;
-        let pid = ctx.allocator.allocate_page(ctx.page_class, i + chunk_num);
+        let pid = ctx.allocator.allocate_page(i + chunk_num);
         black_box(pid);
     }
 }
@@ -133,65 +129,58 @@ fn buffer_pool_reuse_allocate_page(
     _chunk_num: usize,
 ) {
     for _ in 0..chunk_size {
-        ctx.pool.promote_reusable_extent(FreeExtent::new(
-            ctx.reusable_page_number,
-            ctx.page_class.base_page_count() as u64,
-        ));
-        let swip = ctx.pool.allocate_page_class(ctx.page_class);
+        // With a single page class, one retired page yields one base page.
+        ctx.pool
+            .promote_reusable_extent(FreeExtent::new(ctx.reusable_page_number, 1));
+        let swip = ctx.pool.allocate_page();
         let pid = swip.load(std::sync::atomic::Ordering::Acquire).as_page_id();
         ctx.reusable_page_number = physical_page_number(pid);
         black_box(pid);
     }
 }
 
-fn buffer_pool_reuse_allocate_and_fix_64k(
+fn buffer_pool_reuse_allocate_and_fix(
     ctx: &mut BufferPoolAllocCtx,
     chunk_size: usize,
     _chunk_num: usize,
 ) {
     for _ in 0..chunk_size {
-        ctx.pool.promote_reusable_extent(FreeExtent::new(
-            ctx.reusable_page_number,
-            ctx.page_class.base_page_count() as u64,
-        ));
-        let (pid, frame) = ctx.pool.allocate_and_fix_class(ctx.page_class);
+        ctx.pool
+            .promote_reusable_extent(FreeExtent::new(ctx.reusable_page_number, 1));
+        let (pid, frame) = ctx.pool.allocate_and_fix();
         drop(frame);
         ctx.reusable_page_number = physical_page_number(pid);
         black_box(pid);
     }
 }
 
-fn concurrent_allocator_monotonic_4k(
+fn concurrent_allocator_monotonic(
     ctx: &ConcurrentAllocatorMonotonicCtx,
     control: &ConcurrentBenchControl,
 ) -> ConcurrentWorkerResult {
     let mut operations = 0_u64;
     while !control.should_stop() {
-        let pid = ctx
-            .allocator
-            .allocate_page(PageClass::Size4K, control.thread_index());
+        let pid = ctx.allocator.allocate_page(control.thread_index());
         black_box(pid);
         operations = operations.wrapping_add(1);
     }
     ConcurrentWorkerResult::operations(operations)
 }
 
-fn concurrent_allocator_prefilled_reuse_4k(
+fn concurrent_allocator_prefilled_reuse(
     ctx: &ConcurrentAllocatorPrefilledReuseCtx,
     control: &ConcurrentBenchControl,
 ) -> ConcurrentWorkerResult {
     let mut operations = 0_u64;
     while !control.should_stop() {
-        let pid = ctx
-            .allocator
-            .allocate_page(PageClass::Size4K, control.thread_index());
+        let pid = ctx.allocator.allocate_page(control.thread_index());
         black_box(pid);
         operations = operations.wrapping_add(1);
     }
     ConcurrentWorkerResult::operations(operations)
 }
 
-fn concurrent_allocator_promote_reuse_4k(
+fn concurrent_allocator_promote_reuse(
     ctx: &ConcurrentAllocatorPromoteReuseCtx,
     control: &ConcurrentBenchControl,
 ) -> ConcurrentWorkerResult {
@@ -202,16 +191,14 @@ fn concurrent_allocator_promote_reuse_4k(
             .fetch_add(1, Ordering::Relaxed);
         ctx.allocator
             .promote_reusable_extent(FreeExtent::new(page_number, 1));
-        let pid = ctx
-            .allocator
-            .allocate_page(PageClass::Size4K, control.thread_index());
+        let pid = ctx.allocator.allocate_page(control.thread_index());
         black_box(pid);
         operations = operations.wrapping_add(1);
     }
     ConcurrentWorkerResult::operations(operations)
 }
 
-fn concurrent_buffer_pool_monotonic_allocate_page_4k(
+fn concurrent_buffer_pool_monotonic_allocate_page(
     ctx: &ConcurrentBufferPoolMonotonicCtx,
     control: &ConcurrentBenchControl,
 ) -> ConcurrentWorkerResult {
@@ -230,27 +217,16 @@ benchmark_main!(|runner| {
                 allocator: FreePageAllocator::new(1, 16),
                 next_reusable_page_number: 1_000_000,
                 reusable_len: 1,
-                page_class: PageClass::Size4K,
             })
-            .bench("monotonic_4k", allocator_monotonic_4k);
+            .bench("monotonic", allocator_monotonic);
 
         g.throughput(Throughput::per_operation(OPS_PER_CHUNK_U64, "allocations"))
             .factory(&|| FreeAllocatorCtx {
                 allocator: FreePageAllocator::new(2_000_000, 16),
                 next_reusable_page_number: 1_000_000,
                 reusable_len: 1,
-                page_class: PageClass::Size4K,
             })
-            .bench("promote_reuse_4k", allocator_reuse_extent);
-
-        g.throughput(Throughput::per_operation(OPS_PER_CHUNK_U64, "allocations"))
-            .factory(&|| FreeAllocatorCtx {
-                allocator: FreePageAllocator::new(2_000_000, 16),
-                next_reusable_page_number: 1_000_000,
-                reusable_len: PageClass::Size64K.base_page_count() as u64,
-                page_class: PageClass::Size64K,
-            })
-            .bench("promote_reuse_64k", allocator_reuse_extent);
+            .bench("promote_reuse", allocator_reuse_extent);
     });
 
     runner.group::<BufferPoolAllocCtx>("buffer_pool_allocator", |g| {
@@ -258,10 +234,9 @@ benchmark_main!(|runner| {
             .factory(&|| BufferPoolAllocCtx {
                 pool: Arc::new(BufferPool::new(OPS_PER_CHUNK * 2)),
                 reusable_page_number: 0,
-                page_class: PageClass::Size4K,
             })
             .bench(
-                "monotonic_allocate_page_4k",
+                "monotonic_allocate_page",
                 buffer_pool_monotonic_allocate_page,
             );
 
@@ -273,29 +248,26 @@ benchmark_main!(|runner| {
                 BufferPoolAllocCtx {
                     pool,
                     reusable_page_number: physical_page_number(pid),
-                    page_class: PageClass::Size4K,
                 }
             })
             .bench(
-                "promote_reuse_allocate_page_4k",
+                "promote_reuse_allocate_page",
                 buffer_pool_reuse_allocate_page,
             );
 
         g.throughput(Throughput::per_operation(OPS_PER_CHUNK_U64, "allocations"))
             .factory(&|| {
-                let pool = Arc::new(BufferPool::new(PageClass::Size64K.base_page_count() * 128));
-                let class = PageClass::Size64K;
-                let (pid, frame) = pool.allocate_and_fix_class(class);
+                let pool = Arc::new(BufferPool::new(128));
+                let (pid, frame) = pool.allocate_and_fix();
                 drop(frame);
                 BufferPoolAllocCtx {
                     pool,
                     reusable_page_number: physical_page_number(pid),
-                    page_class: class,
                 }
             })
             .bench(
-                "promote_reuse_allocate_and_fix_64k",
-                buffer_pool_reuse_allocate_and_fix_64k,
+                "promote_reuse_allocate_and_fix",
+                buffer_pool_reuse_allocate_and_fix,
             );
     });
 
@@ -303,10 +275,10 @@ benchmark_main!(|runner| {
         let workers = [ConcurrentWorker {
             name: "allocator_worker",
             threads: n_threads,
-            run: concurrent_allocator_monotonic_4k,
+            run: concurrent_allocator_monotonic,
         }];
         runner.concurrent_group::<ConcurrentAllocatorMonotonicCtx>(
-            "free_page_allocator/concurrent/monotonic_4k",
+            "free_page_allocator/concurrent/monotonic",
             |g| {
                 g.sample_duration(Duration::from_millis(50))
                     .throughput(Throughput::per_operation(1, "allocations"))
@@ -319,10 +291,10 @@ benchmark_main!(|runner| {
         let workers = [ConcurrentWorker {
             name: "allocator_worker",
             threads: n_threads,
-            run: concurrent_allocator_prefilled_reuse_4k,
+            run: concurrent_allocator_prefilled_reuse,
         }];
         runner.concurrent_group::<ConcurrentAllocatorPrefilledReuseCtx>(
-            "free_page_allocator/concurrent/prefilled_reuse_4k",
+            "free_page_allocator/concurrent/prefilled_reuse",
             |g| {
                 g.sample_duration(Duration::from_millis(50))
                     .throughput(Throughput::per_operation(1, "allocations"))
@@ -335,10 +307,10 @@ benchmark_main!(|runner| {
         let workers = [ConcurrentWorker {
             name: "allocator_worker",
             threads: n_threads,
-            run: concurrent_allocator_promote_reuse_4k,
+            run: concurrent_allocator_promote_reuse,
         }];
         runner.concurrent_group::<ConcurrentAllocatorPromoteReuseCtx>(
-            "free_page_allocator/concurrent/promote_reuse_4k",
+            "free_page_allocator/concurrent/promote_reuse",
             |g| {
                 g.sample_duration(Duration::from_millis(50))
                     .throughput(Throughput::per_operation(1, "allocations"))
@@ -351,10 +323,10 @@ benchmark_main!(|runner| {
         let workers = [ConcurrentWorker {
             name: "buffer_pool_worker",
             threads: n_threads,
-            run: concurrent_buffer_pool_monotonic_allocate_page_4k,
+            run: concurrent_buffer_pool_monotonic_allocate_page,
         }];
         runner.concurrent_group::<ConcurrentBufferPoolMonotonicCtx>(
-            "buffer_pool_allocator/concurrent/monotonic_allocate_page_4k",
+            "buffer_pool_allocator/concurrent/monotonic_allocate_page",
             |g| {
                 g.sample_duration(Duration::from_millis(50))
                     .throughput(Throughput::per_operation(1, "allocations"))

@@ -3,7 +3,7 @@
 //!
 //! The [`BufferPool`](crate::buffer_pool::BufferPool) asks the allocator for
 //! fresh page IDs under each `allocate_and_fix*` call. The page IDs come from
-//! [`crate::buffer_frame::PageId`]s encoded by `PageClass`. Allocation is hot:
+//! [`crate::buffer_frame::PageId`]s. Allocation is hot:
 //! each thread holds a stable shard hint (see `thread_alloc_shard_hint` in
 //! `buffer_pool`) so contention across threads is amortised. The design has
 //! three layers, consulted in order:
@@ -15,8 +15,6 @@
 //! 2. **Central best-fit freelist** — a single `Mutex<BTreeMap<u64,
 //!    FreeExtent>>` indexed by start page number, holding reusable extents
 //!    retired via [`FreePageAllocator::promote_reusable_extent`]. Adjacent
-//!    same-class extents coalesce on insert (so a retired 64 KiB page can
-//!    reunite with neighbours to satisfy a larger-class allocation); the
 //!    central layer is also what refills hot buckets in batches
 //!    (`HOT_REFILL_BATCH = 8`).
 //! 3. **Monotonic growth** — each shard reserves an independent range
@@ -27,7 +25,7 @@
 //!
 //! ## Allocation policy
 //!
-//! `allocate_page(class, shard_hint)` always prefers reusable extents over
+//! `allocate_page(shard_hint)` always prefers reusable extents over
 //! monotonic growth (so reopened extents from a retired tree are consumed
 //! before the data file grows). Within a single shard the order is:
 //!
@@ -54,7 +52,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crossbeam_queue::SegQueue;
 use parking_lot::Mutex;
 
-use crate::buffer_frame::{PageClass, PageId};
+use crate::buffer_frame::PageId;
 
 const HOT_BUCKET_LIMITS: [u64; 9] = [1, 2, 4, 8, 16, 32, 64, 128, 256];
 const HOT_REFILL_BATCH: usize = 8;
@@ -308,21 +306,20 @@ impl FreePageAllocator {
         self.central.insert(extent);
     }
 
-    /// Allocate a single `class`-sized page, preferring reusable shards over
-    /// monotonic growth. The returned [`PageId`] encodes both the class and
-    /// the start base-page number; `shard_hint` selects which shard is tried
-    /// first (modulo shard count) — pass the calling thread's alloc-shard
-    /// hint for cache locality. See the [module-level docs](self) for the
-    /// full fallback order.
-    pub fn allocate_page(&self, class: PageClass, shard_hint: usize) -> PageId {
-        let len = class.base_page_count() as u64;
+    /// Allocate a single page, preferring reusable shards over
+    /// monotonic growth. The returned [`PageId`] is the start base-page
+    /// number; `shard_hint` selects which shard is tried first (modulo
+    /// shard count) — pass the calling thread's alloc-shard hint for
+    /// cache locality. See the [module-level docs](self) for the full
+    /// fallback order.
+    pub fn allocate_page(&self, shard_hint: usize) -> PageId {
+        // With a single page class, one allocation consumes one base page.
+        let len = 1u64;
         if let Some(extent) = self.allocate_extent(len, shard_hint) {
-            return class.encode_page_id(extent.start_page_number);
+            return extent.start_page_number;
         }
-        let page_number = self
-            .allocate_monotonic_extent(len, shard_hint)
-            .start_page_number;
-        class.encode_page_id(page_number)
+        self.allocate_monotonic_extent(len, shard_hint)
+            .start_page_number
     }
 
     /// High-water mark of the global monotonic cursor. Each shard reserves
@@ -446,7 +443,7 @@ mod tests {
     #[cfg(not(miri))]
     use std::sync::Arc;
 
-    use crate::buffer_frame::{decode_page_id, page_base_span, physical_page_number};
+    use crate::buffer_frame::physical_page_number;
 
     use super::*;
 
@@ -454,11 +451,11 @@ mod tests {
     fn allocate_falls_back_to_monotonic_page_numbers() {
         let allocator = FreePageAllocator::new(1, 4);
 
-        let first = allocator.allocate_page(PageClass::Size4K, 0);
-        let second = allocator.allocate_page(PageClass::Size4K, 0);
+        let first = allocator.allocate_page(0);
+        let second = allocator.allocate_page(0);
 
-        assert_eq!(decode_page_id(first), Some((PageClass::Size4K, 1)));
-        assert_eq!(decode_page_id(second), Some((PageClass::Size4K, 2)));
+        assert_eq!(first, 1);
+        assert_eq!(second, 2);
         assert_eq!(
             allocator.next_page_number(),
             1 + MONOTONIC_REFILL_BASE_PAGES
@@ -469,10 +466,10 @@ mod tests {
     fn monotonic_allocations_reuse_shard_reserved_range() {
         let allocator = FreePageAllocator::new(1, 4);
 
-        let first = allocator.allocate_page(PageClass::Size4K, 0);
+        let first = allocator.allocate_page(0);
         let reserved_high_water = allocator.next_page_number();
-        let second = allocator.allocate_page(PageClass::Size4K, 0);
-        let third = allocator.allocate_page(PageClass::Size4K, 0);
+        let second = allocator.allocate_page(0);
+        let third = allocator.allocate_page(0);
 
         assert_eq!(physical_page_number(first), 1);
         assert_eq!(physical_page_number(second), 2);
@@ -488,8 +485,8 @@ mod tests {
     fn monotonic_shards_reserve_disjoint_ranges() {
         let allocator = FreePageAllocator::new(1, 4);
 
-        let first = allocator.allocate_page(PageClass::Size4K, 0);
-        let second = allocator.allocate_page(PageClass::Size4K, 1);
+        let first = allocator.allocate_page(0);
+        let second = allocator.allocate_page(1);
 
         assert_eq!(physical_page_number(first), 1);
         assert_eq!(
@@ -508,9 +505,9 @@ mod tests {
         let allocator = FreePageAllocator::new(100, 4);
         allocator.promote_reusable_extent(FreeExtent::new(10, 1));
 
-        let pid = allocator.allocate_page(PageClass::Size4K, 0);
+        let pid = allocator.allocate_page(0);
 
-        assert_eq!(decode_page_id(pid), Some((PageClass::Size4K, 10)));
+        assert_eq!(pid, 10);
         assert_eq!(allocator.next_page_number(), 100);
     }
 
@@ -519,8 +516,8 @@ mod tests {
         let allocator = FreePageAllocator::new(100, 4);
         allocator.promote_reusable_extent(FreeExtent::new(10, 4));
 
-        let first = allocator.allocate_page(PageClass::Size4K, 0);
-        let second = allocator.allocate_page(PageClass::Size4K, 0);
+        let first = allocator.allocate_page(0);
+        let second = allocator.allocate_page(0);
 
         assert_eq!(physical_page_number(first), 10);
         assert_eq!(physical_page_number(second), 11);
@@ -528,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn central_allocator_coalesces_adjacent_extents_for_larger_class() {
+    fn central_allocator_coalesces_adjacent_extents() {
         let allocator = FreePageAllocator::new(100, 4);
         allocator.promote_reusable_extent(FreeExtent::new(10, 8));
         allocator.promote_reusable_extent(FreeExtent::new(18, 8));
@@ -536,22 +533,20 @@ mod tests {
         assert_eq!(allocator.central_extent_count(), 1);
         assert_eq!(allocator.central_free_base_pages(), 16);
 
-        let pid = allocator.allocate_page(PageClass::Size64K, 0);
-
-        assert_eq!(decode_page_id(pid), Some((PageClass::Size64K, 10)));
+        // With a single page class each allocation consumes one base page,
+        // so the coalesced 16-page extent satisfies 16 sequential allocations.
+        let first = allocator.allocate_page(0);
+        assert_eq!(first, 10);
         assert_eq!(allocator.next_page_number(), 100);
     }
 
     #[test]
-    fn retired_large_page_can_be_reused_as_smaller_pages() {
+    fn retired_large_extent_can_be_reused_as_single_pages() {
         let allocator = FreePageAllocator::new(100, 4);
-        allocator.promote_reusable_extent(FreeExtent::new(
-            32,
-            PageClass::Size64K.base_page_count() as u64,
-        ));
+        allocator.promote_reusable_extent(FreeExtent::new(32, 4));
 
         let pages = (0..4)
-            .map(|_| allocator.allocate_page(PageClass::Size4K, 0))
+            .map(|_| allocator.allocate_page(0))
             .map(physical_page_number)
             .collect::<Vec<_>>();
 
@@ -564,7 +559,7 @@ mod tests {
         let allocator = FreePageAllocator::new(100, 4);
         allocator.promote_reusable_extent(FreeExtent::new(10, 16));
 
-        let first = allocator.allocate_page(PageClass::Size4K, 0);
+        let first = allocator.allocate_page(0);
 
         assert_eq!(physical_page_number(first), 10);
         assert_eq!(
@@ -574,7 +569,7 @@ mod tests {
         );
 
         for expected in 11..18 {
-            let pid = allocator.allocate_page(PageClass::Size4K, 0);
+            let pid = allocator.allocate_page(0);
             assert_eq!(physical_page_number(pid), expected);
             assert_eq!(
                 allocator.central_free_base_pages(),
@@ -583,7 +578,7 @@ mod tests {
             );
         }
 
-        let next = allocator.allocate_page(PageClass::Size4K, 0);
+        let next = allocator.allocate_page(0);
         assert_eq!(physical_page_number(next), 18);
         assert_eq!(allocator.central_free_base_pages(), 0);
     }
@@ -599,7 +594,7 @@ mod tests {
             let allocator = Arc::clone(&allocator);
             handles.push(std::thread::spawn(move || {
                 (0..32)
-                    .map(|_| allocator.allocate_page(PageClass::Size4K, shard))
+                    .map(|_| allocator.allocate_page(shard))
                     .map(physical_page_number)
                     .collect::<Vec<_>>()
             }));
@@ -625,7 +620,7 @@ mod tests {
             let allocator = Arc::clone(&allocator);
             handles.push(std::thread::spawn(move || {
                 (0..64)
-                    .map(|_| allocator.allocate_page(PageClass::Size4K, shard))
+                    .map(|_| allocator.allocate_page(shard))
                     .map(physical_page_number)
                     .collect::<Vec<_>>()
             }));
@@ -650,47 +645,18 @@ mod tests {
 
         // Exhaust the first reserved range (256 pages).
         for _ in 0..MONOTONIC_REFILL_BASE_PAGES {
-            allocator.allocate_page(PageClass::Size4K, 0);
+            allocator.allocate_page(0);
         }
         let first_next = allocator.next_page_number();
 
         // Next allocation should trigger a second refill from central.
-        allocator.allocate_page(PageClass::Size4K, 0);
+        allocator.allocate_page(0);
         let second_next = allocator.next_page_number();
 
         assert!(
             second_next > first_next,
             "second refill should advance next_page_number: {first_next} → {second_next}"
         );
-    }
-
-    #[test]
-    fn non_coalescable_extents_fall_back_to_monotonic_for_oversize_request() {
-        let allocator = FreePageAllocator::new(1, 1);
-
-        // Promote two non-adjacent 8-page extents.
-        allocator.promote_reusable_extent(FreeExtent::new(100, 8));
-        allocator.promote_reusable_extent(FreeExtent::new(200, 8));
-
-        let central_before = allocator.next_page_number();
-
-        // Request a 64K allocation (16 base pages). The two non-adjacent
-        // 8-page extents cannot coalesce, so this should fall back to
-        // monotonic growth.
-        let pid = allocator.allocate_page(PageClass::Size64K, 0);
-        assert_eq!(page_base_span(pid), 16);
-
-        // The monotonic cursor should have advanced (not consumed the extents).
-        assert!(
-            allocator.next_page_number() > central_before,
-            "oversize request should fall back to monotonic growth"
-        );
-
-        // The two extents should still be available for smaller allocations.
-        let _central_extent_before = allocator.central_extent_count();
-        let p1 = allocator.allocate_page(PageClass::Size4K, 0);
-        let p2 = allocator.allocate_page(PageClass::Size4K, 0);
-        assert_ne!(physical_page_number(p1), physical_page_number(p2));
     }
 
     #[test]

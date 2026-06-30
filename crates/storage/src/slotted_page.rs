@@ -69,30 +69,17 @@ const HEADER_SIZE: usize = std::mem::size_of::<PageHeader>();
 const SLOT_SIZE: usize = std::mem::size_of::<Slot>();
 
 // Compile-time layout checks.
-const _: () = assert!(HEADER_SIZE == 16);
+const _: () = assert!(HEADER_SIZE == 24);
 const _: () = assert!(SLOT_SIZE == 12);
 
-/// Header at the start of every page (16 bytes).
-///
-/// This is the common page header shared by all page types (index pages,
-/// tuple pages, delta pages). Fields here are universal — page-type-specific
-/// metadata (e.g., B-tree sibling links) belongs in the suffix or the
-/// higher-level page abstraction.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PageHeader {
-    num_slots: u16,
-    /// Byte offset where data region starts (grows downward from PAGE_SIZE).
-    data_offset: u16,
-    /// Total bytes consumed by live key+value data (for compaction decisions).
-    space_used: u16,
-    /// Bits 0-7: page-specific flags (bit 0 = has_garbage, bit 1 = is_leaf).
-    /// Bits 8-11: page type discriminator (see PageType).
-    /// Bits 12-15: reserved.
-    flags: u16,
-    /// LSN of the most recent WAL record for this page.
-    /// Persisted on disk so recovery can skip replay of older WAL records.
     page_lsn: u64,
+    data_offset: u32,
+    space_used: u32,
+    num_slots: u16,
+    flags: u16,
 }
 
 const FLAG_HAS_GARBAGE: u16 = 1;
@@ -213,7 +200,7 @@ impl SlottedPage {
     pub fn init(page: &mut [u8; PAGE_SIZE]) -> &mut SlottedPage {
         page.fill(0);
         let sp = Self::from_page_mut(page);
-        sp.header_mut().data_offset = PAGE_SIZE as u16;
+        sp.header_mut().data_offset = PAGE_SIZE as u32;
         sp
     }
 
@@ -518,8 +505,8 @@ impl SlottedPage {
             "reserve_suffix on non-empty page"
         );
         let hdr = self.header_mut();
-        hdr.data_offset -= n as u16;
-        hdr.space_used += n as u16;
+        hdr.data_offset -= n as u32;
+        hdr.space_used += n as u32;
     }
 
     /// Get the key bytes for the given slot.
@@ -637,8 +624,8 @@ impl SlottedPage {
         };
 
         // Update header.
-        self.header_mut().data_offset = new_data_offset as u16;
-        self.header_mut().space_used += data_len as u16;
+        self.header_mut().data_offset = new_data_offset as u32;
+        self.header_mut().space_used += data_len as u32;
     }
 
     /// Remove entry at `slot_id`. Shifts remaining slots left.
@@ -647,7 +634,7 @@ impl SlottedPage {
         assert!((slot_id as usize) < count as usize);
 
         let data_len = self.slot(slot_id).key_len as usize + self.slot(slot_id).val_len as usize;
-        self.header_mut().space_used -= data_len as u16;
+        self.header_mut().space_used -= data_len as u32;
 
         // Shift slots left. Derive both src and dst from one &mut self borrow.
         let remaining = count - slot_id - 1;
@@ -715,7 +702,7 @@ impl SlottedPage {
             // last logical entry is removed, `space_used` still reflects only
             // that reserved suffix, and compactification must not drop it.
             let reserved_suffix = self.header().space_used as usize;
-            self.header_mut().data_offset = (PAGE_SIZE - reserved_suffix) as u16;
+            self.header_mut().data_offset = (PAGE_SIZE - reserved_suffix) as u32;
             self.header_mut().flags &= !FLAG_HAS_GARBAGE;
             return;
         }
@@ -772,7 +759,7 @@ impl SlottedPage {
             self.slot_mut(i as u16).offset = offset as u16;
         }
 
-        self.header_mut().data_offset = offset as u16;
+        self.header_mut().data_offset = offset as u32;
         self.header_mut().flags &= !FLAG_HAS_GARBAGE;
     }
 }
@@ -816,7 +803,7 @@ impl SlottedPage {
         for i in new_count..old_count {
             let s = self.slot(i);
             let data_len = s.key_len as usize + s.val_len as usize;
-            self.header_mut().space_used -= data_len as u16;
+            self.header_mut().space_used -= data_len as u32;
         }
 
         self.header_mut().num_slots = new_count;

@@ -17,16 +17,15 @@
 //! but every page is also disk-backed so the dataset can exceed RAM. The pieces
 //! are:
 //!
-//! - [`buffer_frame`]: the per-page in-memory slot — a 4 KiB-aligned frame
+//! - [`buffer_frame`]: the per-page in-memory slot — a 4096-aligned frame
 //!   combining a [`buffer_frame::BufferFrame`]'s latch (a
 //!   `pagebox_hybrid_latch::HybridLatch`), a frame header, and the page bytes
 //!   themselves. The frame is the unit of pinning, latching, and eviction.
-//! - [`buffer_pool`]: the [`buffer_pool::BufferPool`] owns an array of frames
-//!   partitioned by `pagebox_frame_kernel::PageClass`. It performs fix/evict
-//!   (resident-budget second-chance or batch-clock), pin accounting, prefetch,
-//!   dirty-page tracking, the recovery-aware dt registry, and integration with
-//!   the WAL. Every public method takes `&self`; concurrency is handled with
-//!   atomics and the per-frame latch.
+//! - [`buffer_pool`]: the [`buffer_pool::BufferPool`] owns an array of frames.
+//!   It performs fix/evict (resident-budget second-chance or batch-clock), pin
+//!   accounting, prefetch, dirty-page tracking, the recovery-aware dt registry,
+//!   and integration with the WAL. Every public method takes `&self`;
+//!   concurrency is handled with atomics and the per-frame latch.
 //! - [`page_store`]: the disk side. The [`page_store::PageStore`] trait
 //!   abstracts read / write / allocate / sync; concrete implementations are
 //!   [`page_store::InMemoryPageStore`] (tests) and
@@ -35,10 +34,9 @@
 //!   count, checkpoint LSN, and two user-meta slots used by reopened trees.
 //! - [`free_page_allocator`]: a sharded allocator with a central best-fit
 //!   freelist plus per-shard monotonic reservation. Reusable (promoted)
-//!   extents are consumed before monotonic growth; adjacent same-class
-//!   extents coalesce for larger-class allocations; retired large pages split
-//!   into smaller pages. Page IDs are never reused across reopen until the WAL
-//!   checkpoint advances past them.
+//!   extents are consumed before monotonic growth; retired pages return to the
+//!   freelist. Page IDs are never reused across reopen until the WAL checkpoint
+//!   advances past them.
 //! - [`slotted_page`]: the byte-level page format. Slots grow forward from the
 //!   header, key/value heap grows backward from the end of the page, and
 //!   [`slotted_page::SlottedPage::compactify`] reclaims the gap. Reserved

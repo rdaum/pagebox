@@ -10,24 +10,25 @@
 //! ```text
 //!   ┌─────────┬───────────────────────────┬───────────────────────────┬─────┐
 //!   │ header  │ batch-meta page           │ data page × N            │ ... │
-//!   │ 4 KiB   │  (BATCH_META_HEADER_SIZE) │  (one per BatchEntry)    │     │
+//!   │PAGE_SIZE│  (BATCH_META_HEADER_SIZE) │  (one per BatchEntry)    │     │
 //!   └─────────┴───────────────────────────┴───────────────────────────┴─────┘
 //! ```
 //!
-//! The 4 KiB file header carries `WAL_MAGIC` (`"BWAL"`), a `WAL_VERSION`,
-//! a `WAL_FLAG_DIRECT_IO` bit, and the on-disk `WAL_RECORD_SIZE` so a future
-//! tool can refuse an incompatible file. Each *batch* is `1 + N` pages: a
-//! 4 KiB *batch-meta page* holding an array of 24-byte `BatchEntry` records
-//! (LSN, arg, CRC, kind, flags, len), followed by up to
-//! `BATCH_MAX_RECORDS` 4 KiB *data pages* — one per entry. The number of
-//! data pages actually used is stored in `BATCH_META_COUNT_OFF`; the meta
-//! page's own CRC32 covers everything except the CRC field itself.
+//! The file header (one `PAGE_SIZE` block) carries `WAL_MAGIC` (`"BWAL"`),
+//! a `WAL_VERSION`, a `WAL_FLAG_DIRECT_IO` bit, and the on-disk
+//! `WAL_RECORD_SIZE` so a future tool can refuse an incompatible file. Each
+//! *batch* is `1 + N` pages: a *batch-meta page* holding an array of
+//! `BATCH_ENTRY_SIZE`-byte `BatchEntry` records (LSN, arg, CRC, len, kind,
+//! flags), followed by up to `BATCH_MAX_RECORDS` *data pages* — one per
+//! entry. The number of data pages actually used is stored in
+//! `BATCH_META_COUNT_OFF`; the meta page's own CRC32 covers everything except
+//! the CRC field itself.
 //!
 //! ## Record kinds
 //!
 //! `BatchEntry::kind` discriminates three record kinds:
 //!
-//! - `RECORD_KIND_PAGE_IMAGE` — a full 4 KiB page image. `arg` is the
+//! - `RECORD_KIND_PAGE_IMAGE` — a full page image. `arg` is the
 //!   [`PageId`](pagebox_frame_kernel::PageId); the data page is the page's
 //!   bytes verbatim.
 //! - `RECORD_KIND_LOGICAL` — one chunk of a (possibly multi-chunk) logical
@@ -95,10 +96,10 @@ pub(crate) const BATCH_META_HEADER_SIZE: usize = 16;
 pub(crate) const BATCH_ENTRY_LSN_OFF: usize = 0;
 pub(crate) const BATCH_ENTRY_ARG_OFF: usize = 8;
 pub(crate) const BATCH_ENTRY_CRC_OFF: usize = 16;
-pub(crate) const BATCH_ENTRY_KIND_OFF: usize = 20;
-pub(crate) const BATCH_ENTRY_FLAGS_OFF: usize = 21;
-pub(crate) const BATCH_ENTRY_LEN_OFF: usize = 22;
-pub(crate) const BATCH_ENTRY_SIZE: usize = 24;
+pub(crate) const BATCH_ENTRY_LEN_OFF: usize = 20;
+pub(crate) const BATCH_ENTRY_KIND_OFF: usize = 24;
+pub(crate) const BATCH_ENTRY_FLAGS_OFF: usize = 25;
+pub(crate) const BATCH_ENTRY_SIZE: usize = 28;
 pub(crate) const BATCH_MAX_RECORDS: usize = (PAGE_SIZE - BATCH_META_HEADER_SIZE) / BATCH_ENTRY_SIZE;
 const _: () = assert!(BATCH_META_HEADER_SIZE + BATCH_MAX_RECORDS * BATCH_ENTRY_SIZE <= PAGE_SIZE);
 
@@ -108,12 +109,18 @@ pub(crate) const RECORD_KIND_LOGICAL_PACKED: u8 = 3;
 pub(crate) const LOGICAL_FLAG_FIRST: u8 = 1 << 0;
 pub(crate) const LOGICAL_FLAG_LAST: u8 = 1 << 1;
 pub(crate) const LOGICAL_CHUNK_MAX_LEN: usize = PAGE_SIZE;
-pub(crate) const PACKED_LOGICAL_ENTRY_HEADER_LEN: usize = 18;
+pub(crate) const PACKED_LOGICAL_ENTRY_HEADER_LEN: usize = 20;
 pub(crate) const PACKED_LOGICAL_MAX_PAYLOAD_LEN: usize =
     PAGE_SIZE - PACKED_LOGICAL_ENTRY_HEADER_LEN;
 
-/// Write buffer capacity. Must be a multiple of the WAL block size.
-pub(crate) const WAL_BUF_CAPACITY: usize = 64 * 1024 * 1024;
+const WAL_BATCH_BYTES: usize = (BATCH_MAX_RECORDS + 1) * PAGE_SIZE;
+
+pub(crate) const WAL_BUF_CAPACITY: usize = {
+    let cap = WAL_BATCH_BYTES.next_power_of_two();
+    assert!(cap.is_multiple_of(WAL_RECORD_SIZE));
+    cap
+};
+const _: () = assert!(WAL_BUF_CAPACITY >= WAL_BATCH_BYTES);
 const _: () = assert!(WAL_BUF_CAPACITY.is_multiple_of(WAL_RECORD_SIZE));
 
 const fn wal_buf_records(capacity: usize) -> usize {
@@ -315,9 +322,9 @@ pub(crate) struct BatchEntry {
     pub(crate) lsn: Lsn,
     pub(crate) arg: u64,
     pub(crate) crc: u32,
+    pub(crate) len: u32,
     pub(crate) kind: u8,
     pub(crate) flags: u8,
-    pub(crate) len: u16,
 }
 
 impl BatchEntry {
@@ -328,7 +335,7 @@ impl BatchEntry {
             crc,
             kind: RECORD_KIND_PAGE_IMAGE,
             flags: 0,
-            len: PAGE_SIZE as u16,
+            len: PAGE_SIZE as u32,
         }
     }
 
@@ -345,7 +352,7 @@ impl BatchEntry {
             crc,
             kind: RECORD_KIND_LOGICAL,
             flags,
-            len: len as u16,
+            len: len as u32,
         }
     }
 
@@ -356,7 +363,7 @@ impl BatchEntry {
             crc,
             kind: RECORD_KIND_LOGICAL_PACKED,
             flags: 0,
-            len: len as u16,
+            len: len as u32,
         }
     }
 }
@@ -370,10 +377,10 @@ pub(crate) fn write_batch_entry(buf: &mut [u8], idx: usize, entry: BatchEntry) {
         .copy_from_slice(&entry.arg.to_le_bytes());
     buf[off + BATCH_ENTRY_CRC_OFF..off + BATCH_ENTRY_CRC_OFF + 4]
         .copy_from_slice(&entry.crc.to_le_bytes());
+    buf[off + BATCH_ENTRY_LEN_OFF..off + BATCH_ENTRY_LEN_OFF + 4]
+        .copy_from_slice(&entry.len.to_le_bytes());
     buf[off + BATCH_ENTRY_KIND_OFF] = entry.kind;
     buf[off + BATCH_ENTRY_FLAGS_OFF] = entry.flags;
-    buf[off + BATCH_ENTRY_LEN_OFF..off + BATCH_ENTRY_LEN_OFF + 2]
-        .copy_from_slice(&entry.len.to_le_bytes());
 }
 
 pub(crate) fn overwrite_batch_entry_lsn(buf: &mut [u8], idx: usize, lsn: Lsn) {
@@ -408,20 +415,20 @@ pub(crate) fn read_batch_entry(buf: &[u8], idx: usize) -> BatchEntry {
             .try_into()
             .unwrap(),
     );
-    let kind = buf[off + BATCH_ENTRY_KIND_OFF];
-    let flags = buf[off + BATCH_ENTRY_FLAGS_OFF];
-    let len = u16::from_le_bytes(
-        buf[off + BATCH_ENTRY_LEN_OFF..off + BATCH_ENTRY_LEN_OFF + 2]
+    let len = u32::from_le_bytes(
+        buf[off + BATCH_ENTRY_LEN_OFF..off + BATCH_ENTRY_LEN_OFF + 4]
             .try_into()
             .unwrap(),
     );
+    let kind = buf[off + BATCH_ENTRY_KIND_OFF];
+    let flags = buf[off + BATCH_ENTRY_FLAGS_OFF];
     BatchEntry {
         lsn,
         arg,
         crc,
+        len,
         kind,
         flags,
-        len,
     }
 }
 
