@@ -895,10 +895,25 @@ impl CowBeTree {
         }
 
         let root_pid = self.ensure_root_mutable(dirty_lsn)?;
-        let root = self.load_orphan(root_pid)?;
-        let rewrite = match root {
+        let mut frame = unsafe { self.pool().fix_orphan_frame(root_pid) }.exclusive();
+        let root = decode_page(frame.page_bytes())?;
+        match root {
             NodePage::Leaf { fence, entries } => {
-                self.rewrite_leaf_batch(root_pid, &fence, entries, &[message], dirty_lsn)?
+                let mut entries = entries;
+                apply_message_to_entries(&mut entries, &message);
+                if !self.leaf_should_split(root_pid, &fence, &entries) {
+                    let mut image = vec![0u8; PAGE_SIZE];
+                    let bytes = encode_leaf_page(&mut image, &fence, &entries)?;
+                    frame.page_bytes_mut().copy_from_slice(&image);
+                    mark_frame_dirty(&frame, dirty_lsn);
+                    self.stats.inc(CowBeTreeEvent::InPlacePageRewrites);
+                    self.stats.add_leaf_bytes(bytes);
+                    drop(frame);
+                    return Ok(());
+                }
+                drop(frame);
+                let rewrite = self.split_leaf(root_pid, &fence, entries, dirty_lsn)?;
+                self.install_root_rewrite(root_pid, rewrite, dirty_lsn)
             }
             NodePage::Internal {
                 fence,
@@ -908,9 +923,16 @@ impl CowBeTree {
             } => {
                 buffer.push(message);
                 self.stats.inc(CowBeTreeEvent::RootBufferAppends);
-                if self.should_flush_buffer(&buffer)
-                    || self.internal_should_split(root_pid, &fence, &children, &separators, &buffer)
-                {
+                let needs_flush = self.should_flush_buffer(&buffer)
+                    || self.internal_should_split(
+                        root_pid,
+                        &fence,
+                        &children,
+                        &separators,
+                        &buffer,
+                    );
+                drop(frame);
+                let rewrite = if needs_flush {
                     self.flush_internal(root_pid, fence, children, separators, buffer, dirty_lsn)?
                 } else {
                     self.write_internal_at(
@@ -923,10 +945,10 @@ impl CowBeTree {
                     )?;
                     let pid = root_pid;
                     Rewrite::One { pid }
-                }
+                };
+                self.install_root_rewrite(root_pid, rewrite, dirty_lsn)
             }
-        };
-        self.install_root_rewrite(root_pid, rewrite, dirty_lsn)
+        }
     }
 
     /// Zero-allocation fast path for splitting a full root leaf when the
@@ -2559,6 +2581,12 @@ impl CowBeTree {
         self.stats.inc(CowBeTreeEvent::ColdResolves);
         self.stats.inc(CowBeTreeEvent::PageFaults);
         let frame = unsafe { self.pool().fix_orphan_frame(page_id) }.shared();
+        decode_page(frame.page_bytes())
+    }
+
+    #[allow(dead_code)]
+    fn load_orphan_exclusive(&self, page_id: u64) -> Result<NodePage, CowBeTreeError> {
+        let frame = unsafe { self.pool().fix_orphan_frame(page_id) }.exclusive();
         decode_page(frame.page_bytes())
     }
 
