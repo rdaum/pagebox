@@ -16,6 +16,7 @@ impl KvEngine for KvstoreAdapter {
     fn open(dir: &Path, opts: &EngineOpts) -> std::io::Result<Self> {
         let tree_backend = match opts.engine_specific.get("tree_backend").map(String::as_str) {
             Some("betree") => TreeBackend::BeTree,
+            Some("betree-nw") => TreeBackend::BeTreeNoWal,
             _ => TreeBackend::BPlusTree,
         };
         let kv_opts = KvStoreOptions::default()
