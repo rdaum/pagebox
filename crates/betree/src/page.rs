@@ -257,6 +257,166 @@ pub(crate) fn encode_leaf_page(
     )
 }
 
+#[derive(Debug)]
+pub(crate) struct SplitLeafResult {
+    pub(crate) separator: Vec<u8>,
+    pub(crate) left_count: usize,
+    pub(crate) right_count: usize,
+}
+
+/// Split a leaf page in-place by copying entries directly from `src` into two
+/// destination pages.  Entries `[0, mid)` go to `dst_left`, entries
+/// `[mid, entry_count)` go to `dst_right`.  The separator is the key of the
+/// entry at index `mid`.
+///
+/// This is the zero-allocation split primitive: no `NodePage`, no
+/// `Vec<LeafEntry>`, and no `BodyWriter` allocations.  The only allocation is
+/// the separator key `Vec<u8>` returned in `SplitLeafResult`.
+pub(crate) fn split_leaf_into_pages(
+    src: &[u8],
+    dst_left: &mut [u8],
+    dst_right: &mut [u8],
+    fence_left: &Fence,
+    fence_right: &Fence,
+    mid: usize,
+) -> Result<SplitLeafResult, CowBeTreeError> {
+    let reader = LeafPageReader::new(src)?;
+    let entry_count = reader.entry_count();
+    if mid == 0 || mid >= entry_count {
+        return Err(CowBeTreeError::CorruptPage("invalid leaf split point"));
+    }
+
+    let separator = reader.entry_key(mid)?.to_vec();
+    build_leaf_page_from_src(dst_left, fence_left, &reader, 0, mid)?;
+    build_leaf_page_from_src(dst_right, fence_right, &reader, mid, entry_count)?;
+
+    Ok(SplitLeafResult {
+        separator,
+        left_count: mid,
+        right_count: entry_count - mid,
+    })
+}
+
+fn build_leaf_page_from_src(
+    dst: &mut [u8],
+    fence: &Fence,
+    src: &LeafPageReader<'_>,
+    start: usize,
+    end: usize,
+) -> Result<usize, CowBeTreeError> {
+    let count = end
+        .checked_sub(start)
+        .ok_or(CowBeTreeError::CorruptPage("entry range underflow"))?;
+    if count == 0 {
+        return Err(CowBeTreeError::CorruptPage(
+            "cannot build leaf page from empty entry range",
+        ));
+    }
+
+    let fence_len = fence_encoded_len(fence);
+    let count_len = 2;
+
+    let mut entry_bytes_total = 0usize;
+    for idx in start..end {
+        let entry_bytes = src.entry_raw(idx)?;
+        entry_bytes_total = entry_bytes_total
+            .checked_add(entry_bytes.len())
+            .ok_or(CowBeTreeError::CorruptPage("entry bytes overflow"))?;
+    }
+
+    let directory_len =
+        count
+            .checked_mul(LEAF_DIR_ENTRY_SIZE)
+            .ok_or(CowBeTreeError::CorruptPage(
+                "leaf directory length overflow",
+            ))?;
+    let body_len = fence_len
+        .checked_add(count_len)
+        .and_then(|l| l.checked_add(entry_bytes_total))
+        .and_then(|l| l.checked_add(directory_len))
+        .ok_or(CowBeTreeError::CorruptPage("leaf body length overflow"))?;
+    let needed = HEADER_SIZE
+        .checked_add(body_len)
+        .ok_or(CowBeTreeError::CorruptPage("page length overflow"))?;
+    if needed > dst.len() {
+        return Err(page_overflow("leaf", needed, dst.len()));
+    }
+
+    dst.fill(0);
+
+    write_u16(dst, COUNT_OFF, count, "page item count too large")?;
+    write_u32(dst, BODY_LEN_OFF, body_len, "page body too large")?;
+    dst[MAGIC_OFF..MAGIC_OFF + 4].copy_from_slice(&PAGE_MAGIC.to_le_bytes());
+    dst[VERSION_OFF] = PAGE_VERSION;
+    dst[KIND_OFF] = PageKind::Leaf as u8;
+    page_header::write_page_type(dst, PageType::BeTreeLeaf);
+
+    let body_start = HEADER_SIZE;
+    let mut pos = body_start;
+
+    pos = write_fence_at_page(dst, pos, fence)?;
+
+    let count_u16 =
+        u16::try_from(count).map_err(|_| CowBeTreeError::CorruptPage("too many leaf entries"))?;
+    dst[pos..pos + 2].copy_from_slice(&count_u16.to_le_bytes());
+    pos += 2;
+
+    let dir_start_in_body = (pos - body_start) + entry_bytes_total;
+    let dir_start_in_page = body_start + dir_start_in_body;
+
+    for idx in start..end {
+        let entry_bytes = src.entry_raw(idx)?;
+        let entry_offset_in_body = pos - body_start;
+        let dir_idx = idx - start;
+        let dir_pos = dir_start_in_page + dir_idx * LEAF_DIR_ENTRY_SIZE;
+        let offset_u32 = u32::try_from(entry_offset_in_body)
+            .map_err(|_| CowBeTreeError::CorruptPage("leaf entry offset too large"))?;
+        dst[dir_pos..dir_pos + LEAF_DIR_ENTRY_SIZE].copy_from_slice(&offset_u32.to_le_bytes());
+        dst[pos..pos + entry_bytes.len()].copy_from_slice(entry_bytes);
+        pos += entry_bytes.len();
+    }
+
+    Ok(needed)
+}
+
+fn fence_encoded_len(fence: &Fence) -> usize {
+    let lower_len = 2 + fence.lower.len();
+    let upper_len = match &fence.upper {
+        Some(upper) => 2 + upper.len(),
+        None => 2,
+    };
+    lower_len + upper_len
+}
+
+fn write_fence_at_page(
+    page: &mut [u8],
+    mut pos: usize,
+    fence: &Fence,
+) -> Result<usize, CowBeTreeError> {
+    let lower_len = u16::try_from(fence.lower.len())
+        .map_err(|_| CowBeTreeError::CorruptPage("lower fence too large"))?;
+    page[pos..pos + 2].copy_from_slice(&lower_len.to_le_bytes());
+    pos += 2;
+    page[pos..pos + fence.lower.len()].copy_from_slice(&fence.lower);
+    pos += fence.lower.len();
+
+    match &fence.upper {
+        Some(upper) => {
+            let upper_len = u16::try_from(upper.len())
+                .map_err(|_| CowBeTreeError::CorruptPage("upper fence too large"))?;
+            page[pos..pos + 2].copy_from_slice(&upper_len.to_le_bytes());
+            pos += 2;
+            page[pos..pos + upper.len()].copy_from_slice(upper);
+            pos += upper.len();
+        }
+        None => {
+            page[pos..pos + 2].copy_from_slice(&NONE_FENCE_LEN.to_le_bytes());
+            pos += 2;
+        }
+    }
+    Ok(pos)
+}
+
 fn encode_leaf_body(fence: &Fence, entries: &[LeafEntry]) -> Result<Vec<u8>, CowBeTreeError> {
     let mut body = BodyWriter::new();
     encode_fence(&mut body, fence)?;
@@ -1724,6 +1884,71 @@ impl<'a> BodyReader<'a> {
     }
 }
 
+/// Zero-copy reader for leaf pages.  Pre-parses the page header, fence, and
+/// directory to provide O(1) entry access by index without any heap
+/// allocation.
+pub(crate) struct LeafPageReader<'a> {
+    body: &'a [u8],
+    directory_start: usize,
+    entry_count: usize,
+}
+
+impl<'a> LeafPageReader<'a> {
+    pub(crate) fn new(page: &'a [u8]) -> Result<Self, CowBeTreeError> {
+        let (kind, mut reader) = page_body_reader(page)?;
+        if kind != PageKind::Leaf {
+            return Err(CowBeTreeError::CorruptPage("expected leaf page"));
+        }
+        let body = reader.data;
+        skip_fence(&mut reader)?;
+        let entry_count = reader.read_u16()? as usize;
+        let directory_start = leaf_directory_start(body.len(), entry_count)?;
+        if reader.pos > directory_start {
+            return Err(CowBeTreeError::CorruptPage(
+                "leaf directory overlaps entry header",
+            ));
+        }
+        Ok(Self {
+            body,
+            directory_start,
+            entry_count,
+        })
+    }
+
+    pub(crate) fn entry_count(&self) -> usize {
+        self.entry_count
+    }
+
+    pub(crate) fn entry_key(&self, idx: usize) -> Result<&'a [u8], CowBeTreeError> {
+        let offset = read_leaf_entry_offset(self.body, self.directory_start, idx)?;
+        read_leaf_entry_key_at(self.body, offset)
+    }
+
+    /// Returns the raw entry bytes (key_len + key + version_count + versions)
+    /// for entry `idx`.  The bytes are a zero-copy slice into the page body.
+    pub(crate) fn entry_raw(&self, idx: usize) -> Result<&'a [u8], CowBeTreeError> {
+        let start = read_leaf_entry_offset(self.body, self.directory_start, idx)?;
+        let end = if idx + 1 < self.entry_count {
+            read_leaf_entry_offset(self.body, self.directory_start, idx + 1)?
+        } else {
+            self.directory_start
+        };
+        if start > end {
+            return Err(CowBeTreeError::CorruptPage(
+                "leaf entry has negative length",
+            ));
+        }
+        self.body
+            .get(start..end)
+            .ok_or(CowBeTreeError::CorruptPage("leaf entry raw out of bounds"))
+    }
+
+    pub(crate) fn fence(&self) -> Result<Fence, CowBeTreeError> {
+        let mut reader = BodyReader::new(self.body);
+        decode_fence(&mut reader)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2231,6 +2456,183 @@ mod tests {
         assert!(
             decode_page(&page).is_err(),
             "decode should reject unsorted leaf keys"
+        );
+    }
+
+    #[test]
+    fn leaf_page_reader_reads_entries_and_keys_zero_copy() {
+        let entries: Vec<LeafEntry> = (0..5)
+            .map(|i| LeafEntry {
+                key: format!("key{i:02}").into_bytes(),
+                versions: vec![version(i as Timestamp, format!("val{i:02}").as_bytes())],
+            })
+            .collect();
+        let fence = Fence {
+            lower: b"a".to_vec(),
+            upper: Some(b"z".to_vec()),
+        };
+
+        let mut page = [0u8; PAGE_SIZE];
+        encode_leaf_page(&mut page, &fence, &entries).unwrap();
+
+        let reader = LeafPageReader::new(&page).unwrap();
+        assert_eq!(reader.entry_count(), 5, "entry count mismatch");
+        for (idx, entry) in entries.iter().enumerate() {
+            assert_eq!(
+                reader.entry_key(idx).unwrap(),
+                entry.key.as_slice(),
+                "entry key mismatch at index {idx}"
+            );
+        }
+        let read_fence = reader.fence().unwrap();
+        assert_eq!(read_fence, fence, "fence mismatch");
+    }
+
+    #[test]
+    fn leaf_page_reader_entry_raw_preserves_multi_version_entries() {
+        let entries = vec![
+            LeafEntry {
+                key: b"k01".to_vec(),
+                versions: vec![version(10, b"new"), version(1, b"old")],
+            },
+            LeafEntry {
+                key: b"k02".to_vec(),
+                versions: vec![version(2, b"v02")],
+            },
+            LeafEntry {
+                key: b"k03".to_vec(),
+                versions: vec![
+                    VersionRecord {
+                        commit_ts: 7,
+                        value: Vec::new(),
+                        deleted: true,
+                    },
+                    version(3, b"v03"),
+                ],
+            },
+        ];
+
+        let mut page = [0u8; PAGE_SIZE];
+        encode_leaf_page(&mut page, &Fence::root(), &entries).unwrap();
+
+        let reader = LeafPageReader::new(&page).unwrap();
+        for (idx, entry) in entries.iter().enumerate() {
+            let raw = reader.entry_raw(idx).unwrap();
+            let mut entry_reader = BodyReader::at(raw, 0).unwrap();
+            let key = entry_reader.read_bytes_u16_len().unwrap();
+            let version_count = entry_reader.read_u16().unwrap() as usize;
+            assert_eq!(key, entry.key.as_slice(), "raw entry key mismatch");
+            assert_eq!(
+                version_count,
+                entry.versions.len(),
+                "raw entry version count mismatch"
+            );
+            for version in &entry.versions {
+                let decoded = decode_version(&mut entry_reader).unwrap();
+                assert_eq!(decoded, *version, "version mismatch");
+            }
+        }
+    }
+
+    #[test]
+    fn split_leaf_into_pages_distributes_entries_and_preserves_versions() {
+        let entries: Vec<LeafEntry> = (0..10)
+            .map(|i| LeafEntry {
+                key: format!("key{i:02}").into_bytes(),
+                versions: vec![
+                    version((i + 1) as Timestamp, format!("new{i:02}").as_bytes()),
+                    version(1, format!("old{i:02}").as_bytes()),
+                ],
+            })
+            .collect();
+        let fence = Fence {
+            lower: b"a".to_vec(),
+            upper: Some(b"zzz".to_vec()),
+        };
+
+        let mut src = [0u8; PAGE_SIZE];
+        encode_leaf_page(&mut src, &fence, &entries).unwrap();
+
+        let mid = 4;
+        let separator = entries[mid].key.clone();
+        let left_fence = fence.left_of(separator.clone());
+        let right_fence = fence.right_of(separator.clone());
+
+        let mut dst_left = [0u8; PAGE_SIZE];
+        let mut dst_right = [0u8; PAGE_SIZE];
+        let result = split_leaf_into_pages(
+            &src,
+            &mut dst_left,
+            &mut dst_right,
+            &left_fence,
+            &right_fence,
+            mid,
+        )
+        .unwrap();
+
+        assert_eq!(result.separator, separator, "separator mismatch");
+        assert_eq!(result.left_count, mid, "left count mismatch");
+        assert_eq!(
+            result.right_count,
+            entries.len() - mid,
+            "right count mismatch"
+        );
+
+        let NodePage::Leaf {
+            fence: lf,
+            entries: le,
+        } = decode_page(&dst_left).unwrap()
+        else {
+            panic!("left page should be a leaf");
+        };
+        assert_eq!(lf, left_fence, "left fence mismatch");
+        assert_eq!(
+            le,
+            entries[..mid],
+            "left entries should match the first half"
+        );
+
+        let NodePage::Leaf {
+            fence: rf,
+            entries: re,
+        } = decode_page(&dst_right).unwrap()
+        else {
+            panic!("right page should be a leaf");
+        };
+        assert_eq!(rf, right_fence, "right fence mismatch");
+        assert_eq!(
+            re,
+            entries[mid..],
+            "right entries should match the second half"
+        );
+    }
+
+    #[test]
+    fn split_leaf_into_pages_rejects_invalid_split_point() {
+        let entries = vec![
+            LeafEntry {
+                key: b"k01".to_vec(),
+                versions: vec![version(1, b"v01")],
+            },
+            LeafEntry {
+                key: b"k02".to_vec(),
+                versions: vec![version(2, b"v02")],
+            },
+        ];
+        let mut src = [0u8; PAGE_SIZE];
+        encode_leaf_page(&mut src, &Fence::root(), &entries).unwrap();
+
+        let mut dst_left = [0u8; PAGE_SIZE];
+        let mut dst_right = [0u8; PAGE_SIZE];
+        let fence = Fence::root();
+
+        assert!(
+            split_leaf_into_pages(&src, &mut dst_left, &mut dst_right, &fence, &fence, 0).is_err(),
+            "mid=0 should be rejected"
+        );
+        assert!(
+            split_leaf_into_pages(&src, &mut dst_left, &mut dst_right, &fence, &fence, 2).is_err(),
+            "mid=entry_count should be rejected"
         );
     }
 }

@@ -16,11 +16,11 @@ use crate::message::{
     BufferedMessage, CowBeTreeMessage, Timestamp, VersionRecord, sort_buffer_messages,
 };
 use crate::page::{
-    CowBeTreeError, Fence, LeafEntry, LookupStep, NodePage, PageKindDebug, RawVisibleVersion,
-    append_internal_buffer_kv, append_internal_buffer_message, append_leaf_entry_message,
-    append_leaf_entry_prefix, append_leaf_kv, apply_message_to_entries, buffer_encoded_len,
-    decode_page, encode_internal_page, encode_leaf_page, encoded_page_len, lookup_step,
-    lower_bound_entries, route_child,
+    CowBeTreeError, Fence, LeafEntry, LeafPageReader, LookupStep, NodePage, PageKindDebug,
+    RawVisibleVersion, append_internal_buffer_kv, append_internal_buffer_message,
+    append_leaf_entry_message, append_leaf_entry_prefix, append_leaf_kv, apply_message_to_entries,
+    buffer_encoded_len, decode_page, encode_internal_page, encode_leaf_page, encoded_page_len,
+    lookup_step, lower_bound_entries, route_child, split_leaf_into_pages,
 };
 use crate::stats::{CowBeTreeEvent, CowBeTreeStats};
 
@@ -401,15 +401,17 @@ impl CowBeTree {
             return Ok(true);
         }
 
+        let step = lookup_step(frame.page_bytes(), key, Timestamp::MAX)?;
+        match step {
+            LookupStep::Leaf { visible: None } => return Ok(false),
+            LookupStep::Internal { .. } => return Ok(false),
+            LookupStep::Leaf { visible: Some(_) } => {}
+        }
+
         let mut node = decode_page(frame.page_bytes())?;
         let NodePage::Leaf { fence, entries } = &mut node else {
             return Ok(false);
         };
-        let pos = lower_bound_entries(entries, key);
-        if entries.get(pos).is_none_or(|entry| entry.key != key) {
-            return Ok(false);
-        }
-
         let message = BufferedMessage::put(key, commit_ts, value);
         apply_message_to_entries(entries, &message);
         if self.leaf_should_split(page_id, fence, entries) {
@@ -771,6 +773,10 @@ impl CowBeTree {
             return Ok(());
         }
 
+        if let Some(rewrite) = self.try_split_root_leaf_direct(root_pid, &message, dirty_lsn)? {
+            return self.install_root_rewrite(root_pid, rewrite, dirty_lsn);
+        }
+
         let root = self.load_orphan(root_pid)?;
         let rewrite = match root {
             NodePage::Leaf { fence, entries } => {
@@ -803,6 +809,99 @@ impl CowBeTree {
             }
         };
         self.install_root_rewrite(root_pid, rewrite, dirty_lsn)
+    }
+
+    /// Zero-allocation fast path for splitting a full root leaf when the
+    /// message is a new-key put whose key sorts after the last entry.
+    ///
+    /// Reads the source page directly (no `decode_page`), copies entries into
+    /// two new destination pages using `split_leaf_into_pages`, then appends
+    /// the message to the right page using `append_leaf_kv`.  Returns
+    /// `None` when the fast path conditions are not met (root is not a leaf,
+    /// message is a delete or an update, key falls in the left page's range,
+    /// etc.) so the caller falls back to the decode path.
+    fn try_split_root_leaf_direct(
+        &self,
+        root_pid: u64,
+        message: &BufferedMessage,
+        dirty_lsn: Option<Lsn>,
+    ) -> Result<Option<Rewrite>, CowBeTreeError> {
+        let src_frame = unsafe { self.pool().fix_orphan_frame(root_pid) }.shared();
+        let src = src_frame.page_bytes();
+
+        let reader = match LeafPageReader::new(src) {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+        let entry_count = reader.entry_count();
+        if entry_count < 2 {
+            return Ok(None);
+        }
+
+        if message.version.deleted {
+            return Ok(None);
+        }
+        let last_key = reader.entry_key(entry_count - 1)?;
+        if message.key.as_slice() <= last_key {
+            return Ok(None);
+        }
+
+        let mid = entry_count.div_ceil(2);
+        if mid >= entry_count {
+            return Ok(None);
+        }
+
+        let separator_key = reader.entry_key(mid)?;
+        let root_fence = reader.fence()?;
+        let left_fence = root_fence.left_of(separator_key.to_vec());
+        let right_fence = root_fence.right_of(separator_key.to_vec());
+
+        let (left_pid, left_frame_handle) = self.allocate_frame();
+        let (right_pid, right_frame_handle) = self.allocate_frame();
+        let mut left_frame = left_frame_handle.exclusive();
+        let mut right_frame = right_frame_handle.exclusive();
+
+        let split_result = split_leaf_into_pages(
+            src,
+            left_frame.page_bytes_mut(),
+            right_frame.page_bytes_mut(),
+            &left_fence,
+            &right_fence,
+            mid,
+        )?;
+
+        let appended = append_leaf_kv(
+            right_frame.page_bytes_mut(),
+            &message.key,
+            &message.version.value,
+            message.version.commit_ts,
+            self.config.max_leaf_entries,
+        )?;
+        if appended.is_none() {
+            return Ok(None);
+        }
+
+        left_frame.set_parent_link_none();
+        mark_frame_dirty(&left_frame, dirty_lsn);
+        right_frame.set_parent_link_none();
+        mark_frame_dirty(&right_frame, dirty_lsn);
+
+        drop(src_frame);
+        drop(left_frame);
+        drop(right_frame);
+
+        self.append_hint.store(right_pid, Ordering::Release);
+        self.stats.inc(CowBeTreeEvent::LeafSplits);
+        self.stats.inc(CowBeTreeEvent::CowPagesAllocated);
+        self.stats.inc(CowBeTreeEvent::CowPagesAllocated);
+        self.stats
+            .add_leaf_bytes(split_result.left_count + split_result.right_count + 1);
+
+        Ok(Some(Rewrite::Split {
+            left_pid,
+            right_pid,
+            separator: split_result.separator,
+        }))
     }
 
     fn try_write_new_message_page_local(

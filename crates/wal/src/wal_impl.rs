@@ -2377,7 +2377,8 @@ impl WalInner {
                 let requested_write = self.requested_write_lsn.load(Ordering::Acquire);
                 let pending_write = !state.pending_writes.is_empty()
                     || requested_write > written
-                    || (relaxed_mode && self.should_write_relaxed(&state, last_write));
+                    || (relaxed_mode && self.should_write_relaxed(&state, last_write))
+                    || (state.shutdown && state.active.used > 0);
                 if state.crash_shutdown {
                     return;
                 }
