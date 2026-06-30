@@ -148,6 +148,7 @@ enum VisibleLookupStep {
     Internal {
         parent_pid: u64,
         child_swip: Swip,
+        child_slot: u16,
         visible_buffer: Option<VisibleCandidate>,
         buffer_count: usize,
     },
@@ -727,15 +728,21 @@ impl CowBeTree {
                 VisibleLookupStep::Internal {
                     parent_pid,
                     child_swip,
+                    child_slot,
                     visible_buffer,
                     buffer_count,
-                    ..
                 } => {
                     if buffer_count > 0 {
                         saw_path_buffer = true;
                     }
                     if let Some(buffer) = visible_buffer {
                         merge_owned_visible_candidate(&mut visible, buffer);
+                    }
+                    if child_swip.is_evicted() {
+                        let child_pid = child_swip.as_page_id();
+                        if child_pid > 0 && child_pid <= 0xFFFF_FFFF {
+                            self.swizzle_child_read_only(parent_pid, child_pid, child_slot);
+                        }
                     }
                     next_swip = child_swip;
                     next_parent = parent_pid;
@@ -1155,7 +1162,6 @@ impl CowBeTree {
         write_child_swip_at(parent.page_bytes_mut(), child_slot, hot_swip);
     }
 
-    #[allow(dead_code)]
     fn swizzle_child_read_only(&self, parent_pid: u64, child_pid: u64, child_slot: u16) {
         let Some(child_pin) = (unsafe { self.pool().try_fix_resident_page_frame(child_pid) })
         else {
@@ -2815,12 +2821,13 @@ fn own_lookup_step(step: LookupStep<'_>) -> VisibleLookupStep {
         },
         LookupStep::Internal {
             child_swip,
+            child_slot,
             visible_buffer,
             buffer_count,
-            ..
         } => VisibleLookupStep::Internal {
             parent_pid: 0,
             child_swip,
+            child_slot,
             visible_buffer: visible_buffer.map(own_visible_candidate),
             buffer_count,
         },
