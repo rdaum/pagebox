@@ -158,6 +158,34 @@ impl ClassArena {
             )
         };
         assert_ne!(ptr, libc::MAP_FAILED, "mmap failed");
+
+        // Request Transparent Huge Pages for the frame arena to reduce TLB
+        // pressure. The arena is large (16× the resident budget per class)
+        // and accessed frequently on the hot path.
+        #[cfg(target_os = "linux")]
+        {
+            let ret = unsafe { libc::madvise(ptr, byte_len, libc::MADV_HUGEPAGE) };
+            // Non-fatal: the kernel may refuse THP for this region.
+            debug_assert_eq!(
+                ret,
+                0,
+                "madvise(MADV_HUGEPAGE) failed: {}",
+                std::io::Error::last_os_error()
+            );
+
+            // Prevent the mapping from being inherited by fork(). Required
+            // for O_DIRECT correctness: fork() creates a COW copy of the
+            // address space, and direct I/O into a COW'd page may write
+            // from the wrong physical page.
+            let ret = unsafe { libc::madvise(ptr, byte_len, libc::MADV_DONTFORK) };
+            debug_assert_eq!(
+                ret,
+                0,
+                "madvise(MADV_DONTFORK) failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
         let ptr = ptr as *mut BufferFrame;
 
         ClassArena {
@@ -417,7 +445,7 @@ pub struct BufferPool {
     fix_orphan_latch_wait_sampled_pages: parking_lot::Mutex<HashMap<u64, u64>>,
     fix_orphan_evicting_retry_sample_clock: AtomicU64,
     fix_orphan_evicting_retry_sampled_pages: parking_lot::Mutex<HashMap<u64, u64>>,
-    /// Registry of parent finders by data structure ID (like LeanStore's DTRegistry).
+    /// Registry of parent finders by data structure ID.
     /// Each B-tree registers itself so eviction can tree-walk to find parents.
     dt_registry: parking_lot::Mutex<HashMap<u16, Arc<dyn ParentFinder>>>,
     /// Coordinate hot-frame pins against eviction.
