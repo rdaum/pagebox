@@ -355,6 +355,10 @@ struct AlignedPageCopy {
     len: usize,
 }
 
+thread_local! {
+    static SPARE_PAGE_BUF: std::cell::RefCell<Option<Box<[u8; PAGE_SIZE]>>> = const { std::cell::RefCell::new(None) };
+}
+
 impl AlignedPageCopy {
     fn copy_from(page: &[u8]) -> Self {
         let layout = std::alloc::Layout::from_size_align(page.len(), PAGE_SIZE).unwrap();
@@ -382,6 +386,34 @@ impl Drop for AlignedPageCopy {
     fn drop(&mut self) {
         let layout = std::alloc::Layout::from_size_align(self.len, PAGE_SIZE).unwrap();
         unsafe { std::alloc::dealloc(self.ptr.as_ptr(), layout) };
+    }
+}
+
+/// A reusable thread-local page-level scratch buffer.
+/// Avoids alloc/free on every mark_dirty_raw call.
+struct PageScratch {
+    buf: Box<[u8; PAGE_SIZE]>,
+}
+
+impl PageScratch {
+    fn take() -> Self {
+        let buf = SPARE_PAGE_BUF.with(|cell| cell.borrow_mut().take());
+        Self {
+            buf: buf.unwrap_or_else(|| Box::new([0u8; PAGE_SIZE])),
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buf[..]
+    }
+}
+
+impl Drop for PageScratch {
+    fn drop(&mut self) {
+        let buf = std::mem::replace(&mut self.buf, Box::new([0u8; PAGE_SIZE]));
+        SPARE_PAGE_BUF.with(|cell| {
+            *cell.borrow_mut() = Some(buf);
+        });
     }
 }
 
@@ -3804,12 +3836,9 @@ impl BufferPool {
                 );
                 let lsn = wal.claim_lsn();
                 page_header::write_page_lsn(page, lsn);
-                let mut page_copy = AlignedPageCopy::copy_from(page);
-                prepare_page_copy_for_writeback(page_copy.as_mut_slice(), self);
-                let prepared_page: &mut [u8; PAGE_SIZE] = page_copy
-                    .as_mut_slice()
-                    .try_into()
-                    .expect("page-sized copy");
+                let mut scratch = PageScratch::take();
+                scratch.as_mut_slice().copy_from_slice(page);
+                prepare_page_copy_for_writeback(scratch.as_mut_slice(), self);
                 let mut record = BufferedWalRecord {
                     epoch: 0,
                     offset: 0,
@@ -3824,7 +3853,7 @@ impl BufferPool {
                             lsn,
                             pid,
                             |_lsn, page_image| {
-                                page_image.copy_from_slice(prepared_page);
+                                page_image.copy_from_slice(scratch.as_mut_slice());
                             },
                         )
                         .expect("WAL overwrite failed");
@@ -3836,7 +3865,7 @@ impl BufferPool {
                 if !logged {
                     record = wal
                         .append_page_image_with_lsn(lsn, pid, |_lsn, page_image| {
-                            page_image.copy_from_slice(prepared_page);
+                            page_image.copy_from_slice(scratch.as_mut_slice());
                         })
                         .expect("WAL append failed");
                 }
