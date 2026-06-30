@@ -403,18 +403,6 @@ impl CowBeTree {
         value: &[u8],
         commit_ts: Timestamp,
     ) -> Result<bool, CowBeTreeError> {
-        let right = {
-            let frame = unsafe { self.pool().fix_orphan_frame(page_id) }.shared();
-            if leaf_should_chase_right(frame.page_bytes(), key) {
-                read_right_sibling(frame.page_bytes())
-            } else {
-                0
-            }
-        };
-        if right != 0 {
-            return self.try_append_leaf_kv_page_local(right, key, value, commit_ts);
-        }
-
         let mut frame = unsafe { self.pool().fix_orphan_frame(page_id) }.exclusive();
         if leaf_should_chase_right(frame.page_bytes(), key) {
             let right = read_right_sibling(frame.page_bytes());
