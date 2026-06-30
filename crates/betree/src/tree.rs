@@ -19,13 +19,13 @@ use crate::message::{
     BufferedMessage, CowBeTreeMessage, Timestamp, VersionRecord, sort_buffer_messages,
 };
 use crate::page::{
-    CowBeTreeError, Fence, LeafEntry, LeafPageReader, LookupStep, NodePage, PageKindDebug,
-    RawVisibleVersion, append_internal_buffer_kv, append_internal_buffer_message,
+    CowBeTreeError, Fence, LeafEntry, LeafPageReader, LeafUpdateResult, LookupStep, NodePage,
+    PageKindDebug, RawVisibleVersion, append_internal_buffer_kv, append_internal_buffer_message,
     append_leaf_entry_message, append_leaf_entry_prefix, append_leaf_kv, apply_message_to_entries,
     buffer_encoded_len, decode_page, encode_internal_page, encode_leaf_page, encoded_page_len,
     internal_child_array_range, leaf_should_chase_right, lookup_child_slot, lookup_step,
     lower_bound_entries, read_child_swip_at, read_right_sibling, route_child,
-    split_leaf_into_pages, write_child_swip_at, write_right_sibling,
+    split_leaf_into_pages, update_leaf_kv, write_child_swip_at, write_right_sibling,
 };
 use crate::stats::{CowBeTreeEvent, CowBeTreeStats};
 
@@ -466,11 +466,15 @@ impl CowBeTree {
             return Ok(true);
         }
 
-        let step = lookup_step(frame.page_bytes(), key, Timestamp::MAX)?;
-        match step {
-            LookupStep::Leaf { visible: None } => return Ok(false),
-            LookupStep::Internal { .. } => return Ok(false),
-            LookupStep::Leaf { visible: Some(_) } => {}
+        match update_leaf_kv(frame.page_bytes_mut(), key, value, commit_ts)? {
+            LeafUpdateResult::Updated => {
+                mark_frame_dirty(frame, None);
+                self.append_hint.store(frame.pid(), Ordering::Release);
+                self.stats.inc(CowBeTreeEvent::InPlacePageRewrites);
+                return Ok(true);
+            }
+            LeafUpdateResult::NotFound => return Ok(false),
+            LeafUpdateResult::NeedRewrite => {}
         }
 
         let mut node = decode_page(frame.page_bytes())?;

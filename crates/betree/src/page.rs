@@ -814,6 +814,64 @@ pub(crate) fn append_leaf_entry_message(
     append_leaf_entry_batch(page, std::slice::from_ref(message), max_leaf_entries)
 }
 
+pub(crate) enum LeafUpdateResult {
+    Updated,
+    NotFound,
+    NeedRewrite,
+}
+
+pub(crate) fn update_leaf_kv(
+    page: &mut [u8],
+    key: &[u8],
+    value: &[u8],
+    commit_ts: Timestamp,
+) -> Result<LeafUpdateResult, CowBeTreeError> {
+    let (kind, mut reader) = page_body_reader(page)?;
+    if kind != PageKind::Leaf {
+        return Ok(LeafUpdateResult::NeedRewrite);
+    }
+    skip_fence(&mut reader)?;
+    let entry_count = reader.read_u16()? as usize;
+    if entry_count == 0 {
+        return Ok(LeafUpdateResult::NotFound);
+    }
+    let directory_start = leaf_directory_start(reader.data.len(), entry_count)?;
+    if reader.pos > directory_start {
+        return Ok(LeafUpdateResult::NeedRewrite);
+    }
+
+    let Some(idx) = find_leaf_entry(reader.data, directory_start, entry_count, key)? else {
+        return Ok(LeafUpdateResult::NotFound);
+    };
+
+    let entry_offset = read_leaf_entry_offset(reader.data, directory_start, idx)?;
+    let mut entry_reader = BodyReader::at(reader.data, entry_offset)?;
+    let entry_key = entry_reader.read_bytes_u16_len()?;
+    if entry_key != key {
+        return Ok(LeafUpdateResult::NeedRewrite);
+    }
+
+    let version_count = entry_reader.read_u16()? as usize;
+    if version_count == 0 {
+        return Ok(LeafUpdateResult::NeedRewrite);
+    }
+
+    let old_version_pos = entry_reader.pos;
+    let old_version = read_raw_version(&mut entry_reader)?;
+    if old_version.commit_ts != commit_ts {
+        return Ok(LeafUpdateResult::NeedRewrite);
+    }
+
+    let old_value_len = old_version.value.len();
+    if old_value_len == value.len() {
+        let value_start = old_version_pos + 8 + 1 + 4;
+        page[value_start..value_start + value.len()].copy_from_slice(value);
+        Ok(LeafUpdateResult::Updated)
+    } else {
+        Ok(LeafUpdateResult::NeedRewrite)
+    }
+}
+
 pub(crate) fn append_leaf_kv(
     page: &mut [u8],
     key: &[u8],
@@ -1819,9 +1877,7 @@ fn decode_internal(mut reader: BodyReader<'_>, fence: Fence) -> Result<NodePage,
                 "decode_internal: garbage child_pid=0x{child_pid:016x} swip_raw=0x{:016x}",
                 swip.raw(),
             );
-            return Err(CowBeTreeError::CorruptPage(
-                "internal child pid is garbage",
-            ));
+            return Err(CowBeTreeError::CorruptPage("internal child pid is garbage"));
         }
         children.push(child_pid);
     }
