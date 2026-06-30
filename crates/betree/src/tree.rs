@@ -354,11 +354,8 @@ impl CowBeTree {
         commit_ts: Timestamp,
         value: &[u8],
     ) -> Result<(), CowBeTreeError> {
-        {
-            let _structural_guard = self.write_latch.lock_shared();
-            if self.try_put_page_local(key, commit_ts, value)? {
-                return Ok(());
-            }
+        if self.try_put_page_local(key, commit_ts, value)? {
+            return Ok(());
         }
         let message = BufferedMessage::put(key, commit_ts, value);
         self.write_message_structural(message, None)
@@ -765,13 +762,9 @@ impl CowBeTree {
         message: BufferedMessage,
         dirty_lsn: Option<Lsn>,
     ) -> Result<(), CowBeTreeError> {
-        {
-            let _structural_guard = self.write_latch.lock_shared();
-            if self.try_write_message_page_local(&message, dirty_lsn)? {
-                return Ok(());
-            }
+        if self.try_write_message_page_local(&message, dirty_lsn)? {
+            return Ok(());
         }
-
         self.write_message_structural(message, dirty_lsn)
     }
 
@@ -780,13 +773,9 @@ impl CowBeTree {
         message: BufferedMessage,
         dirty_lsn: Option<Lsn>,
     ) -> Result<(), CowBeTreeError> {
-        {
-            let _structural_guard = self.write_latch.lock_shared();
-            if self.try_write_new_message_page_local(&message, dirty_lsn)? {
-                return Ok(());
-            }
+        if self.try_write_new_message_page_local(&message, dirty_lsn)? {
+            return Ok(());
         }
-
         self.write_message_structural(message, dirty_lsn)
     }
 
