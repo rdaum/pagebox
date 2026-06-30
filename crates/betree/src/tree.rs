@@ -24,8 +24,9 @@ use crate::page::{
     RawVisibleVersion, append_internal_buffer_kv, append_internal_buffer_message,
     append_leaf_entry_message, append_leaf_entry_prefix, append_leaf_kv, apply_message_to_entries,
     buffer_encoded_len, decode_page, encode_internal_page, encode_leaf_page, encoded_page_len,
-    internal_child_array_range, lookup_child_slot, lookup_step, lower_bound_entries,
-    read_child_swip_at, route_child, split_leaf_into_pages, write_child_swip_at,
+    internal_child_array_range, leaf_should_chase_right, lookup_child_slot, lookup_step,
+    lower_bound_entries, read_child_swip_at, read_right_sibling, route_child,
+    split_leaf_into_pages, write_child_swip_at, write_right_sibling,
 };
 use crate::stats::{CowBeTreeEvent, CowBeTreeStats};
 
@@ -402,7 +403,26 @@ impl CowBeTree {
         value: &[u8],
         commit_ts: Timestamp,
     ) -> Result<bool, CowBeTreeError> {
+        let right = {
+            let frame = unsafe { self.pool().fix_orphan_frame(page_id) }.shared();
+            if leaf_should_chase_right(frame.page_bytes(), key) {
+                read_right_sibling(frame.page_bytes())
+            } else {
+                0
+            }
+        };
+        if right != 0 {
+            return self.try_append_leaf_kv_page_local(right, key, value, commit_ts);
+        }
+
         let mut frame = unsafe { self.pool().fix_orphan_frame(page_id) }.exclusive();
+        if leaf_should_chase_right(frame.page_bytes(), key) {
+            let right = read_right_sibling(frame.page_bytes());
+            if right != 0 {
+                drop(frame);
+                return self.try_append_leaf_kv_page_local(right, key, value, commit_ts);
+            }
+        }
         if let Some(appended) = append_leaf_kv(
             frame.page_bytes_mut(),
             key,
@@ -1885,13 +1905,19 @@ impl CowBeTree {
         let right_fence = fence.right_of(separator.clone());
         let left_fits_existing_page =
             self.leaf_fits_capacity(&left_fence, &entries[..mid], page_size(page_id));
+        let right_pid = self.allocate_leaf(&right_fence, &entries[mid..], dirty_lsn)?;
         let left_pid = if left_fits_existing_page {
-            self.write_leaf_at(page_id, &left_fence, &entries[..mid], dirty_lsn)?;
+            self.write_leaf_at_with_right(
+                page_id,
+                &left_fence,
+                &entries[..mid],
+                right_pid,
+                dirty_lsn,
+            )?;
             page_id
         } else {
-            self.allocate_leaf(&left_fence, &entries[..mid], dirty_lsn)?
+            self.allocate_leaf_with_right(&left_fence, &entries[..mid], right_pid, dirty_lsn)?
         };
-        let right_pid = self.allocate_leaf(&right_fence, &entries[mid..], dirty_lsn)?;
         self.append_hint.store(right_pid, Ordering::Release);
         self.stats.inc(CowBeTreeEvent::LeafSplits);
         Ok(Rewrite::Split {
@@ -2037,8 +2063,21 @@ impl CowBeTree {
         entries: &[LeafEntry],
         dirty_lsn: Option<Lsn>,
     ) -> Result<u64, CowBeTreeError> {
+        self.allocate_leaf_with_right(fence, entries, 0, dirty_lsn)
+    }
+
+    fn allocate_leaf_with_right(
+        &self,
+        fence: &Fence,
+        entries: &[LeafEntry],
+        right_sibling: u64,
+        dirty_lsn: Option<Lsn>,
+    ) -> Result<u64, CowBeTreeError> {
         let mut image = vec![0u8; PAGE_SIZE];
         let bytes = encode_leaf_page(&mut image, fence, entries)?;
+        if right_sibling != 0 {
+            write_right_sibling(&mut image, right_sibling);
+        }
         let (pid, frame) = self.allocate_frame();
         let mut frame = frame.exclusive();
         frame.page_bytes_mut().copy_from_slice(&image);
@@ -2111,8 +2150,22 @@ impl CowBeTree {
         entries: &[LeafEntry],
         dirty_lsn: Option<Lsn>,
     ) -> Result<(), CowBeTreeError> {
+        self.write_leaf_at_with_right(page_id, fence, entries, 0, dirty_lsn)
+    }
+
+    fn write_leaf_at_with_right(
+        &self,
+        page_id: u64,
+        fence: &Fence,
+        entries: &[LeafEntry],
+        right_sibling: u64,
+        dirty_lsn: Option<Lsn>,
+    ) -> Result<(), CowBeTreeError> {
         let mut image = vec![0u8; page_size(page_id)];
         let bytes = encode_leaf_page(&mut image, fence, entries)?;
+        if right_sibling != 0 {
+            write_right_sibling(&mut image, right_sibling);
+        }
         let page_image_bytes = image.len();
         self.write_page_image(page_id, image, dirty_lsn);
         self.stats.inc(CowBeTreeEvent::InPlacePageRewrites);
@@ -2688,7 +2741,6 @@ fn swip_page_id(swip: Swip) -> u64 {
         swip.as_page_id()
     }
 }
-
 fn largest_child_batch(
     children: &[u64],
     separators: &[Vec<u8>],

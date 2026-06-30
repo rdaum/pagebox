@@ -1,6 +1,6 @@
 use std::fmt;
 
-use pagebox_storage::buffer_frame::{BufferFrame, BufferFrameRef};
+use pagebox_storage::buffer_frame::{BufferFrame, BufferFrameRef, PAGE_SIZE};
 use pagebox_storage::page_header::{self, PageType};
 use pagebox_swip_kernel::SwipWord as Swip;
 
@@ -16,6 +16,40 @@ const MAGIC_OFF: usize = 14;
 const VERSION_OFF: usize = 20;
 const KIND_OFF: usize = 21;
 const NONE_FENCE_LEN: u16 = u16::MAX;
+const RIGHT_SIBLING_OFF: usize = PAGE_SIZE - 8;
+
+pub(crate) fn read_right_sibling(page: &[u8]) -> u64 {
+    u64::from_le_bytes(
+        page[RIGHT_SIBLING_OFF..RIGHT_SIBLING_OFF + 8]
+            .try_into()
+            .unwrap_or([0; 8]),
+    )
+}
+
+pub(crate) fn write_right_sibling(page: &mut [u8], pid: u64) {
+    if RIGHT_SIBLING_OFF + 8 <= page.len() {
+        page[RIGHT_SIBLING_OFF..RIGHT_SIBLING_OFF + 8].copy_from_slice(&pid.to_le_bytes());
+    }
+}
+
+pub(crate) fn leaf_should_chase_right(page: &[u8], key: &[u8]) -> bool {
+    if read_right_sibling(page) == 0 {
+        return false;
+    }
+    let Ok((kind, mut reader)) = page_body_reader(page) else {
+        return false;
+    };
+    if kind != PageKind::Leaf {
+        return false;
+    }
+    let Ok(fence) = decode_fence(&mut reader) else {
+        return false;
+    };
+    match fence.upper {
+        Some(ref upper) => key >= upper.as_slice(),
+        None => false,
+    }
+}
 
 #[derive(Debug)]
 pub enum CowBeTreeError {
@@ -340,7 +374,7 @@ fn build_leaf_page_from_src(
     let needed = HEADER_SIZE
         .checked_add(body_len)
         .ok_or(CowBeTreeError::CorruptPage("page length overflow"))?;
-    if needed > dst.len() {
+    if needed > RIGHT_SIBLING_OFF {
         return Err(page_overflow("leaf", needed, dst.len()));
     }
 
@@ -662,7 +696,7 @@ pub(crate) fn append_internal_buffer_message(
         .body_len
         .checked_add(message_len)
         .ok_or(CowBeTreeError::CorruptPage("internal body length overflow"))?;
-    if HEADER_SIZE + new_body_len > page.len() {
+    if HEADER_SIZE + new_body_len > RIGHT_SIBLING_OFF {
         return Ok(None);
     }
 
@@ -738,7 +772,7 @@ pub(crate) fn append_internal_buffer_kv(
         .body_len
         .checked_add(message_len)
         .ok_or(CowBeTreeError::CorruptPage("internal body length overflow"))?;
-    if HEADER_SIZE + new_body_len > page.len() {
+    if HEADER_SIZE + new_body_len > RIGHT_SIBLING_OFF {
         return Ok(None);
     }
 
@@ -818,7 +852,7 @@ pub(crate) fn append_leaf_kv(
     let new_body_len = new_body_len
         .checked_add(directory_bytes)
         .ok_or(CowBeTreeError::CorruptPage("leaf body length overflow"))?;
-    if HEADER_SIZE + new_body_len > page.len() {
+    if HEADER_SIZE + new_body_len > RIGHT_SIBLING_OFF {
         return Ok(None);
     }
 
@@ -910,7 +944,7 @@ pub(crate) fn append_leaf_entry_batch(
     let new_body_len = new_body_len
         .checked_add(directory_bytes)
         .ok_or(CowBeTreeError::CorruptPage("leaf body length overflow"))?;
-    if HEADER_SIZE + new_body_len > page.len() {
+    if HEADER_SIZE + new_body_len > RIGHT_SIBLING_OFF {
         return Ok(None);
     }
 
@@ -994,7 +1028,7 @@ pub(crate) fn append_leaf_entry_prefix(
             .and_then(|len| len.checked_add(entry_len))
             .and_then(|len| len.checked_add(directory_bytes))
             .ok_or(CowBeTreeError::CorruptPage("leaf body length overflow"))?;
-        if HEADER_SIZE + new_body_len > page.len() {
+        if HEADER_SIZE + new_body_len > RIGHT_SIBLING_OFF {
             break;
         }
 
@@ -1070,7 +1104,7 @@ fn page_body_reader(page: &[u8]) -> Result<(PageKind, BodyReader<'_>), CowBeTree
     let kind =
         PageKind::from_byte(page[KIND_OFF]).ok_or(CowBeTreeError::CorruptPage("bad page kind"))?;
     let body_len = read_u32(page, BODY_LEN_OFF)? as usize;
-    if HEADER_SIZE + body_len > page.len() {
+    if HEADER_SIZE + body_len > RIGHT_SIBLING_OFF {
         return Err(CowBeTreeError::CorruptPage(
             "page body extends past page end",
         ));
@@ -1665,7 +1699,7 @@ fn finish_page(
     body: Vec<u8>,
 ) -> Result<usize, CowBeTreeError> {
     let needed = HEADER_SIZE + body.len();
-    if needed > page.len() {
+    if needed > RIGHT_SIBLING_OFF {
         return Err(page_overflow(
             match kind {
                 PageKind::Leaf => "leaf",
