@@ -1,5 +1,6 @@
 use std::fmt;
 
+use pagebox_storage::buffer_frame::BufferFrameRef;
 use pagebox_storage::page_header::{self, PageType};
 use pagebox_swip_kernel::SwipWord as Swip;
 
@@ -173,7 +174,7 @@ pub(crate) enum LookupStep<'a> {
         visible: Option<RawVisibleVersion<'a>>,
     },
     Internal {
-        child_page_id: u64,
+        child_swip: Swip,
         visible_buffer: Option<RawVisibleVersion<'a>>,
         buffer_count: usize,
     },
@@ -503,6 +504,76 @@ pub(crate) fn lookup_step<'a>(
         PageKind::Leaf => lookup_leaf(reader, key, read_ts),
         PageKind::Internal => lookup_internal(reader, key, read_ts),
     }
+}
+
+/// Route `key` to its child SWIP without scanning the internal buffer.
+///
+/// Returns `Ok(None)` for leaf pages, `Ok(Some(swip))` for the routed child on
+/// internal pages. This is the write-path routing primitive: it avoids the
+/// visible-buffer scan that [`lookup_step`] performs, since the write path
+/// only needs the child edge, not the buffered-message visibility.
+pub(crate) fn lookup_child_swip(page: &[u8], key: &[u8]) -> Result<Option<Swip>, CowBeTreeError> {
+    let (kind, mut reader) = page_body_reader(page)?;
+    skip_fence(&mut reader)?;
+    if kind != PageKind::Internal {
+        return Ok(None);
+    }
+
+    let child_count = reader.read_u16()? as usize;
+    let separator_count = reader.read_u16()? as usize;
+    let _buffer_count = reader.read_u16()?;
+    if child_count == 0 {
+        return Err(CowBeTreeError::EmptyInternalPage);
+    }
+    if separator_count + 1 != child_count {
+        return Err(CowBeTreeError::CorruptPage(
+            "internal separator count does not match child count",
+        ));
+    }
+
+    let child_start = reader.pos;
+    let child_bytes = child_count
+        .checked_mul(8)
+        .ok_or(CowBeTreeError::CorruptPage("child array length overflow"))?;
+    reader.read_exact(child_bytes)?;
+
+    let mut child_idx = 0usize;
+    for _ in 0..separator_count {
+        let separator = reader.read_bytes_u16_len()?;
+        if separator <= key {
+            child_idx += 1;
+        }
+    }
+
+    let child_off = child_start
+        .checked_add(child_idx * 8)
+        .ok_or(CowBeTreeError::CorruptPage("child offset overflow"))?;
+    let raw_child = reader
+        .data
+        .get(child_off..child_off + 8)
+        .ok_or(CowBeTreeError::CorruptPage("child read out of bounds"))?;
+    let child_swip = Swip::from_raw(u64::from_le_bytes(raw_child.try_into().unwrap()));
+    Ok(Some(child_swip))
+}
+
+/// Locate the contiguous child SWIP array in an internal page.
+///
+/// Returns `(child_count, child_array_page_offset)` where the offset is
+/// relative to the page start. Returns `None` for non-internal pages or
+/// malformed headers. Used by the writeback preparer to iterate child slots.
+pub(crate) fn internal_child_array_range(page: &[u8]) -> Option<(usize, usize)> {
+    let (kind, mut reader) = page_body_reader(page).ok()?;
+    if kind != PageKind::Internal {
+        return None;
+    }
+    skip_fence(&mut reader).ok()?;
+    let child_count = reader.read_u16().ok()? as usize;
+    let _separator_count = reader.read_u16().ok()?;
+    let _buffer_count = reader.read_u16().ok()?;
+    let child_array_offset = HEADER_SIZE
+        .checked_add(reader.pos)
+        .filter(|_| child_count > 0)?;
+    Some((child_count, child_array_offset))
 }
 
 pub(crate) fn append_internal_buffer_message(
@@ -1372,12 +1443,7 @@ fn lookup_internal<'a>(
         .data
         .get(child_off..child_off + 8)
         .ok_or(CowBeTreeError::CorruptPage("child read out of bounds"))?;
-    let swip = Swip::from_raw(u64::from_le_bytes(raw_child.try_into().unwrap()));
-    if !swip.is_evicted() {
-        return Err(CowBeTreeError::CorruptPage(
-            "internal child swip is not evicted page id",
-        ));
-    }
+    let child_swip = Swip::from_raw(u64::from_le_bytes(raw_child.try_into().unwrap()));
 
     let mut visible_buffer = None;
     for _ in 0..buffer_count {
@@ -1389,7 +1455,7 @@ fn lookup_internal<'a>(
     }
 
     Ok(LookupStep::Internal {
-        child_page_id: swip.as_page_id(),
+        child_swip,
         visible_buffer,
         buffer_count,
     })
@@ -1652,12 +1718,13 @@ fn decode_internal(mut reader: BodyReader<'_>, fence: Fence) -> Result<NodePage,
     for _ in 0..child_count {
         let raw = reader.read_u64()?;
         let swip = Swip::from_raw(raw);
-        if !swip.is_evicted() {
-            return Err(CowBeTreeError::CorruptPage(
-                "internal child swip is not evicted page id",
-            ));
-        }
-        children.push(swip.as_page_id());
+        // Child SWIPs may be swizzled (Hot/Cool) in resident pages; resolve
+        // to the page ID via the frame header. Evicted SWIPs decode directly.
+        let child_pid = match BufferFrameRef::from_hot_swip(swip) {
+            Some(frame) => frame.pid(),
+            None => swip.as_page_id(),
+        };
+        children.push(child_pid);
     }
 
     let mut separators = Vec::with_capacity(separator_count);
@@ -2121,20 +2188,115 @@ mod tests {
         encode_internal_page(&mut page, &Fence::root(), &children, &separators, &buffer).unwrap();
 
         let LookupStep::Internal {
-            child_page_id,
+            child_swip,
             visible_buffer: Some(visible),
             buffer_count,
         } = lookup_step(&page, b"k25", 15).unwrap()
         else {
             panic!("raw lookup should route through the internal page");
         };
-        assert_eq!(child_page_id, 33, "child routing should follow separators");
+        assert_eq!(
+            child_swip.as_page_id(),
+            33,
+            "child routing should follow separators"
+        );
         assert_eq!(buffer_count, 4, "buffer count should be reported");
         assert_eq!(
             visible.value, b"new",
             "newest visible buffer message should win"
         );
         assert_eq!(visible.commit_ts, 12, "buffer timestamp mismatch");
+    }
+
+    #[test]
+    fn lookup_child_swip_routes_without_scanning_buffer() {
+        let children = vec![11, 22, 33];
+        let separators = vec![b"k10".to_vec(), b"k20".to_vec()];
+        let buffer = vec![
+            BufferedMessage::put(b"k25", 12, b"buffered"),
+            BufferedMessage::put(b"k05", 5, b"early"),
+        ];
+
+        let mut page = [0u8; PAGE_SIZE];
+        encode_internal_page(&mut page, &Fence::root(), &children, &separators, &buffer).unwrap();
+
+        // Keys below the first separator route to child 0.
+        assert_eq!(
+            lookup_child_swip(&page, b"k00")
+                .unwrap()
+                .unwrap()
+                .as_page_id(),
+            11,
+            "key below first separator routes to first child",
+        );
+        // Key equal to a separator routes right (separator <= key).
+        assert_eq!(
+            lookup_child_swip(&page, b"k10")
+                .unwrap()
+                .unwrap()
+                .as_page_id(),
+            22,
+            "key equal to a separator routes past it",
+        );
+        // Key above the last separator routes to the final child.
+        assert_eq!(
+            lookup_child_swip(&page, b"zzz")
+                .unwrap()
+                .unwrap()
+                .as_page_id(),
+            33,
+            "key above last separator routes to last child",
+        );
+    }
+
+    #[test]
+    fn lookup_child_swip_returns_none_for_leaf_pages() {
+        let entries = vec![LeafEntry {
+            key: b"k10".to_vec(),
+            versions: vec![version(1, b"v01")],
+        }];
+        let mut page = [0u8; PAGE_SIZE];
+        encode_leaf_page(&mut page, &Fence::root(), &entries).unwrap();
+
+        assert!(
+            lookup_child_swip(&page, b"k10").unwrap().is_none(),
+            "leaf pages have no child to route to",
+        );
+    }
+
+    #[test]
+    fn internal_child_array_range_locates_child_slots_for_internal_pages() {
+        let children = vec![11, 22, 33];
+        let separators = vec![b"k10".to_vec(), b"k20".to_vec()];
+        let mut page = [0u8; PAGE_SIZE];
+        encode_internal_page(&mut page, &Fence::root(), &children, &separators, &[]).unwrap();
+
+        let (child_count, child_offset) = internal_child_array_range(&page)
+            .expect("internal page must expose its child array range");
+        assert_eq!(child_count, 3, "child count mismatch");
+        // Each child slot is an 8-byte little-endian SWIP word; the first one
+        // at child_offset must encode the Evicted page ID 11.
+        let raw = u64::from_le_bytes(page[child_offset..child_offset + 8].try_into().unwrap());
+        assert_eq!(
+            Swip::from_raw(raw).as_page_id(),
+            11,
+            "first child slot should encode page id 11",
+        );
+    }
+
+    #[test]
+    fn internal_child_array_range_rejects_leaf_pages() {
+        let entries = vec![LeafEntry {
+            key: b"k10".to_vec(),
+            versions: vec![version(1, b"v01")],
+        }];
+        let mut page = [0u8; PAGE_SIZE];
+        encode_leaf_page(&mut page, &Fence::root(), &entries).unwrap();
+
+        assert!(
+            internal_child_array_range(&page).is_none(),
+            "leaf pages must not expose a child array range",
+        );
     }
 
     #[test]

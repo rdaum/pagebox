@@ -8,8 +8,11 @@ use crate::metrics_stub::MetricVisitor;
 #[cfg(feature = "metrics")]
 use fast_telemetry::MetricVisitor;
 use pagebox_hybrid_latch::HybridLatch;
-use pagebox_storage::buffer_frame::{BufferFrame, Lsn, PAGE_SIZE, StableSwipRef, page_size};
+use pagebox_storage::buffer_frame::{
+    BufferFrame, BufferFrameRef, Lsn, PAGE_SIZE, PageWritebackPreparer, StableSwipRef, page_size,
+};
 use pagebox_storage::buffer_pool::{BufferPool, BufferPoolHandle, ExclusiveFrame, PinnedFrame};
+use pagebox_storage::page_header::{self, PageType};
 use pagebox_swip_kernel::{AtomicSwipWord as AtomicSwip, SwipWord as Swip};
 
 use crate::message::{
@@ -20,7 +23,8 @@ use crate::page::{
     RawVisibleVersion, append_internal_buffer_kv, append_internal_buffer_message,
     append_leaf_entry_message, append_leaf_entry_prefix, append_leaf_kv, apply_message_to_entries,
     buffer_encoded_len, decode_page, encode_internal_page, encode_leaf_page, encoded_page_len,
-    lookup_step, lower_bound_entries, route_child, split_leaf_into_pages,
+    internal_child_array_range, lookup_child_swip, lookup_step, lower_bound_entries, route_child,
+    split_leaf_into_pages,
 };
 use crate::stats::{CowBeTreeEvent, CowBeTreeStats};
 
@@ -141,7 +145,7 @@ enum VisibleLookupStep {
         visible: Option<VisibleCandidate>,
     },
     Internal {
-        child_page_id: u64,
+        child_swip: Swip,
         visible_buffer: Option<VisibleCandidate>,
         buffer_count: usize,
     },
@@ -149,7 +153,7 @@ enum VisibleLookupStep {
 
 enum WriteRouteStep {
     Leaf,
-    Internal { child_page_id: u64 },
+    Internal { child_swip: Swip },
 }
 
 struct IncrementalGcState<'a> {
@@ -198,6 +202,7 @@ impl CowBeTree {
         P: Into<BufferPoolHandle>,
     {
         let pool = pool.into();
+        register_internal_writeback_preparer(pool.as_pool());
         let stats = CowBeTreeStats::new(counter_shards());
         let mut image = vec![0u8; PAGE_SIZE];
         let bytes = encode_leaf_page(&mut image, &Fence::root(), &[])
@@ -235,8 +240,10 @@ impl CowBeTree {
     where
         P: Into<BufferPoolHandle>,
     {
+        let pool = pool.into();
+        register_internal_writeback_preparer(pool.as_pool());
         Self {
-            pool: pool.into(),
+            pool,
             root: Box::new(AtomicSwip::new(Swip::evicted(root_page_id))),
             write_latch: HybridLatch::new(),
             append_hint: AtomicU64::new(root_page_id),
@@ -360,8 +367,8 @@ impl CowBeTree {
                 WriteRouteStep::Leaf => {
                     return self.try_append_leaf_kv_page_local(page_id, key, value, commit_ts);
                 }
-                WriteRouteStep::Internal { child_page_id } => {
-                    page_id = child_page_id;
+                WriteRouteStep::Internal { child_swip } => {
+                    page_id = swip_page_id(child_swip);
                     match self.write_route_step(page_id, key)? {
                         WriteRouteStep::Leaf => {
                             return self
@@ -574,14 +581,14 @@ impl CowBeTree {
         read_ts: Timestamp,
     ) -> Option<CowBeTreeVisibleVersion> {
         let mut root = true;
-        let mut page_id = self.root_page_id();
+        let mut next_swip = Swip::evicted(0);
         let mut visible = None;
         let mut saw_path_buffer = false;
         loop {
             let Ok(step) = (if root {
                 self.lookup_root_step(key, read_ts)
             } else {
-                self.lookup_orphan_step(page_id, key, read_ts)
+                self.lookup_orphan_step(next_swip, key, read_ts)
             }) else {
                 return self
                     .lookup_visible_candidate_owned(key, read_ts)
@@ -600,7 +607,7 @@ impl CowBeTree {
                     return visible.map(CowBeTreeVisibleVersion::from);
                 }
                 VisibleLookupStep::Internal {
-                    child_page_id,
+                    child_swip,
                     visible_buffer,
                     buffer_count,
                 } => {
@@ -610,7 +617,7 @@ impl CowBeTree {
                     if let Some(buffer) = visible_buffer {
                         merge_owned_visible_candidate(&mut visible, buffer);
                     }
-                    page_id = child_page_id;
+                    next_swip = child_swip;
                 }
             }
         }
@@ -924,8 +931,8 @@ impl CowBeTree {
                 WriteRouteStep::Leaf => {
                     return self.try_append_leaf_message(page_id, message, dirty_lsn);
                 }
-                WriteRouteStep::Internal { child_page_id } => {
-                    page_id = child_page_id;
+                WriteRouteStep::Internal { child_swip } => {
+                    page_id = swip_page_id(child_swip);
                     match self.write_route_step(page_id, &message.key)? {
                         WriteRouteStep::Leaf => {
                             return self.try_append_leaf_message(page_id, message, dirty_lsn);
@@ -956,8 +963,8 @@ impl CowBeTree {
                 WriteRouteStep::Leaf => {
                     return self.try_rewrite_leaf_page_local(page_id, message, dirty_lsn);
                 }
-                WriteRouteStep::Internal { child_page_id } => {
-                    page_id = child_page_id;
+                WriteRouteStep::Internal { child_swip } => {
+                    page_id = swip_page_id(child_swip);
                     match self.write_route_step(page_id, &message.key)? {
                         WriteRouteStep::Leaf => {
                             return self.try_rewrite_leaf_page_local(page_id, message, dirty_lsn);
@@ -975,12 +982,9 @@ impl CowBeTree {
 
     fn write_route_step(&self, page_id: u64, key: &[u8]) -> Result<WriteRouteStep, CowBeTreeError> {
         let frame = unsafe { self.pool().fix_orphan_frame(page_id) }.shared();
-        let step = lookup_step(frame.page_bytes(), key, Timestamp::MAX)?;
-        Ok(match step {
-            LookupStep::Leaf { .. } => WriteRouteStep::Leaf,
-            LookupStep::Internal { child_page_id, .. } => {
-                WriteRouteStep::Internal { child_page_id }
-            }
+        Ok(match lookup_child_swip(frame.page_bytes(), key)? {
+            None => WriteRouteStep::Leaf,
+            Some(child_swip) => WriteRouteStep::Internal { child_swip },
         })
     }
 
@@ -2301,13 +2305,13 @@ impl CowBeTree {
 
     fn lookup_orphan_step(
         &self,
-        page_id: u64,
+        child_swip: Swip,
         key: &[u8],
         read_ts: Timestamp,
     ) -> Result<VisibleLookupStep, CowBeTreeError> {
         self.stats.inc(CowBeTreeEvent::ColdResolves);
         self.stats.inc(CowBeTreeEvent::PageFaults);
-        let frame = unsafe { self.pool().fix_orphan_frame(page_id) }.shared();
+        let frame = self.fix_child(child_swip).shared();
         let step = lookup_step(frame.page_bytes(), key, read_ts)?;
         Ok(own_lookup_step(step))
     }
@@ -2317,6 +2321,29 @@ impl CowBeTree {
         self.stats.inc(CowBeTreeEvent::PageFaults);
         let frame = unsafe { self.pool().fix_orphan_frame(page_id) }.shared();
         decode_page(frame.page_bytes())
+    }
+
+    /// Resolve a child SWIP read from a parent internal page to a pinned frame.
+    ///
+    /// Hot/Cool swizzled pointers bypass the page table entirely (direct frame
+    /// pin); Evicted pointers fall back to [`BufferPool::fix_orphan_frame`],
+    /// which faults the page in via the page table.
+    ///
+    /// The betree currently stores children as Evicted page IDs, so this always
+    /// takes the fault path. The Hot/Cool branch is the forward-compatible fast
+    /// path for a future swizzle-in step: [`BufferPool::pin_child`] returns
+    /// `None` for a stale pointer (frame reused), so a concurrent eviction that
+    /// unswizzles between reading the SWIP and pinning degrades to a panic
+    /// rather than undefined behaviour. A correct swizzle-in implementation
+    /// would hold the parent's latch until the child is pinned (B-link style),
+    /// which is follow-up work tracked alongside optimistic reads.
+    fn fix_child(&self, swip: Swip) -> PinnedFrame<'_> {
+        if swip.is_hot() || swip.is_cool() {
+            unsafe { self.pool().pin_child(swip) }
+                .expect("hot/cool child swip must pin while parent edge is stable")
+        } else {
+            unsafe { self.pool().fix_orphan_frame(swip.as_page_id()) }
+        }
     }
 
     fn materialize_node(
@@ -2382,6 +2409,54 @@ impl CowBeTree {
     fn pool(&self) -> &BufferPool {
         self.pool.as_pool()
     }
+}
+
+/// Writeback preparer for `BeTreeInternal` pages.
+///
+/// The betree internal-node body stores child references as 8-byte SWIP words.
+/// Resident pages may carry swizzled (Hot/Cool) pointers once the traversal
+/// path swizzles them in; the on-disk format must contain Evicted page IDs.
+/// This preparer rewrites every Hot/Cool child slot to `Evicted(pid)` in the
+/// writeback copy, leaving the live frame's swizzled pointers intact.
+///
+/// Leaf pages carry no child pointers and short-circuit. The preparer is
+/// registered for [`PageType::BeTreeInternal`] in [`CowBeTree::new`],
+/// [`CowBeTree::open_with_config`], and [`CowBeTree::fork`].
+struct BeTreeInternalWritebackPreparer;
+
+impl PageWritebackPreparer for BeTreeInternalWritebackPreparer {
+    fn prepare_page_copy_for_writeback(&self, page: &mut [u8], pool: &BufferPool) {
+        if page_header::read_page_type(page) != PageType::BeTreeInternal {
+            return;
+        }
+        let Some((child_count, child_offset)) = internal_child_array_range(page) else {
+            return;
+        };
+        for i in 0..child_count {
+            let off = match child_offset.checked_add(i * 8) {
+                Some(off) => off,
+                None => return,
+            };
+            let Some(slot) = page.get_mut(off..off + 8) else {
+                return;
+            };
+            let raw = u64::from_le_bytes(slot.try_into().unwrap());
+            let swip = Swip::from_raw(raw);
+            if let Some(frame) = BufferFrameRef::from_hot_swip(swip)
+                && pool.contains_frame(frame)
+            {
+                let child_pid = frame.pid();
+                slot.copy_from_slice(&Swip::evicted(child_pid).raw().to_le_bytes());
+            }
+        }
+    }
+}
+
+fn register_internal_writeback_preparer(pool: &BufferPool) {
+    pool.register_page_writeback_preparer(
+        PageType::BeTreeInternal,
+        Arc::new(BeTreeInternalWritebackPreparer),
+    );
 }
 
 fn mark_frame_dirty(frame: &ExclusiveFrame<'_>, dirty_lsn: Option<Lsn>) {
@@ -2454,11 +2529,11 @@ fn own_lookup_step(step: LookupStep<'_>) -> VisibleLookupStep {
             visible: visible.map(own_visible_candidate),
         },
         LookupStep::Internal {
-            child_page_id,
+            child_swip,
             visible_buffer,
             buffer_count,
         } => VisibleLookupStep::Internal {
-            child_page_id,
+            child_swip,
             visible_buffer: visible_buffer.map(own_visible_candidate),
             buffer_count,
         },
@@ -2620,4 +2695,108 @@ fn integer_sqrt(value: usize) -> usize {
         }
     }
     low
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pagebox_storage::buffer_frame::PAGE_SIZE;
+    use pagebox_storage::page_header;
+
+    /// Build a `BeTreeInternal` page image whose child slots carry real
+    /// resident frame SWIPs, run the writeback preparer, and assert every
+    /// slot is rewritten to `Evicted(pid)`.
+    ///
+    /// This is the regression guard for the swizzled-pointer writeback path:
+    /// if the preparer stopped iterating slots, mis-parsed the child-array
+    /// offset, or wrote the wrong endianness, the Hot child would persist into
+    /// the on-disk image and the next reopen would read a garbage page id.
+    #[test]
+    fn writeback_preparer_converts_hot_child_swips_to_evicted_page_ids() {
+        let pool = BufferPool::new(8);
+        register_internal_writeback_preparer(&pool);
+
+        // Allocate two resident child frames and keep them pinned so their
+        // Hot SWIPs stay valid pointers into the pool's frame array.
+        let (left_pid, left_pinned) = pool.allocate_and_fix();
+        let (right_pid, right_pinned) = pool.allocate_and_fix();
+        let left_swip = left_pinned.hot_swip();
+        let _right_swip = right_pinned.hot_swip();
+        assert!(left_swip.is_hot(), "freshly allocated frame must be Hot");
+
+        // Encode an internal page with both children as Evicted page IDs.
+        let children = vec![left_pid, right_pid];
+        let separators = vec![b"mid".to_vec()];
+        let mut page = vec![0u8; PAGE_SIZE];
+        encode_internal_page(&mut page, &Fence::root(), &children, &separators, &[]).unwrap();
+        assert_eq!(
+            page_header::read_page_type(&page),
+            PageType::BeTreeInternal,
+            "encoded page must carry the BeTreeInternal marker",
+        );
+
+        let (child_count, child_offset) =
+            internal_child_array_range(&page).expect("internal page has a child array");
+        assert_eq!(child_count, 2, "child count mismatch");
+
+        // Swizzle the first child slot to Hot; leave the second as Evicted.
+        page[child_offset..child_offset + 8].copy_from_slice(&left_swip.raw().to_le_bytes());
+
+        // Run the preparer on the writeback copy.
+        BeTreeInternalWritebackPreparer.prepare_page_copy_for_writeback(&mut page, &pool);
+
+        // The Hot slot must be rewritten to Evicted(left_pid).
+        let got_left = u64::from_le_bytes(page[child_offset..child_offset + 8].try_into().unwrap());
+        assert_eq!(
+            Swip::from_raw(got_left),
+            Swip::evicted(left_pid),
+            "preparer must convert the swizzled child back to an evicted page id",
+        );
+        assert!(
+            !Swip::from_raw(got_left).is_hot(),
+            "converted slot must not remain a swizzled pointer",
+        );
+
+        // The Evicted slot must be untouched.
+        let right_off = child_offset + 8;
+        let got_right = u64::from_le_bytes(page[right_off..right_off + 8].try_into().unwrap());
+        assert_eq!(
+            Swip::from_raw(got_right),
+            Swip::evicted(right_pid),
+            "preparer must leave an already-evicted child slot unchanged",
+        );
+
+        drop(left_pinned);
+        drop(right_pinned);
+    }
+
+    /// A stray 8-byte word that happens to look like an aligned pointer but
+    /// does not resolve to a pool-owned frame must be left alone, not
+    /// rewritten to a garbage page id. This mirrors the `contains_frame` guard
+    /// in `BufferFrame::convert_swips_in_buf`.
+    #[test]
+    fn writeback_preparer_leaves_non_pool_swips_untouched() {
+        let pool = BufferPool::new(4);
+        register_internal_writeback_preparer(&pool);
+
+        let (child_pid, _pinned) = pool.allocate_and_fix();
+        let children = vec![child_pid];
+        let mut page = vec![0u8; PAGE_SIZE];
+        encode_internal_page(&mut page, &Fence::root(), &children, &[], &[]).unwrap();
+
+        let (_, child_offset) = internal_child_array_range(&page).unwrap();
+        // A Hot-tagged word pointing at a plausible-but-unowned address: a
+        // small aligned value well outside the pool's arena.
+        let bogus = Swip::hot_ptr(0x1000_0000);
+        assert!(bogus.is_hot(), "fixture must be a Hot swip");
+        page[child_offset..child_offset + 8].copy_from_slice(&bogus.raw().to_le_bytes());
+
+        let before: [u8; 8] = page[child_offset..child_offset + 8].try_into().unwrap();
+        BeTreeInternalWritebackPreparer.prepare_page_copy_for_writeback(&mut page, &pool);
+        let after: [u8; 8] = page[child_offset..child_offset + 8].try_into().unwrap();
+        assert_eq!(
+            before, after,
+            "non-pool Hot swip must be left untouched (no garbage page id rewrite)",
+        );
+    }
 }
