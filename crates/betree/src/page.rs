@@ -1,6 +1,6 @@
 use std::fmt;
 
-use pagebox_storage::buffer_frame::BufferFrameRef;
+use pagebox_storage::buffer_frame::{BufferFrame, BufferFrameRef};
 use pagebox_storage::page_header::{self, PageType};
 use pagebox_swip_kernel::SwipWord as Swip;
 
@@ -512,7 +512,15 @@ pub(crate) fn lookup_step<'a>(
 /// internal pages. This is the write-path routing primitive: it avoids the
 /// visible-buffer scan that [`lookup_step`] performs, since the write path
 /// only needs the child edge, not the buffered-message visibility.
+#[allow(dead_code)]
 pub(crate) fn lookup_child_swip(page: &[u8], key: &[u8]) -> Result<Option<Swip>, CowBeTreeError> {
+    Ok(lookup_child_slot(page, key)?.map(|(swip, _)| swip))
+}
+
+pub(crate) fn lookup_child_slot(
+    page: &[u8],
+    key: &[u8],
+) -> Result<Option<(Swip, u16)>, CowBeTreeError> {
     let (kind, mut reader) = page_body_reader(page)?;
     skip_fence(&mut reader)?;
     if kind != PageKind::Internal {
@@ -553,7 +561,7 @@ pub(crate) fn lookup_child_swip(page: &[u8], key: &[u8]) -> Result<Option<Swip>,
         .get(child_off..child_off + 8)
         .ok_or(CowBeTreeError::CorruptPage("child read out of bounds"))?;
     let child_swip = Swip::from_raw(u64::from_le_bytes(raw_child.try_into().unwrap()));
-    Ok(Some(child_swip))
+    Ok(Some((child_swip, child_idx as u16)))
 }
 
 /// Locate the contiguous child SWIP array in an internal page.
@@ -574,6 +582,46 @@ pub(crate) fn internal_child_array_range(page: &[u8]) -> Option<(usize, usize)> 
         .checked_add(reader.pos)
         .filter(|_| child_count > 0)?;
     Some((child_count, child_array_offset))
+}
+
+pub(crate) fn read_child_swip_at(page: &[u8], slot: u16) -> Option<Swip> {
+    let (count, offset) = internal_child_array_range(page)?;
+    if slot as usize >= count {
+        return None;
+    }
+    let pos = offset + (slot as usize) * 8;
+    let raw = u64::from_le_bytes(page.get(pos..pos + 8)?.try_into().ok()?);
+    Some(Swip::from_raw(raw))
+}
+
+pub(crate) fn write_child_swip_at(page: &mut [u8], slot: u16, swip: Swip) -> Option<()> {
+    let (count, offset) = internal_child_array_range(page)?;
+    if slot as usize >= count {
+        return None;
+    }
+    let pos = offset + (slot as usize) * 8;
+    page.get_mut(pos..pos + 8)?
+        .copy_from_slice(&swip.raw().to_le_bytes());
+    Some(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn find_child_slot_by_frame(
+    page: &[u8],
+    child_bf: *const u8,
+    child_pid: u64,
+) -> Option<u16> {
+    let (count, offset) = internal_child_array_range(page)?;
+    let expected_hot = Swip::hot(child_bf as *mut BufferFrame).raw();
+    let expected_evicted = Swip::evicted(child_pid).raw();
+    for slot in 0..count {
+        let pos = offset + slot * 8;
+        let raw = u64::from_le_bytes(page.get(pos..pos + 8)?.try_into().ok()?);
+        if raw == expected_hot || raw == expected_evicted {
+            return Some(slot as u16);
+        }
+    }
+    None
 }
 
 pub(crate) fn append_internal_buffer_message(

@@ -9,7 +9,8 @@ use crate::metrics_stub::MetricVisitor;
 use fast_telemetry::MetricVisitor;
 use pagebox_hybrid_latch::HybridLatch;
 use pagebox_storage::buffer_frame::{
-    BufferFrame, BufferFrameRef, Lsn, PAGE_SIZE, PageWritebackPreparer, StableSwipRef, page_size,
+    BufferFrame, BufferFrameRef, Lsn, PAGE_SIZE, PageWritebackPreparer, ParentFinder,
+    StableSwipRef, page_size,
 };
 use pagebox_storage::buffer_pool::{BufferPool, BufferPoolHandle, ExclusiveFrame, PinnedFrame};
 use pagebox_storage::page_header::{self, PageType};
@@ -23,8 +24,8 @@ use crate::page::{
     RawVisibleVersion, append_internal_buffer_kv, append_internal_buffer_message,
     append_leaf_entry_message, append_leaf_entry_prefix, append_leaf_kv, apply_message_to_entries,
     buffer_encoded_len, decode_page, encode_internal_page, encode_leaf_page, encoded_page_len,
-    internal_child_array_range, lookup_child_swip, lookup_step, lower_bound_entries, route_child,
-    split_leaf_into_pages,
+    internal_child_array_range, lookup_child_slot, lookup_step, lower_bound_entries,
+    read_child_swip_at, route_child, split_leaf_into_pages, write_child_swip_at,
 };
 use crate::stats::{CowBeTreeEvent, CowBeTreeStats};
 
@@ -179,6 +180,8 @@ impl ForkRegistry {
     }
 }
 
+const BETREE_DT_ID: u16 = 2;
+
 pub struct CowBeTree {
     pool: BufferPoolHandle,
     root: Box<AtomicSwip>,
@@ -187,6 +190,7 @@ pub struct CowBeTree {
     forks: Arc<ForkRegistry>,
     stats: CowBeTreeStats,
     config: CowBeTreeConfig,
+    dt_id: u16,
 }
 
 impl CowBeTree {
@@ -218,6 +222,8 @@ impl CowBeTree {
         frame.set_parent_link_stable(unsafe { StableSwipRef::from_ref(root.as_ref()) });
         drop(frame);
 
+        let proxy = Arc::new(DtProxy { pool: pool.clone() });
+        pool.as_pool().register_dt(BETREE_DT_ID, proxy);
         Self {
             pool,
             root,
@@ -226,6 +232,7 @@ impl CowBeTree {
             forks: Arc::new(ForkRegistry::new()),
             stats,
             config,
+            dt_id: BETREE_DT_ID,
         }
     }
 
@@ -242,6 +249,8 @@ impl CowBeTree {
     {
         let pool = pool.into();
         register_internal_writeback_preparer(pool.as_pool());
+        let proxy = Arc::new(DtProxy { pool: pool.clone() });
+        pool.as_pool().register_dt(BETREE_DT_ID, proxy);
         Self {
             pool,
             root: Box::new(AtomicSwip::new(Swip::evicted(root_page_id))),
@@ -250,6 +259,7 @@ impl CowBeTree {
             forks: Arc::new(ForkRegistry::new()),
             stats: CowBeTreeStats::new(counter_shards()),
             config,
+            dt_id: BETREE_DT_ID,
         }
     }
 
@@ -268,6 +278,7 @@ impl CowBeTree {
             forks: Arc::clone(&self.forks),
             stats: CowBeTreeStats::new(counter_shards()),
             config: self.config,
+            dt_id: self.dt_id,
         })
     }
 
@@ -982,10 +993,38 @@ impl CowBeTree {
 
     fn write_route_step(&self, page_id: u64, key: &[u8]) -> Result<WriteRouteStep, CowBeTreeError> {
         let frame = unsafe { self.pool().fix_orphan_frame(page_id) }.shared();
-        Ok(match lookup_child_swip(frame.page_bytes(), key)? {
+        Ok(match lookup_child_slot(frame.page_bytes(), key)? {
             None => WriteRouteStep::Leaf,
-            Some(child_swip) => WriteRouteStep::Internal { child_swip },
+            Some((child_swip, child_slot)) => {
+                if child_swip.is_evicted() {
+                    self.swizzle_child_in_parent(page_id, child_swip.as_page_id(), child_slot);
+                }
+                WriteRouteStep::Internal { child_swip }
+            }
         })
+    }
+
+    fn swizzle_child_in_parent(&self, parent_pid: u64, child_pid: u64, child_slot: u16) {
+        let child = unsafe { self.pool().fix_orphan_frame(child_pid) }.exclusive();
+        child
+            .write_ref()
+            .set_parent_link_inner(parent_pid, child_slot, false, self.dt_id);
+        let hot_swip = child.write_ref().frame().hot_swip();
+        let Some(parent_pin) = (unsafe { self.pool().try_fix_resident_page_frame(parent_pid) })
+        else {
+            return;
+        };
+        let Ok(mut parent) = parent_pin.try_exclusive() else {
+            return;
+        };
+        if parent.pid() != parent_pid {
+            return;
+        }
+        let page_bytes = parent.page_bytes();
+        if page_header::read_page_type(page_bytes) != PageType::BeTreeInternal {
+            return;
+        }
+        write_child_swip_at(parent.page_bytes_mut(), child_slot, hot_swip);
     }
 
     fn try_rewrite_leaf_page_local(
@@ -2695,6 +2734,50 @@ fn integer_sqrt(value: usize) -> usize {
         }
     }
     low
+}
+
+struct DtProxy {
+    pool: BufferPoolHandle,
+}
+
+impl ParentFinder for DtProxy {
+    fn find_and_unswizzle_with_hint(
+        &self,
+        child: BufferFrameRef,
+        child_pid: u64,
+        parent_pid: u64,
+        slot_index: u16,
+        _is_upper: bool,
+    ) -> Option<bool> {
+        let pool = self.pool.as_pool();
+        let parent_pin = unsafe { pool.try_fix_resident_page_frame(parent_pid) }?;
+        let mut parent = parent_pin.try_exclusive().ok()?;
+        if parent.pid() != parent_pid {
+            return None;
+        }
+        let page_bytes = parent.page_bytes();
+        if page_header::read_page_type(page_bytes) != PageType::BeTreeInternal {
+            return None;
+        }
+        let current_swip = read_child_swip_at(page_bytes, slot_index);
+        let child_hot_swip = child.hot_swip();
+        let expected_evicted = Swip::evicted(child_pid);
+        match current_swip {
+            Some(swip)
+                if swip.raw() == child_hot_swip.raw() || swip.raw() == expected_evicted.raw() =>
+            {
+                let page_mut = parent.page_bytes_mut();
+                write_child_swip_at(page_mut, slot_index, expected_evicted);
+                parent.mark_dirty();
+                Some(true)
+            }
+            _ => None,
+        }
+    }
+
+    fn find_and_unswizzle(&self, _child: BufferFrameRef, _child_pid: u64) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
