@@ -1,5 +1,12 @@
-//! Background page provider thread — replenishes resident-budget
-//! availability by proactively evicting unpinned pages.
+//! Background page provider thread — proactively evicts clean pages and
+//! flushes dirty pages so they become evictable.
+//!
+//! The provider runs a continuous loop:
+//! 1. If budget is sufficient, sleep until woken by a worker.
+//! 2. Try to evict clean pages (non-blocking `try_evict_policy`).
+//! 3. If eviction found only dirty pages (no-steal), flush them via
+//!    `try_flush_dirty_batch` so the next pass can evict them.
+//! 4. Notify waiting workers when frames become available.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -7,7 +14,6 @@ use std::time::Duration;
 
 use pagebox_threading as threading;
 
-use crate::buffer_frame::PageClass;
 use crate::buffer_pool::BufferPool;
 
 pub struct PageProviderHandle {
@@ -56,6 +62,14 @@ impl PageProviderHandle {
     pub fn is_running(&self) -> bool {
         self.thread.is_some()
     }
+
+    pub fn frames_available_notify(&self) {
+        self.frames_available.1.notify_all();
+    }
+
+    pub fn need_frames_notify(&self) {
+        self.need_frames.1.notify_one();
+    }
 }
 
 impl Drop for PageProviderHandle {
@@ -77,20 +91,22 @@ fn run(
         let target_free = (pool.num_frames() / 10).max(16);
         let available = pool.approx_available_budget();
         if available >= target_free {
+            // Budget sufficient — sleep until a worker signals need.
             let guard = need_frames.0.lock().unwrap();
             let _ = need_frames.1.wait_timeout(guard, Duration::from_millis(10));
             continue;
         }
 
         let want = (target_free - available).min(64);
-        let evicted = PageClass::ALL
-            .iter()
-            .map(|&class| pool.try_evict_policy(class, want))
-            .sum::<usize>();
+        let evicted = pool.try_evict_any_policy_for_provider(want);
 
         if evicted > 0 {
             frames_available.1.notify_all();
         } else {
+            // Eviction couldn't find clean victims — likely all resident
+            // pages are dirty (no-steal). Flush dirty pages so they become
+            // evictable on the next pass.
+            let _ = pool.try_flush_dirty_batch_for_provider(64);
             std::thread::yield_now();
         }
     }

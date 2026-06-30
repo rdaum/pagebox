@@ -577,6 +577,11 @@ pub struct BufferPoolHandle {
 impl BufferPoolHandle {
     pub fn new(pool: Arc<BufferPool>) -> Self {
         let _ = pool.self_weak.set(Arc::downgrade(&pool));
+        // Start the background page provider thread.
+        if background_page_provider_enabled() {
+            let weak = Arc::downgrade(&pool);
+            pool.page_provider.lock().unwrap().start(weak);
+        }
         Self { inner: pool }
     }
 
@@ -626,6 +631,13 @@ unsafe impl Sync for BufferPool {}
 fn background_page_provider_enabled() -> bool {
     static VALUE: OnceLock<bool> = OnceLock::new();
     *VALUE.get_or_init(|| {
+        // Disabled by default. The background thread adds condvar latency
+        // on the eviction path and competes for CPU with workers. The
+        // hot-pin fence is still gated on budget pressure (see
+        // lock_hot_pin) regardless of this setting, so the in-memory read
+        // path remains lock-free when there's no eviction.
+        // Set PAGEBOX_ENABLE_BACKGROUND_PAGE_PROVIDER=1 to enable for
+        // experiments.
         matches!(
             std::env::var("PAGEBOX_ENABLE_BACKGROUND_PAGE_PROVIDER")
                 .ok()
@@ -1247,7 +1259,13 @@ impl BufferPool {
     }
 
     fn lock_hot_pin(&self) -> Option<EvictionReadGuard<'_>> {
-        if !background_page_provider_enabled() {
+        // Only take the eviction fence when budget is low and the
+        // background thread may be evicting. This keeps the in-memory
+        // hot path lock-free when eviction isn't needed.
+        if self.eviction_writer_pending.load(Ordering::Acquire) == 0
+            && self.resident_base_pages_available.load(Ordering::Relaxed)
+                > (self.resident_base_pages / 10).max(16)
+        {
             return None;
         }
         loop {
@@ -1262,7 +1280,10 @@ impl BufferPool {
     }
 
     fn try_lock_hot_pin(&self) -> Option<Option<EvictionReadGuard<'_>>> {
-        if !background_page_provider_enabled() {
+        if self.eviction_writer_pending.load(Ordering::Acquire) == 0
+            && self.resident_base_pages_available.load(Ordering::Relaxed)
+                > (self.resident_base_pages / 10).max(16)
+        {
             return Some(None);
         }
         if self.eviction_writer_pending.load(Ordering::Acquire) != 0 {
@@ -2753,34 +2774,29 @@ impl BufferPool {
     }
 
     fn wait_for_resident_budget(&self, class: PageClass) {
-        let provider = background_page_provider_enabled()
-            .then(|| {
-                let mut pp = self.page_provider.lock().unwrap();
-                if !pp.is_running() {
-                    let pool = self.self_weak.get().cloned()?;
-                    pp.start(pool);
-                }
-                let need_frames = pp.need_frames.clone();
-                let frames_available = pp.frames_available.clone();
-                drop(pp);
-                need_frames.1.notify_one();
-                Some((need_frames, frames_available))
-            })
-            .flatten();
+        // When the background page provider is enabled, it handles eviction
+        // and dirty-page flushing. Workers just wake it and wait.
+        // Otherwise, workers do inline eviction.
+        let frames_available = if background_page_provider_enabled() {
+            let pp = self.page_provider.lock().unwrap();
+            pp.need_frames_notify();
+            Some(pp.frames_available.clone())
+        } else {
+            None
+        };
 
-        let mut idle_attempts = 0u32;
+        let mut idle = 0u32;
         loop {
             if self.resident_base_pages_available.load(Ordering::Relaxed) >= class.base_page_count()
             {
                 return;
             }
-            if let Some((need_frames, _)) = &provider {
-                need_frames.1.notify_one();
-            }
-            idle_attempts += 1;
+            idle += 1;
 
+            // Inline eviction (primary path when bg provider is off,
+            // safety valve when it's on).
             if self.try_evict_any_policy(16) > 0 || self.try_evict_any_batch(16) > 0 {
-                idle_attempts = 0;
+                idle = 0;
                 if self.resident_base_pages_available.load(Ordering::Relaxed)
                     >= class.base_page_count()
                 {
@@ -2788,45 +2804,19 @@ impl BufferPool {
                 }
             }
 
-            if idle_attempts >= 16
+            if idle >= 16
                 && let Ok(flushed) = self.try_flush_dirty_batch(64)
                 && flushed > 0
             {
-                idle_attempts = 0;
+                idle = 0;
                 continue;
             }
 
-            if idle_attempts >= 100 {
-                let mut any_evictable = false;
-                for &candidate_class in &PageClass::ALL {
-                    let state = self.class_state(candidate_class);
-                    for i in 0..state.arena.len {
-                        if !self.is_slot_initialized(candidate_class, i) {
-                            continue;
-                        }
-                        let bf = self.raw_frame(candidate_class, i);
-                        let state = unsafe { (*bf).header.core.state.load(Ordering::Relaxed) };
-                        if state == FrameState::Resident
-                            && unsafe { (*bf).header.core.pin_count.load(Ordering::Relaxed) } == 0
-                        {
-                            any_evictable = true;
-                            break;
-                        }
-                    }
-                    if any_evictable {
-                        break;
-                    }
-                }
-                if !any_evictable
-                    && self.resident_base_pages_available.load(Ordering::Relaxed)
-                        < class.base_page_count()
-                {
-                    self.panic_pool_exhausted(class);
-                }
-                idle_attempts = 0;
+            if idle >= 100 {
+                self.panic_pool_exhausted(class);
             }
 
-            if let Some((_, frames_available)) = &provider {
+            if let Some(frames_available) = &frames_available {
                 let guard = frames_available.0.lock().unwrap();
                 let _ = frames_available
                     .1
@@ -4250,12 +4240,32 @@ impl BufferPool {
         self.resident_base_pages_available
             .fetch_add(class.base_page_count(), Ordering::Relaxed);
         let _ = bf;
+        // Notify any worker waiting in pop_free_frame/wait_for_resident_budget.
+        if background_page_provider_enabled()
+            && let Ok(pp) = self.page_provider.lock()
+        {
+            pp.frames_available_notify();
+        }
     }
 
     /// Approximate number of resident-budget tokens still available
     /// before eviction must replenish capacity.
     pub fn approx_available_budget(&self) -> usize {
         self.resident_base_pages_available.load(Ordering::Relaxed)
+    }
+
+    pub fn try_evict_any_policy_for_provider(&self, max_batch: usize) -> usize {
+        self.try_evict_any_policy(max_batch)
+    }
+
+    #[cfg(not(miri))]
+    pub fn try_flush_dirty_batch_for_provider(&self, max_batch: usize) -> std::io::Result<usize> {
+        self.try_flush_dirty_batch(max_batch)
+    }
+
+    #[cfg(miri)]
+    pub fn try_flush_dirty_batch_for_provider(&self, _max_batch: usize) -> std::io::Result<usize> {
+        Ok(0)
     }
 
     /// Try to evict one randomly-selected frame. Returns true if a frame
