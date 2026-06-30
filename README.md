@@ -23,16 +23,16 @@ semantics) are unreleased and will change without migration scaffolding — a
 format change means reinitializing local data, not upgrading it.
 
 There is a substantial test suite: unit and integration tests across every
-substrate crate, `#[should_panic]` contract tests for invariant violations,
-differential / property tests against `BTreeMap` oracles, loom models for the
-concurrency primitives that admit enumeration, and microbenchmarks for the hot
+substrate crate, various contract tests for invariant violations,
+differential / property tests oracles, loom models for the concurrency
+primitives that admit enumeration, and microbenchmarks for the hot
 paths.
 
-That said, this is a work in progress. Subtle correctness and concurrency bugs
+But this is a work in progress. Subtle correctness and concurrency bugs
 are likely still hiding like broken glass in the grass. And I reserve the right to
 change the API and storage formats.
 
-The goal is a robust, measured storage engine; I'm not there yet. 
+The goal is a robust, measured storage engine; I'm not there yet.
 
 Use it, study it, break it, file issues.
 
@@ -135,28 +135,16 @@ metrics = ["pagebox-storage/metrics", "pagebox-wal/metrics", "pagebox-btree/metr
 
 ## Example: `kvstore`
 
-`kvstore` is a standalone durable key-value store built on exactly four substrate
-crates (`pagebox-btree`, `pagebox-storage`, `pagebox-wal`, `pagebox-frame-kernel`)
-plus `clap`. It demonstrates that the substrate composes into a real crash-safe
-engine with no database, SQL, or row-layer types in scope.
+`kvstore` is a standalone durable key-value store built on top of pagestore.
+It's here to demonstrate the API. `cargo run -p kvstore` will exercise it.
 
-The open path mirrors a full database recovery sequence:
-
-1. `FilePageStore::open` — open or create the data file.
-2. `Wal::open_opts` — open or create the WAL.
-3. `wal.recover(&store, checkpoint_lsn, read_page_lsn)` — replay page images.
-4. `store.sync()` — flush recovered pages.
-5. `BufferPool::with_store` + `pool.set_wal` — wire the pool to the store and WAL.
-6. `BTree::new` or `BTree::open` — create or reopen the tree from `user_meta_0`
-   (root page ID) and `user_meta_1` (height).
-
-Checkpoint flushes dirty pages, persists tree metadata into the store's user
-meta slots, advances the checkpoint LSN, and resets the WAL.
+The open path mirrors a full database recovery sequence. Checkpoint flushes
+dirty pages, persists tree metadata into the store's user meta slots, 
+advances the checkpoint LSN, and resets the WAL.
 
 ## Research Background
 
-Pagebox is not a reimplementation of any one system, but its design is shaped by
-research on memory-optimised disk-based engines:
+These two papers are of importance for what I'm trying to do:
 
 - [LeanStore: In-Memory Data Management beyond Main Memory](https://db.in.tum.de/~leis/papers/leanstore.pdf)
   for swizzled pointers, hot/cool page management, and low-overhead buffer-managed
