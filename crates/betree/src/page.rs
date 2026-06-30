@@ -175,6 +175,7 @@ pub(crate) enum LookupStep<'a> {
     },
     Internal {
         child_swip: Swip,
+        child_slot: u16,
         visible_buffer: Option<RawVisibleVersion<'a>>,
         buffer_count: usize,
     },
@@ -1504,6 +1505,7 @@ fn lookup_internal<'a>(
 
     Ok(LookupStep::Internal {
         child_swip,
+        child_slot: child_idx as u16,
         visible_buffer,
         buffer_count,
     })
@@ -2239,6 +2241,7 @@ mod tests {
             child_swip,
             visible_buffer: Some(visible),
             buffer_count,
+            ..
         } = lookup_step(&page, b"k25", 15).unwrap()
         else {
             panic!("raw lookup should route through the internal page");

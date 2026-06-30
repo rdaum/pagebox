@@ -146,7 +146,9 @@ enum VisibleLookupStep {
         visible: Option<VisibleCandidate>,
     },
     Internal {
+        parent_pid: u64,
         child_swip: Swip,
+        child_slot: u16,
         visible_buffer: Option<VisibleCandidate>,
         buffer_count: usize,
     },
@@ -593,13 +595,14 @@ impl CowBeTree {
     ) -> Option<CowBeTreeVisibleVersion> {
         let mut root = true;
         let mut next_swip = Swip::evicted(0);
+        let mut next_parent = 0u64;
         let mut visible = None;
         let mut saw_path_buffer = false;
         loop {
             let Ok(step) = (if root {
                 self.lookup_root_step(key, read_ts)
             } else {
-                self.lookup_orphan_step(next_swip, key, read_ts)
+                self.lookup_orphan_step(next_parent, next_swip, key, read_ts)
             }) else {
                 return self
                     .lookup_visible_candidate_owned(key, read_ts)
@@ -618,7 +621,9 @@ impl CowBeTree {
                     return visible.map(CowBeTreeVisibleVersion::from);
                 }
                 VisibleLookupStep::Internal {
+                    parent_pid,
                     child_swip,
+                    child_slot,
                     visible_buffer,
                     buffer_count,
                 } => {
@@ -628,7 +633,15 @@ impl CowBeTree {
                     if let Some(buffer) = visible_buffer {
                         merge_owned_visible_candidate(&mut visible, buffer);
                     }
+                    if child_swip.is_evicted() {
+                        self.swizzle_child_read_only(
+                            parent_pid,
+                            child_swip.as_page_id(),
+                            child_slot,
+                        );
+                    }
                     next_swip = child_swip;
+                    next_parent = parent_pid;
                 }
             }
         }
@@ -1024,6 +1037,32 @@ impl CowBeTree {
         if page_header::read_page_type(page_bytes) != PageType::BeTreeInternal {
             return;
         }
+        write_child_swip_at(parent.page_bytes_mut(), child_slot, hot_swip);
+    }
+
+    fn swizzle_child_read_only(&self, parent_pid: u64, child_pid: u64, child_slot: u16) {
+        let child = unsafe { self.pool().fix_orphan_frame(child_pid) };
+        let child_frame = child.frame_ref();
+        let Some(parent_pin) = (unsafe { self.pool().try_fix_resident_page_frame(parent_pid) })
+        else {
+            return;
+        };
+        let Ok(mut parent) = parent_pin.try_exclusive() else {
+            return;
+        };
+        if parent.pid() != parent_pid {
+            return;
+        }
+        let page_bytes = parent.page_bytes();
+        if page_header::read_page_type(page_bytes) != PageType::BeTreeInternal {
+            return;
+        }
+        unsafe {
+            child_frame
+                .write_ref()
+                .set_parent_link_inner(parent_pid, child_slot, false, self.dt_id);
+        }
+        let hot_swip = child_frame.hot_swip();
         write_child_swip_at(parent.page_bytes_mut(), child_slot, hot_swip);
     }
 
@@ -2338,21 +2377,34 @@ impl CowBeTree {
             self.stats.inc(CowBeTreeEvent::PageFaults);
         }
         let frame = unsafe { self.pool().fix_frame(&self.root) }.shared();
+        let root_pid = frame.pid();
         let step = lookup_step(frame.page_bytes(), key, read_ts)?;
-        Ok(own_lookup_step(step))
+        let mut step = own_lookup_step(step);
+        if let VisibleLookupStep::Internal { parent_pid, .. } = &mut step {
+            *parent_pid = root_pid;
+        }
+        Ok(step)
     }
 
     fn lookup_orphan_step(
         &self,
+        parent_pid: u64,
         child_swip: Swip,
         key: &[u8],
         read_ts: Timestamp,
     ) -> Result<VisibleLookupStep, CowBeTreeError> {
-        self.stats.inc(CowBeTreeEvent::ColdResolves);
-        self.stats.inc(CowBeTreeEvent::PageFaults);
         let frame = self.fix_child(child_swip).shared();
         let step = lookup_step(frame.page_bytes(), key, read_ts)?;
-        Ok(own_lookup_step(step))
+        let mut step = own_lookup_step(step);
+        if let VisibleLookupStep::Internal {
+            parent_pid: step_parent_pid,
+            ..
+        } = &mut step
+        {
+            *step_parent_pid = frame.pid();
+        }
+        let _ = parent_pid;
+        Ok(step)
     }
 
     fn load_orphan(&self, page_id: u64) -> Result<NodePage, CowBeTreeError> {
@@ -2569,10 +2621,13 @@ fn own_lookup_step(step: LookupStep<'_>) -> VisibleLookupStep {
         },
         LookupStep::Internal {
             child_swip,
+            child_slot,
             visible_buffer,
             buffer_count,
         } => VisibleLookupStep::Internal {
+            parent_pid: 0,
             child_swip,
+            child_slot,
             visible_buffer: visible_buffer.map(own_visible_candidate),
             buffer_count,
         },
