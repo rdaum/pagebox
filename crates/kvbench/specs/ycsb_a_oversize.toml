@@ -1,0 +1,13 @@
+# YCSB-A: 50% read / 50% update, uniform, exceeds buffer pool (50k records).
+workload = "ycsb_a"
+distribution = { kind = "uniform" }
+record_count = 50000
+value_size = 100
+operation_count = 200000
+seed = 42
+threads = 4
+
+[engine_opts]
+value_size = 100
+sync_mode = "relaxed"
+buffer_budget_frames = 1024

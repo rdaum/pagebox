@@ -1,0 +1,13 @@
+# Phase 0 spec: single-threaded ReadRandom against kvstore.
+workload = "read_random"
+distribution = { kind = "uniform" }
+record_count = 10000
+value_size = 100
+operation_count = 50000
+seed = 42
+threads = 1
+
+[engine_opts]
+value_size = 100
+sync_mode = "relaxed"
+buffer_budget_frames = 1024

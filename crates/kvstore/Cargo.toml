@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2024"
 license.workspace = true
 
+[lib]
+name = "kvstore"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kvstore"
+path = "src/main.rs"
+
 [dependencies]
 pagebox-btree.workspace = true
 pagebox-storage.workspace = true

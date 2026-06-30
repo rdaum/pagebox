@@ -1,0 +1,13 @@
+# Phase 1 spec: YCSB-A workload against kvstore with zipfian distribution.
+workload = "ycsb_a"
+distribution = { kind = "zipfian", params = { theta = 0.99 } }
+record_count = 50000
+value_size = 100
+operation_count = 100000
+seed = 42
+threads = 4
+
+[engine_opts]
+value_size = 100
+sync_mode = "relaxed"
+buffer_budget_frames = 8192
