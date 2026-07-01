@@ -1,4 +1,6 @@
 # FillRandom: random-order bulk load, write-heavy.
+# 50k records × ~108 bytes = ~5.4 MB dataset, 4096 frames × 4K = 16 MB budget.
+# Dataset fits — measures pure write throughput and split efficiency.
 workload = "fill_random"
 distribution = { kind = "uniform" }
 record_count = 50000
@@ -10,4 +12,4 @@ threads = 4
 [engine_opts]
 value_size = 100
 sync_mode = "relaxed"
-buffer_budget_frames = 1024
+buffer_budget_frames = 4096

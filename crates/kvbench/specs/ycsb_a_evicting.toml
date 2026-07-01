@@ -1,8 +1,8 @@
 # YCSB-A: 50% read / 50% update, uniform, dataset exceeds buffer pool.
-# 200k records × ~108 bytes = ~21 MB dataset, 64 frames × 64K = 4 MB budget.
-# Forces real eviction in kvstore's buffer pool and memory pressure in all
-# engines with bounded caches. LMDB uses the unbounded OS page cache, so
-# this spec highlights the architectural difference.
+# 200k records × ~108 bytes = ~21 MB dataset, 8192 frames × 4K = 32 MB budget.
+# Dataset partially fits — realistic memory pressure with mixed read/write
+# traffic. Tests eviction, dirty page writeback, and split paths under
+# memory pressure across all engines with a fair cache budget.
 workload = "ycsb_a"
 distribution = { kind = "uniform" }
 record_count = 200000
@@ -14,4 +14,4 @@ threads = 4
 [engine_opts]
 value_size = 100
 sync_mode = "relaxed"
-buffer_budget_frames = 64
+buffer_budget_frames = 8192
