@@ -408,16 +408,43 @@ needed, not optional — Phase 4 is real work, not conditional.
      the values are used only for their `swip()` (identity, not routing
      decision), and the caller re-validates by re-fixing the parent.
 
-4. **Phase 4: Add `ValidatedToken` for post-blocking-call validation**
-   - Needed: the `find_leaf_optimistic` root prologue (btree.rs:802) uses
-     blocking `fix_orphan_frame` under an optimistic guard and then uses
-     `routed_child` without re-validating. Either the token forces a
-     re-validate, or that specific site is rewritten to use a shared guard or
-     a non-blocking `try_fix_orphan_frame` + re-validate (matching the in-loop
-     path at btree.rs:872-884).
-   - The in-loop optimistic path already does the right thing; no token needed
-     there. Audit other blocking-call-under-optimistic sites as part of this
-     phase rather than assuming the root prologue is the only one.
+4. **Phase 4: Re-validate after blocking `fix_orphan_frame` under optimistic guards** — *DONE*
+   - The design doc proposed a `ValidatedToken` type to force re-validation
+     between blocking calls and `set_parent_link_for_routed_child`. After
+     auditing all sites, the simpler fix — adding `opt.validate()` / 
+     `inner.validate()` after each blocking `fix_orphan_frame` and returning
+     `Err(Restart)` on failure — is sufficient and matches the existing
+     in-loop pattern. No token type needed.
+   - **5 sites fixed** (all used blocking `fix_orphan_frame` under an
+     optimistic guard without re-validating before using `routed_child`):
+     - `find_leaf_exclusive_from_fixed_root` in-loop (btree.rs:541): added
+       `inner.validate()` after `fix_orphan_frame`.
+     - `find_leaf_exclusive` root prologue (btree.rs:608): added
+       `opt.validate()` after `fix_orphan_frame`.
+     - `find_leaf_exclusive` in-loop (btree.rs:697): added `inner.validate()`
+       after `fix_orphan_frame`.
+     - `find_leaf_exclusive_with_path` in-loop (btree.rs:788): added
+       `inner.validate()` after `fix_orphan_frame`.
+     - `find_leaf_optimistic` root prologue (btree.rs:852): added
+       `opt.validate()` after `fix_orphan_frame`.
+   - **Shared-guard paths are safe:** `with_lookup_fallback_leaf`,
+     `find_leaf_shared_fallback`, `find_leaf_shared_nonblocking`,
+     `find_leaf_exclusive_fallback`, `find_leaf_exclusive_with_path_fallback`
+     all use shared guards (not optimistic), which block exclusive writers.
+     The blocking `fix_orphan_frame` in those paths is safe because the
+     parent's routing entries cannot change while the shared guard is held.
+   - **In-loop optimistic path already correct:**
+     `find_leaf_optimistic` in-loop (btree.rs:933) already used
+     `try_fix_orphan_frame` (non-blocking) + `inner.validate()` (re-validate).
+   - **No `ValidatedToken` type was needed.** The audit found that all
+     blocking-call-under-optimistic sites could be fixed by adding a
+     `validate()` call. The token approach would be needed only if a future
+     change adds a path that uses `routed_child` after a blocking call
+     *without* an obvious validate site. The current code has no such path.
+   - Verified: `cargo build --workspace` passes; `cargo test --workspace`
+     passes (1 pre-existing `shuttle_pin_evict_minimal` failure, unrelated);
+     `cargo clippy --workspace --all-targets` introduces no new warnings;
+     `cargo fmt --all` is a no-op.
 
 ### What the compiler will catch after this design
 

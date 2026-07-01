@@ -539,6 +539,13 @@ impl BTree {
             } else {
                 self.stats.inc(BTreeEvent::ResolveCold);
                 let child = unsafe { pool.fix_orphan_frame(child_swip.as_page_id()) };
+                // Re-validate after the blocking fix: another thread could
+                // have exclusively latched this inner node during the fix and
+                // modified its routing entries.
+                if inner.validate().is_err() {
+                    self.stats.inc(BTreeEvent::LeafDescentRestarts);
+                    return Err(Restart);
+                }
                 let child_frame = ResidentFrame::from_pinned(&child);
                 unsafe {
                     self.set_parent_link_for_routed_child(
@@ -599,6 +606,12 @@ impl BTree {
                 } else {
                     self.stats.inc(BTreeEvent::ResolveCold);
                     let child = unsafe { pool.fix_orphan_frame(child_swip.as_page_id()) };
+                    // Re-validate after the blocking fix: another thread could
+                    // have exclusively latched the root during the fix and
+                    // modified its routing entries.
+                    if opt.validate().is_err() {
+                        return Err(Restart);
+                    }
                     let child_frame = ResidentFrame::from_pinned(&child);
                     unsafe {
                         self.set_parent_link_for_routed_child(&child_frame, &root, &routed_child)
@@ -682,6 +695,13 @@ impl BTree {
             } else {
                 self.stats.inc(BTreeEvent::ResolveCold);
                 let child = unsafe { pool.fix_orphan_frame(child_swip.as_page_id()) };
+                // Re-validate after the blocking fix: another thread could
+                // have exclusively latched this inner node during the fix and
+                // modified its routing entries.
+                if inner.validate().is_err() {
+                    self.stats.inc(BTreeEvent::LeafDescentRestarts);
+                    return Err(Restart);
+                }
                 let child_frame = ResidentFrame::from_pinned(&child);
                 unsafe {
                     self.set_parent_link_for_routed_child(
@@ -766,6 +786,13 @@ impl BTree {
             } else {
                 self.stats.inc(BTreeEvent::ResolveCold);
                 let child = unsafe { pool.fix_orphan_frame(child_swip.as_page_id()) };
+                // Re-validate after the blocking fix: another thread could
+                // have exclusively latched this inner node during the fix and
+                // modified its routing entries.
+                if inner.validate().is_err() {
+                    self.stats.inc(BTreeEvent::SplitPathRestarts);
+                    return Err(Restart);
+                }
                 let child_frame = ResidentFrame::from_pinned(&child);
                 // Swizzle-in: write HOT back to parent page bytes.
                 if let Ok(parent) = inner.upgrade_to_exclusive() {
@@ -823,6 +850,12 @@ impl BTree {
                 } else {
                     self.stats.inc(BTreeEvent::ResolveCold);
                     let child = unsafe { pool.fix_orphan_frame(child_swip.as_page_id()) };
+                    // Re-validate after the blocking fix: another thread could
+                    // have exclusively latched the root during the fix and
+                    // modified its routing entries.
+                    if opt.validate().is_err() {
+                        return Err(Restart);
+                    }
                     let child_frame = ResidentFrame::from_pinned(&child);
                     unsafe {
                         self.set_parent_link_for_routed_child(&child_frame, &root, &routed_child)
