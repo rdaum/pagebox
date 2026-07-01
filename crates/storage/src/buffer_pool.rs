@@ -2777,19 +2777,32 @@ impl BufferPool {
             if let Some(bf) = self.state.free_list.try_pop() {
                 return bf;
             }
-            if self.try_evict_any_policy(16) > 0 || self.try_evict_any_batch(16) > 0 {
+            // Evict one frame at a time to avoid swamping the pool with
+            // Evicting-state frames under concurrent fix_orphan_frame calls.
+            if self.try_evict_any_policy(1) > 0 || self.try_evict_any_batch(1) > 0 {
                 idle = 0;
             } else {
                 idle += 1;
-            }
-            if idle >= 100 {
-                self.panic_pool_exhausted();
             }
             if idle >= 16
                 && let Ok(flushed) = self.try_flush_dirty_batch(64)
                 && flushed > 0
             {
                 idle = 0;
+            }
+            if idle >= 32 {
+                // Under heavy read contention on a small pool, optimistic
+                // readers hold latches that prevent try_lock_exclusive in
+                // eviction, and the second-chance referenced bit cycles.
+                // Yield to let readers release latches so eviction can
+                // proceed.
+                #[cfg(not(loom))]
+                std::thread::yield_now();
+                #[cfg(loom)]
+                loom::thread::yield_now();
+            }
+            if idle >= 4096 {
+                self.panic_pool_exhausted();
             }
         }
     }

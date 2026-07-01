@@ -1051,7 +1051,7 @@ impl BTree {
             let routed_child = current_frame.try_route_to_child(key).ok_or(Restart)?;
             let child_swip = routed_child.swip();
             let child = if child_swip.is_hot() || child_swip.is_cool() {
-                let Some(child) = (unsafe { pool.pin_child(child_swip) }) else {
+                let Some(child) = (unsafe { pool.try_pin_child(child_swip) }) else {
                     return Err(Restart);
                 };
                 child
@@ -2779,7 +2779,7 @@ impl BTree {
         let mut current = unsafe { pool.fix_frame(&self.meta_swip) };
 
         loop {
-            let current_shared = current.shared();
+            let current_shared = current.clone_pin().shared();
             let shared = SharedNode::<Leaf>::from_leaf_frame(current_shared);
             let current_frame = shared.resident_frame();
             if current_frame.is_leaf() {
@@ -2803,15 +2803,44 @@ impl BTree {
                 };
                 child
             } else {
-                let child = unsafe { pool.fix_orphan_frame(routed_child.swip().as_page_id()) };
-                unsafe {
-                    self.set_parent_link_for_routed_child(
-                        &ResidentFrame::from_pinned(&child),
-                        &current_frame,
-                        &routed_child,
-                    )
-                };
+                // Cold-SWIP path: the child is evicted, need a blocking
+                // fix_orphan_frame to load it. Drop the shared guard first
+                // so eviction can exclusive-latch this parent to unswizzle
+                // other frames — holding a shared latch across a blocking
+                // fix starves eviction and panics the pool.
+                let child_pid = routed_child.swip().as_page_id();
+                let parent_pid = current.pid();
                 drop(shared);
+                let child = unsafe { pool.fix_orphan_frame(child_pid) };
+                // Re-fix the parent under a new shared guard and re-read
+                // the routing. The shared guard was dropped during the
+                // blocking fix, so the parent's routing may have changed
+                // (split, eviction unswizzle). If the routing still points
+                // to the same child, set the parent link; otherwise skip —
+                // the child is loaded, and the next traversal will set the
+                // link correctly.
+                let parent = unsafe { pool.fix_orphan_frame(parent_pid) };
+                let parent_shared = parent.shared();
+                let parent_frame = ResidentFrame::from_shared(&parent_shared);
+                if let Some(re_routed) = parent_frame.try_route_to_child(key) {
+                    let re_pid = if re_routed.swip().is_hot() || re_routed.swip().is_cool() {
+                        unsafe { ResidentFrame::from_hot_swip(re_routed.swip()) }
+                            .map(|f| f.pid())
+                            .unwrap_or(0)
+                    } else {
+                        re_routed.swip().as_page_id()
+                    };
+                    if re_pid == child_pid {
+                        unsafe {
+                            self.set_parent_link_for_routed_child(
+                                &ResidentFrame::from_pinned(&child),
+                                &parent_frame,
+                                &re_routed,
+                            )
+                        };
+                    }
+                }
+                drop(parent_shared);
                 current = child;
                 continue;
             };
