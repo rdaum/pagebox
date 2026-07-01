@@ -25,10 +25,12 @@ use workload::{WorkloadSpec, generate_load_ops, generate_run_ops};
 
 #[cfg(feature = "fjall")]
 use engines::fjall::FjallAdapter;
+#[cfg(feature = "lmdb")]
+use engines::lmdb::LmdbAdapter;
 #[cfg(feature = "redb")]
 use engines::redb::RedbAdapter;
-#[cfg(feature = "sled")]
-use engines::sled::SledAdapter;
+#[cfg(feature = "rocksdb")]
+use engines::rocksdb::RocksdbAdapter;
 
 #[derive(Parser)]
 #[command(name = "kvbench")]
@@ -48,12 +50,18 @@ enum Command {
         /// Output JSON report path.
         #[arg(long, default_value = "report.json")]
         output: PathBuf,
-        /// Engine to run ("kvstore", "fjall", "redb", "sled").
+        /// Engine to run ("kvstore", "fjall", "redb", "rocksdb", "lmdb").
         #[arg(long)]
         engine: String,
         /// Temp directory root (each run gets a fresh subdir).
         #[arg(long, default_value = "/tmp/kvbench")]
         tmpdir: PathBuf,
+        /// Verify correctness against a shadow HashMap.
+        #[arg(long)]
+        verify: bool,
+        /// Override thread count from spec. Useful for scaling sweeps.
+        #[arg(long)]
+        threads: Option<usize>,
     },
     /// Compare two JSON reports.
     Compare {
@@ -89,7 +97,9 @@ fn main() -> std::io::Result<()> {
             output,
             engine,
             tmpdir,
-        } => run_spec_file(&spec, &output, &engine, &tmpdir),
+            verify,
+            threads,
+        } => run_spec_file(&spec, &output, &engine, &tmpdir, verify, threads),
         Command::Compare { a, b } => {
             let report_a: Report = read_report(&a)?;
             let report_b: Report = read_report(&b)?;
@@ -112,8 +122,10 @@ fn main() -> std::io::Result<()> {
             println!("  fjall (--features fjall)");
             #[cfg(feature = "redb")]
             println!("  redb (--features redb)");
-            #[cfg(feature = "sled")]
-            println!("  sled (--features sled)");
+            #[cfg(feature = "lmdb")]
+            println!("  lmdb (--features lmdb)");
+            #[cfg(feature = "rocksdb")]
+            println!("  rocksdb (--features rocksdb)");
             Ok(())
         }
     }
@@ -144,6 +156,8 @@ fn run_spec_file(
     output: &std::path::Path,
     engine_name: &str,
     tmpdir: &std::path::Path,
+    verify: bool,
+    threads_override: Option<usize>,
 ) -> std::io::Result<()> {
     let spec_contents = std::fs::read_to_string(spec_path)?;
     let spec_file: SpecFile = toml::from_str(&spec_contents).map_err(|e| {
@@ -153,7 +167,10 @@ fn run_spec_file(
         )
     })?;
 
-    let spec = spec_file.spec.clone();
+    let mut spec = spec_file.spec.clone();
+    if let Some(t) = threads_override {
+        spec.threads = t.max(1);
+    }
     let opts = spec_file.engine_opts.clone();
     eprintln!(
         "Running {} / {} (records={}, ops={}, threads={})",
@@ -166,13 +183,15 @@ fn run_spec_file(
 
     let dir = create_fresh_dir(tmpdir, engine_name)?;
     let report = match engine_name {
-        "kvstore" => run_engine::<KvstoreAdapter>(&dir, &spec, &opts)?,
+        "kvstore" => run_engine::<KvstoreAdapter>(&dir, &spec, &opts, verify)?,
         #[cfg(feature = "fjall")]
-        "fjall" => run_engine::<FjallAdapter>(&dir, &spec, &opts)?,
+        "fjall" => run_engine::<FjallAdapter>(&dir, &spec, &opts, verify)?,
         #[cfg(feature = "redb")]
-        "redb" => run_engine::<RedbAdapter>(&dir, &spec, &opts)?,
-        #[cfg(feature = "sled")]
-        "sled" => run_engine::<SledAdapter>(&dir, &spec, &opts)?,
+        "redb" => run_engine::<RedbAdapter>(&dir, &spec, &opts, verify)?,
+        #[cfg(feature = "lmdb")]
+        "lmdb" => run_engine::<LmdbAdapter>(&dir, &spec, &opts, verify)?,
+        #[cfg(feature = "rocksdb")]
+        "rocksdb" => run_engine::<RocksdbAdapter>(&dir, &spec, &opts, verify)?,
         _ => {
             let available = available_engines();
             return Err(std::io::Error::new(
@@ -201,15 +220,21 @@ fn run_engine<E: KvEngine>(
     dir: &std::path::Path,
     spec: &WorkloadSpec,
     opts: &EngineOpts,
+    verify: bool,
 ) -> std::io::Result<Report> {
     let engine = E::open(dir, opts)?;
     let engine_name = E::NAME;
+    let shadow = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
     // Load phase.
     let load_summary = if spec.workload.needs_load_phase() {
         eprintln!("  Loading {} records...", spec.record_count);
         let load_ops = generate_load_ops(spec, opts);
-        let load_stats = run_phase(&engine, &load_ops, spec.threads.max(1));
+        let load_stats = if verify {
+            driver::run_phase_verify(&engine, &load_ops, spec.threads.max(1), &shadow)
+        } else {
+            run_phase(&engine, &load_ops, spec.threads.max(1))
+        };
         eprintln!(
             "  Load: {:.0} ops/sec, {:.2}ms",
             load_stats.ops_per_sec(),
@@ -226,7 +251,11 @@ fn run_engine<E: KvEngine>(
     // Run phase.
     eprintln!("  Running {} operations...", spec.operation_count);
     let run_ops = generate_run_ops(spec, opts);
-    let run_stats = run_phase(&engine, &run_ops, spec.threads.max(1));
+    let run_stats = if verify {
+        driver::run_phase_verify(&engine, &run_ops, spec.threads.max(1), &shadow)
+    } else {
+        run_phase(&engine, &run_ops, spec.threads.max(1))
+    };
 
     let report = Report::new(
         engine_name,
@@ -292,8 +321,8 @@ fn available_engines() -> String {
     if cfg!(feature = "redb") {
         engines.push("redb");
     }
-    if cfg!(feature = "sled") {
-        engines.push("sled");
+    if cfg!(feature = "lmdb") {
+        engines.push("lmdb");
     }
     engines.join(", ")
 }

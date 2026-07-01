@@ -5,6 +5,7 @@
 //! `std::thread::scope` so borrowed references can be shared across threads
 //! without `Arc` or raw pointers.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -18,9 +19,37 @@ use crate::workload::{WorkloadOp, scan_end_key};
 /// The `ops` slice is partitioned across `threads` worker threads; each
 /// worker atomically claims the next op index and executes it.
 pub fn run_phase<E: KvEngine + Sync>(engine: &E, ops: &[WorkloadOp], threads: usize) -> PhaseStats {
+    let shadow = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    run_phase_inner(engine, ops, threads, false, &shadow)
+}
+
+/// Run a phase with verification against a shadow HashMap.
+///
+/// Every Put updates the shadow map. Every Get is checked against it.
+/// Every Del is checked. Scans verify the count matches. Mismatches
+/// are printed and counted. The shadow map is shared across calls
+/// so the load phase's writes are visible to the run phase.
+pub fn run_phase_verify<E: KvEngine + Sync>(
+    engine: &E,
+    ops: &[WorkloadOp],
+    threads: usize,
+    shadow: &Arc<std::sync::Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
+) -> PhaseStats {
+    run_phase_inner(engine, ops, threads, true, shadow)
+}
+
+fn run_phase_inner<E: KvEngine + Sync>(
+    engine: &E,
+    ops: &[WorkloadOp],
+    threads: usize,
+    verify: bool,
+    shadow: &Arc<std::sync::Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
+) -> PhaseStats {
     let threads = threads.max(1);
     let next_idx = Arc::new(AtomicU64::new(0));
     let total = ops.len() as u64;
+
+    let errors = Arc::new(AtomicU64::new(0));
 
     let start = Instant::now();
     let mut combined = PhaseStats::new();
@@ -29,6 +58,8 @@ pub fn run_phase<E: KvEngine + Sync>(engine: &E, ops: &[WorkloadOp], threads: us
         let mut handles = Vec::with_capacity(threads);
         for _ in 0..threads {
             let next_idx = Arc::clone(&next_idx);
+            let shadow = Arc::clone(shadow);
+            let errors = Arc::clone(&errors);
             handles.push(s.spawn(move || {
                 let mut local = PhaseStats::new();
                 loop {
@@ -38,7 +69,7 @@ pub fn run_phase<E: KvEngine + Sync>(engine: &E, ops: &[WorkloadOp], threads: us
                     }
                     let op = &ops[idx as usize];
                     let op_start = Instant::now();
-                    let kind = execute_op(engine, op);
+                    let kind = execute_op(engine, op, verify, &shadow, &errors, idx);
                     let elapsed = op_start.elapsed().as_nanos() as u64;
                     local.record(elapsed, kind);
                 }
@@ -52,23 +83,57 @@ pub fn run_phase<E: KvEngine + Sync>(engine: &E, ops: &[WorkloadOp], threads: us
     });
 
     combined.duration = start.elapsed();
+
+    let err_count = errors.load(Ordering::Relaxed);
+    if verify && err_count > 0 {
+        eprintln!("  VERIFY: {err_count} mismatches detected in {total} operations");
+    }
+
     combined
 }
 
 /// Execute a single operation against the engine. Returns the op kind for
 /// counting.
-fn execute_op<E: KvEngine>(engine: &E, op: &WorkloadOp) -> OpKind {
+fn execute_op<E: KvEngine>(
+    engine: &E,
+    op: &WorkloadOp,
+    verify: bool,
+    shadow: &Arc<std::sync::Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
+    errors: &Arc<AtomicU64>,
+    op_idx: u64,
+) -> OpKind {
     match op {
         WorkloadOp::Put { key, value } => {
             engine.put(key, value);
+            if verify {
+                shadow.lock().unwrap().insert(key.clone(), value.clone());
+            }
             OpKind::Put
         }
         WorkloadOp::Get { key } => {
-            black_box(engine.get(key));
+            let actual = engine.get(key);
+            black_box(&actual);
+            if verify {
+                let expected = shadow.lock().unwrap().get(key).cloned();
+                if actual != expected {
+                    errors.fetch_add(1, Ordering::Relaxed);
+                    if errors.load(Ordering::Relaxed) <= 5 {
+                        eprintln!(
+                            "  VERIFY MISMATCH op[{op_idx}] Get: key={:?} expected={:?} actual={:?}",
+                            key,
+                            expected.as_ref().map(|v| &v[..]),
+                            actual.as_ref().map(|v| &v[..]),
+                        );
+                    }
+                }
+            }
             OpKind::Get
         }
         WorkloadOp::Del { key } => {
-            black_box(engine.del(key));
+            let _ = engine.del(key);
+            if verify {
+                shadow.lock().unwrap().remove(key);
+            }
             OpKind::Del
         }
         WorkloadOp::Scan { start, count } => {
@@ -78,11 +143,33 @@ fn execute_op<E: KvEngine>(engine: &E, op: &WorkloadOp) -> OpKind {
                 n += 1;
             });
             black_box(n);
+            if verify {
+                let guard = shadow.lock().unwrap();
+                let expected: Vec<_> = guard
+                    .iter()
+                    .filter(|(k, _)| {
+                        k.as_slice() >= start.as_slice() && k.as_slice() < end.as_slice()
+                    })
+                    .collect();
+                if n != expected.len() {
+                    errors.fetch_add(1, Ordering::Relaxed);
+                    if errors.load(Ordering::Relaxed) <= 5 {
+                        eprintln!(
+                            "  VERIFY MISMATCH op[{op_idx}] Scan: start={:?} expected={} entries, got {n}",
+                            &start[..],
+                            expected.len(),
+                        );
+                    }
+                }
+            }
             OpKind::Scan
         }
         WorkloadOp::Rmw { key, value } => {
             let _ = engine.get(key);
             engine.put(key, value);
+            if verify {
+                shadow.lock().unwrap().insert(key.clone(), value.clone());
+            }
             OpKind::Rmw
         }
     }
@@ -97,7 +184,14 @@ fn black_box<T>(t: T) -> T {
 #[allow(dead_code)]
 pub fn time_single_op<E: KvEngine>(engine: &E, op: &WorkloadOp) -> Duration {
     let start = Instant::now();
-    let _ = execute_op(engine, op);
+    let _ = execute_op(
+        engine,
+        op,
+        false,
+        &Arc::new(std::sync::Mutex::new(HashMap::new())),
+        &Arc::new(AtomicU64::new(0)),
+        0,
+    );
     start.elapsed()
 }
 

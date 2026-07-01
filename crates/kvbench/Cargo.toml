@@ -21,7 +21,8 @@ default = []
 # Phase 1: external comparison engines (off by default).
 fjall = ["dep:fjall"]
 redb = ["dep:redb"]
-sled = ["dep:sled"]
+rocksdb = ["dep:rocksdb"]
+lmdb = ["dep:lmdb-rkv"]
 
 [dependencies.fjall]
 version = "3"
@@ -32,8 +33,13 @@ default-features = false
 version = "4"
 optional = true
 
-[dependencies.sled]
-version = "0.34"
+[dependencies.rocksdb]
+version = "0.23"
+optional = true
+features = ["multi-threaded-cf"]
+
+[dependencies.lmdb-rkv]
+version = "0.14"
 optional = true
 
 [lints.rust]

@@ -10,5 +10,8 @@ pub mod fjall;
 #[cfg(feature = "redb")]
 pub mod redb;
 
-#[cfg(feature = "sled")]
-pub mod sled;
+#[cfg(feature = "lmdb")]
+pub mod lmdb;
+
+#[cfg(feature = "rocksdb")]
+pub mod rocksdb;

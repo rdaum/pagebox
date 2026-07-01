@@ -16,8 +16,8 @@ use fjall::{Database, KeyspaceCreateOptions, PersistMode};
 
 use crate::engine::{EngineOpts, EngineStats, KvEngine, SyncMode};
 
-/// Page size used by the pagebox substrate (4 KiB).
-const PAGE_SIZE: u64 = 4096;
+/// Page size used by the pagebox substrate (64 KiB).
+const PAGE_SIZE: u64 = 65536;
 
 /// Adapter wrapping `fjall::Database` with a single keyspace.
 pub struct FjallAdapter {
