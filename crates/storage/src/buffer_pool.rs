@@ -1987,29 +1987,12 @@ impl<'a> PinnedFrame<'a> {
     }
 }
 
-// Thread-local xorshift64 state for random eviction.
+// Thread-local shard hint for allocation.
 thread_local! {
-    static RNG_STATE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static ALLOC_SHARD_HINT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
 }
 
 static NEXT_ALLOC_SHARD_HINT: AtomicUsize = AtomicUsize::new(0);
-
-fn thread_rng() -> u64 {
-    RNG_STATE.with(|cell| {
-        let mut x = cell.get();
-        if x == 0 {
-            x = (cell as *const _ as u64)
-                .wrapping_mul(0x517cc1b727220a95)
-                .wrapping_add(1);
-        }
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        cell.set(x);
-        x
-    })
-}
 
 fn thread_alloc_shard_hint() -> usize {
     ALLOC_SHARD_HINT.with(|cell| {
@@ -3918,22 +3901,42 @@ impl BufferPool {
     /// Try to evict one randomly-selected frame. Returns true if a frame
     /// was evicted and released a resident-budget token. Used by the
     /// page provider thread to proactively replenish available budget.
+    /// Try to evict one frame using a sequential clock-hand scan.
+    ///
+    /// Advances a shared clock hand through the frame array. On each probe:
+    /// - If the frame is not Resident, skip (no cache-line bounces).
+    /// - If the `referenced` bit is set, clear it (second chance) and skip.
+    /// - If unreferenced, attempt eviction (exclusive latch, CAS to Evicting).
+    ///
+    /// Sequential scanning has better cache behavior than random probing:
+    /// adjacent frames are likely in the same cache-line group, and the
+    /// hardware prefetcher can warm the next group while we process the
+    /// current one. It also avoids repeatedly probing the same hot frames
+    /// that random selection would hit.
     #[cfg(not(miri))]
     pub fn try_evict_one(&self) -> bool {
         let num_slots = self.allocated_slots();
         if num_slots == 0 {
             return false;
         }
-        let idx = thread_rng() as usize % num_slots;
-        if !self.is_slot_initialized(idx) {
-            return false;
+        let start = self.state.eviction_hand.fetch_add(1, Ordering::Relaxed) % num_slots;
+        for offset in 0..num_slots {
+            let idx = (start + offset) % num_slots;
+            if !self.is_slot_initialized(idx) {
+                continue;
+            }
+            let bf = self.raw_frame(idx);
+            if self
+                .with_single_evict_candidate(bf, |pid| {
+                    self.writeback_evicting_frame_if_dirty(bf, pid);
+                    self.finish_latched_evicting_frame(bf, pid)
+                })
+                .is_some()
+            {
+                return true;
+            }
         }
-        let bf = self.raw_frame(idx);
-        self.with_single_evict_candidate(bf, |pid| {
-            self.writeback_evicting_frame_if_dirty(bf, pid);
-            self.finish_latched_evicting_frame(bf, pid)
-        })
-        .unwrap_or(false)
+        false
     }
 
     /// Try to acquire an eviction permit. Returns `None` if the pool already
