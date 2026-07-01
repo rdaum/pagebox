@@ -1475,7 +1475,7 @@ impl<'a> PinnedFrame<'a> {
         unsafe { BufferFrameRef::from_raw(self.bf) }
     }
 
-    pub fn read_ref(&self) -> BufferFrameReadRef {
+    pub fn read_ref(&self) -> BufferFrameReadRef<'a> {
         unsafe { self.frame_ref().read_ref() }
     }
 
@@ -1573,7 +1573,7 @@ impl<'a> OptimisticFrame<'a> {
         self.pinned.frame_ref()
     }
 
-    pub fn read_ref(&self) -> BufferFrameReadRef {
+    pub fn read_ref(&self) -> BufferFrameReadRef<'a> {
         self.pinned.read_ref()
     }
 
@@ -1697,7 +1697,7 @@ impl<'a> ResidentSharedFrame<'a> {
         unsafe { &(*self.bf).page }
     }
 
-    pub fn read_ref(&self) -> BufferFrameReadRef {
+    pub fn read_ref(&self) -> BufferFrameReadRef<'a> {
         unsafe { BufferFrameRef::from_raw(self.bf).read_ref() }
     }
 
@@ -1729,7 +1729,7 @@ impl<'a> SharedFrame<'a> {
         self.pinned.frame_ref()
     }
 
-    pub fn read_ref(&self) -> BufferFrameReadRef {
+    pub fn read_ref(&self) -> BufferFrameReadRef<'a> {
         self.pinned.read_ref()
     }
 
@@ -1772,12 +1772,12 @@ impl Deref for ResidentSharedFrame<'_> {
     }
 }
 
-impl ResidentOptimisticFrame<'_> {
+impl<'a> ResidentOptimisticFrame<'a> {
     pub fn page(&self) -> &[u8; PAGE_SIZE] {
         unsafe { &(*self.bf).page }
     }
 
-    pub fn read_ref(&self) -> BufferFrameReadRef {
+    pub fn read_ref(&self) -> BufferFrameReadRef<'a> {
         unsafe { BufferFrameRef::from_raw(self.bf).read_ref() }
     }
 
@@ -1838,11 +1838,11 @@ impl<'a> ExclusiveFrame<'a> {
         self.pinned.frame_ref()
     }
 
-    pub fn read_ref(&self) -> BufferFrameReadRef {
+    pub fn read_ref(&self) -> BufferFrameReadRef<'a> {
         self.pinned.read_ref()
     }
 
-    pub fn write_ref(&self) -> BufferFrameWriteRef {
+    pub fn write_ref(&self) -> BufferFrameWriteRef<'a> {
         unsafe { self.frame_ref().write_ref() }
     }
 
@@ -2385,7 +2385,7 @@ impl BufferPool {
         f(&mut frame)
     }
 
-    pub fn mark_dirty_frame(&self, frame: BufferFrameWriteRef) {
+    pub fn mark_dirty_frame(&self, frame: BufferFrameWriteRef<'_>) {
         unsafe { self.mark_dirty_raw(frame.frame().as_ptr()) };
     }
 

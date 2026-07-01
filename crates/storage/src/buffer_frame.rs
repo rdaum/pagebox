@@ -20,9 +20,9 @@
 //!   `unsafe` (caller asserts the frame is live for the use). Cheap to copy;
 //!   no `Drop`. This is the type stored inside `Swip::Hot`/`Cool` words.
 //! - [`BufferFrameReadRef`] — produced by [`BufferFrameRef::read_ref`] under the
-//!   caller's pin/latch protocol; exposes the page bytes as `&'static [u8;
-//!   PAGE_SIZE]` (the buffer pool guarantees the underlying storage outlives
-//!   the program, so the borrow is effectively unbounded).
+//!   caller's pin/latch protocol; exposes the page bytes as `&'a [u8;
+//!   PAGE_SIZE]` where `'a` is the lifetime established at construction (tied
+//!   to the guard/pin that authorizes access).
 //! - [`BufferFrameWriteRef`] — produced by [`BufferFrameRef::write_ref`] under
 //!   an exclusive latch; exposes mutable page bytes and the parent-link
 //!   mutators.
@@ -113,23 +113,28 @@ pub struct BufferFrameRef {
 /// optimistic-guard protocol.
 ///
 /// Construction is `unsafe` (caller asserts the frame is pinned or otherwise
-/// protected from eviction). Exposes [`BufferFrameReadRef::page`] as a
-/// `&'static [u8; PAGE_SIZE]`: the page bytes live for as long as the buffer
-/// pool does, so the borrow is effectively unbounded.
+/// protected from eviction for the lifetime `'a`). Exposes [`BufferFrameReadRef::page`]
+/// as a `&'a [u8; PAGE_SIZE]`: the page-byte borrow is bounded by the lifetime
+/// established at construction, which the guard types tie to their own borrow
+/// of the pool. This prevents the page bytes from outliving the guard that
+/// makes them valid.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BufferFrameReadRef {
+pub struct BufferFrameReadRef<'a> {
     frame: BufferFrameRef,
+    _marker: std::marker::PhantomData<&'a ()>,
 }
 
 /// Write view on a [`BufferFrame`] produced under an exclusive latch or
 /// eviction-time ownership.
 ///
-/// Construction is `unsafe` (caller asserts exclusive access). Exposes
-/// mutable page bytes and the parent-link mutators used by the eviction /
-/// publish-split paths.
+/// Construction is `unsafe` (caller asserts exclusive access for the lifetime
+/// `'a`). Exposes mutable page bytes and the parent-link mutators used by the
+/// eviction / publish-split paths. The lifetime `'a` bounds the mutable page
+/// borrow to the guard that authorizes mutation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BufferFrameWriteRef {
+pub struct BufferFrameWriteRef<'a> {
     frame: BufferFrameRef,
+    _marker: std::marker::PhantomData<&'a ()>,
 }
 
 // SAFETY: BufferFrameRef is an identity reference to a BufferFrame. The frame
@@ -137,10 +142,10 @@ pub struct BufferFrameWriteRef {
 // protocol that was required for the underlying frame pointer.
 unsafe impl Send for BufferFrameRef {}
 unsafe impl Sync for BufferFrameRef {}
-unsafe impl Send for BufferFrameReadRef {}
-unsafe impl Sync for BufferFrameReadRef {}
-unsafe impl Send for BufferFrameWriteRef {}
-unsafe impl Sync for BufferFrameWriteRef {}
+unsafe impl Send for BufferFrameReadRef<'_> {}
+unsafe impl Sync for BufferFrameReadRef<'_> {}
+unsafe impl Send for BufferFrameWriteRef<'_> {}
+unsafe impl Sync for BufferFrameWriteRef<'_> {}
 // SAFETY: StableSwipRef carries identity for a caller-proven stable routing
 // edge. AtomicSwip provides its own synchronization; the lifetime invariant is
 // established at construction.
@@ -237,25 +242,34 @@ impl BufferFrameRef {
 
     /// # Safety
     /// The caller must ensure the frame is live and protected for reads by an
-    /// appropriate pin/latch/eviction protocol.
-    pub unsafe fn read_ref(self) -> BufferFrameReadRef {
-        BufferFrameReadRef { frame: self }
+    /// appropriate pin/latch/eviction protocol for the duration `'a`.
+    pub unsafe fn read_ref<'a>(self) -> BufferFrameReadRef<'a> {
+        BufferFrameReadRef {
+            frame: self,
+            _marker: std::marker::PhantomData,
+        }
     }
 
     /// # Safety
     /// The caller must ensure the frame is live and protected for mutation by
-    /// an exclusive latch or equivalent eviction-time ownership.
-    pub unsafe fn write_ref(self) -> BufferFrameWriteRef {
-        BufferFrameWriteRef { frame: self }
+    /// an exclusive latch or equivalent eviction-time ownership for the
+    /// duration `'a`.
+    pub unsafe fn write_ref<'a>(self) -> BufferFrameWriteRef<'a> {
+        BufferFrameWriteRef {
+            frame: self,
+            _marker: std::marker::PhantomData,
+        }
     }
 }
 
-impl BufferFrameReadRef {
+impl<'a> BufferFrameReadRef<'a> {
     pub fn frame(self) -> BufferFrameRef {
         self.frame
     }
 
-    pub fn page(self) -> &'static [u8; PAGE_SIZE] {
+    pub fn page(self) -> &'a [u8; PAGE_SIZE] {
+        // SAFETY: caller of read_ref asserted the frame is pinned/protected
+        // for 'a. The page bytes are stable while the frame is resident.
         unsafe { &self.frame.ptr.as_ref().page }
     }
 
@@ -264,20 +278,24 @@ impl BufferFrameReadRef {
     }
 }
 
-impl BufferFrameWriteRef {
+impl<'a> BufferFrameWriteRef<'a> {
     pub fn frame(self) -> BufferFrameRef {
         self.frame
     }
 
-    pub fn read_ref(self) -> BufferFrameReadRef {
-        BufferFrameReadRef { frame: self.frame }
+    pub fn read_ref(self) -> BufferFrameReadRef<'a> {
+        BufferFrameReadRef {
+            frame: self.frame,
+            _marker: std::marker::PhantomData,
+        }
     }
 
-    pub fn page(self) -> &'static [u8; PAGE_SIZE] {
+    pub fn page(self) -> &'a [u8; PAGE_SIZE] {
         self.read_ref().page()
     }
 
-    pub fn page_mut(self) -> &'static mut [u8; PAGE_SIZE] {
+    pub fn page_mut(self) -> &'a mut [u8; PAGE_SIZE] {
+        // SAFETY: caller of write_ref asserted exclusive access for 'a.
         unsafe { &mut (*self.frame.as_ptr()).page }
     }
 
@@ -356,7 +374,7 @@ pub trait ParentFinder: Send + Sync {
 /// outside the buffer pool, such as watermark-driven delta pruning on
 /// table-owned delta pages.
 pub trait PageReclaimer: Send + Sync {
-    fn try_reclaim_before_evict(&self, page_pid: u64, page: BufferFrameWriteRef);
+    fn try_reclaim_before_evict(&self, page_pid: u64, page: BufferFrameWriteRef<'_>);
 }
 
 /// Callback trait for converting resident-only page bytes in a writeback copy.

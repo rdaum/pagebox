@@ -2465,10 +2465,10 @@ impl BTree {
         }
     }
 
-    fn try_read_optimistic_leaf<T>(
-        &self,
+    fn try_read_optimistic_leaf<'l, T>(
+        &'l self,
         key: &[u8],
-        read: impl FnOnce(&OptimisticNode<'_, Leaf>, u16, bool) -> Result<Option<T>, Restart>,
+        read: impl FnOnce(&OptimisticNode<'l, Leaf>, u16, bool) -> Result<Option<T>, Restart>,
     ) -> Result<Option<T>, Restart> {
         let leaf = unsafe { self.find_leaf_optimistic(key) }?;
         let Some((pos, exact)) = leaf.try_lower_bound(key) else {

@@ -29,7 +29,7 @@ const UNDERFULL_THRESHOLD: usize = (PAGE_SIZE * 60) / 100;
 pub(crate) struct BTreeNode;
 
 impl BTreeNode {
-    pub(crate) fn init(bf: BufferFrameWriteRef, is_leaf: bool) {
+    pub(crate) fn init(bf: BufferFrameWriteRef<'_>, is_leaf: bool) {
         let page = bf.page_mut();
         let sp = SlottedPage::init(page);
         if is_leaf {
@@ -47,40 +47,40 @@ impl BTreeNode {
         page[RIGHT_SIBLING_OFFSET..RIGHT_SIBLING_OFFSET + 8].fill(0);
     }
 
-    pub(crate) fn is_leaf(bf: BufferFrameReadRef) -> bool {
+    pub(crate) fn is_leaf(bf: BufferFrameReadRef<'_>) -> bool {
         Self::sp(bf).has_custom_flag(FLAG_IS_LEAF)
     }
 
-    pub(crate) fn sp(bf: BufferFrameReadRef) -> &'static SlottedPage {
+    pub(crate) fn sp<'a>(bf: BufferFrameReadRef<'a>) -> &'a SlottedPage {
         SlottedPage::from_page(bf.page())
     }
 
-    pub(crate) fn sp_mut(bf: BufferFrameWriteRef) -> &'static mut SlottedPage {
+    pub(crate) fn sp_mut<'a>(bf: BufferFrameWriteRef<'a>) -> &'a mut SlottedPage {
         SlottedPage::from_page_mut(bf.page_mut())
     }
 
-    pub(crate) fn set_upper(bf: BufferFrameWriteRef, swip: Swip) {
+    pub(crate) fn set_upper(bf: BufferFrameWriteRef<'_>, swip: Swip) {
         let page = bf.page_mut();
         page[UPPER_OFFSET..].copy_from_slice(&swip.raw().to_ne_bytes());
     }
 
-    pub(crate) fn upper_swip(bf: BufferFrameReadRef) -> Swip {
+    pub(crate) fn upper_swip(bf: BufferFrameReadRef<'_>) -> Swip {
         let page = bf.page();
         let raw = u64::from_ne_bytes(page[UPPER_OFFSET..].try_into().unwrap());
         Swip::from_raw(raw)
     }
 
-    pub(crate) fn set_leaf_right_pid(bf: BufferFrameWriteRef, pid: u64) {
+    pub(crate) fn set_leaf_right_pid(bf: BufferFrameWriteRef<'_>, pid: u64) {
         let page = bf.page_mut();
         page[RIGHT_SIBLING_OFFSET..RIGHT_SIBLING_OFFSET + 8].copy_from_slice(&pid.to_ne_bytes());
     }
 
-    pub(crate) fn set_leaf_left_pid(bf: BufferFrameWriteRef, pid: u64) {
+    pub(crate) fn set_leaf_left_pid(bf: BufferFrameWriteRef<'_>, pid: u64) {
         let page = bf.page_mut();
         page[LEFT_SIBLING_OFFSET..LEFT_SIBLING_OFFSET + 8].copy_from_slice(&pid.to_ne_bytes());
     }
 
-    pub(crate) fn leaf_right_pid(bf: BufferFrameReadRef) -> u64 {
+    pub(crate) fn leaf_right_pid(bf: BufferFrameReadRef<'_>) -> u64 {
         let page = bf.page();
         u64::from_ne_bytes(
             page[RIGHT_SIBLING_OFFSET..RIGHT_SIBLING_OFFSET + 8]
@@ -89,7 +89,7 @@ impl BTreeNode {
         )
     }
 
-    pub(crate) fn leaf_left_pid(bf: BufferFrameReadRef) -> u64 {
+    pub(crate) fn leaf_left_pid(bf: BufferFrameReadRef<'_>) -> u64 {
         let page = bf.page();
         u64::from_ne_bytes(
             page[LEFT_SIBLING_OFFSET..LEFT_SIBLING_OFFSET + 8]
@@ -99,7 +99,7 @@ impl BTreeNode {
     }
 
     #[cfg(test)]
-    pub(crate) fn lookup_inner_swip(bf: BufferFrameReadRef, key: &[u8]) -> Swip {
+    pub(crate) fn lookup_inner_swip(bf: BufferFrameReadRef<'_>, key: &[u8]) -> Swip {
         let sp = Self::sp(bf);
         let (pos, _) = sp.lower_bound(key);
         if pos == sp.num_slots() {
@@ -110,35 +110,40 @@ impl BTreeNode {
         }
     }
 
-    pub(crate) fn child_swip_at(bf: BufferFrameReadRef, pos: u16) -> Swip {
+    pub(crate) fn child_swip_at(bf: BufferFrameReadRef<'_>, pos: u16) -> Swip {
         let sp = Self::sp(bf);
         let val = sp.get_value(pos);
         Swip::from_raw(u64::from_ne_bytes(val[..8].try_into().unwrap()))
     }
 
-    pub(crate) fn insert_inner_at(bf: BufferFrameWriteRef, pos: u16, key: &[u8], child_swip: Swip) {
+    pub(crate) fn insert_inner_at(
+        bf: BufferFrameWriteRef<'_>,
+        pos: u16,
+        key: &[u8],
+        child_swip: Swip,
+    ) {
         let sp = Self::sp_mut(bf);
         sp.insert(pos, key, &child_swip.raw().to_ne_bytes());
     }
 
-    pub(crate) fn set_child_swip_at(bf: BufferFrameWriteRef, pos: u16, child_swip: Swip) {
+    pub(crate) fn set_child_swip_at(bf: BufferFrameWriteRef<'_>, pos: u16, child_swip: Swip) {
         let sp = Self::sp_mut(bf);
         let ok = sp.update_value_if_same_length(pos, &child_swip.raw().to_ne_bytes());
         debug_assert!(ok, "child swip value must remain 8 bytes");
     }
 
-    pub(crate) fn replace_inner_key(bf: BufferFrameWriteRef, pos: u16, key: &[u8]) {
+    pub(crate) fn replace_inner_key(bf: BufferFrameWriteRef<'_>, pos: u16, key: &[u8]) {
         let child_swip = Self::child_swip_at(bf.read_ref(), pos);
         let sp = Self::sp_mut(bf);
         sp.remove(pos);
         sp.insert(pos, key, &child_swip.raw().to_ne_bytes());
     }
 
-    pub(crate) fn can_insert_inner(bf: BufferFrameReadRef, key_len: usize) -> bool {
+    pub(crate) fn can_insert_inner(bf: BufferFrameReadRef<'_>, key_len: usize) -> bool {
         Self::sp(bf).can_insert(key_len, 8)
     }
 
-    pub(crate) fn is_underfull(bf: BufferFrameReadRef) -> bool {
+    pub(crate) fn is_underfull(bf: BufferFrameReadRef<'_>) -> bool {
         Self::sp(bf).free_space_after_compaction() > UNDERFULL_THRESHOLD
     }
 }
@@ -233,11 +238,11 @@ impl ResidentFrame {
         unsafe { self.bf.optimistic_guard() }
     }
 
-    fn read_ref(self) -> BufferFrameReadRef {
+    fn read_ref<'a>(self) -> BufferFrameReadRef<'a> {
         unsafe { self.bf.read_ref() }
     }
 
-    fn write_ref(self) -> BufferFrameWriteRef {
+    fn write_ref<'a>(self) -> BufferFrameWriteRef<'a> {
         unsafe { self.bf.write_ref() }
     }
 
@@ -261,11 +266,11 @@ impl ResidentFrame {
         BTreeNode::is_leaf(self.read_ref())
     }
 
-    pub(crate) fn sp(self) -> &'static SlottedPage {
+    pub(crate) fn sp<'a>(self) -> &'a SlottedPage {
         BTreeNode::sp(self.read_ref())
     }
 
-    pub(crate) fn sp_mut(self) -> &'static mut SlottedPage {
+    pub(crate) fn sp_mut<'a>(self) -> &'a mut SlottedPage {
         BTreeNode::sp_mut(self.write_ref())
     }
 
@@ -281,19 +286,19 @@ impl ResidentFrame {
         self.sp().try_lower_bound(key)
     }
 
-    pub(crate) fn get_key(self, pos: u16) -> &'static [u8] {
+    pub(crate) fn get_key<'a>(self, pos: u16) -> &'a [u8] {
         self.sp().get_key(pos)
     }
 
-    pub(crate) fn try_get_key(self, pos: u16) -> Option<&'static [u8]> {
+    pub(crate) fn try_get_key<'a>(self, pos: u16) -> Option<&'a [u8]> {
         self.sp().try_get_key(pos)
     }
 
-    pub(crate) fn get_value(self, pos: u16) -> &'static [u8] {
+    pub(crate) fn get_value<'a>(self, pos: u16) -> &'a [u8] {
         self.sp().get_value(pos)
     }
 
-    pub(crate) fn try_get_value(self, pos: u16) -> Option<&'static [u8]> {
+    pub(crate) fn try_get_value<'a>(self, pos: u16) -> Option<&'a [u8]> {
         self.sp().try_get_value(pos)
     }
 
@@ -508,7 +513,7 @@ impl<'a> OptimisticNode<'a, Leaf> {
         self.resident_frame().try_lower_bound(key)
     }
 
-    pub(crate) fn try_value_at(&self, pos: u16) -> Option<&'static [u8]> {
+    pub(crate) fn try_value_at(&self, pos: u16) -> Option<&'a [u8]> {
         self.resident_frame().try_get_value(pos)
     }
 
@@ -623,19 +628,19 @@ impl<'a> SharedNode<'a, Leaf> {
         self.resident_frame().num_slots()
     }
 
-    pub(crate) fn key_at(&self, pos: u16) -> &'static [u8] {
+    pub(crate) fn key_at(&self, pos: u16) -> &'a [u8] {
         self.resident_frame().get_key(pos)
     }
 
-    pub(crate) fn try_key_at(&self, pos: u16) -> Option<&'static [u8]> {
+    pub(crate) fn try_key_at(&self, pos: u16) -> Option<&'a [u8]> {
         self.resident_frame().try_get_key(pos)
     }
 
-    pub(crate) fn value_at(&self, pos: u16) -> &'static [u8] {
+    pub(crate) fn value_at(&self, pos: u16) -> &'a [u8] {
         self.resident_frame().get_value(pos)
     }
 
-    pub(crate) fn try_value_at(&self, pos: u16) -> Option<&'static [u8]> {
+    pub(crate) fn try_value_at(&self, pos: u16) -> Option<&'a [u8]> {
         self.resident_frame().try_get_value(pos)
     }
 
@@ -695,11 +700,11 @@ impl<'a> ExclusiveNode<'a, Leaf> {
         self.resident_frame().lower_bound(key)
     }
 
-    pub(crate) fn key_at(&self, pos: u16) -> &'static [u8] {
+    pub(crate) fn key_at(&self, pos: u16) -> &'a [u8] {
         self.resident_frame().get_key(pos)
     }
 
-    pub(crate) fn value_at(&self, pos: u16) -> &'static [u8] {
+    pub(crate) fn value_at(&self, pos: u16) -> &'a [u8] {
         self.resident_frame().get_value(pos)
     }
 
@@ -804,7 +809,7 @@ impl<'a> ExclusiveNode<'a, Inner> {
         child.matches_swip(self.child_edge_swip(edge))
     }
 
-    pub(crate) fn key_at(&self, pos: u16) -> &'static [u8] {
+    pub(crate) fn key_at(&self, pos: u16) -> &'a [u8] {
         self.resident_frame().sp().get_key(pos)
     }
 
