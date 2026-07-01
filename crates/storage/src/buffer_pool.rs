@@ -896,6 +896,53 @@ fn parse_eviction_policy(value: &str) -> Option<EvictionPolicy> {
     None
 }
 
+/// Exponential backoff for `pop_free_frame` contention.
+///
+/// Starts with `yield_now` ( cooperative scheduling hint, ~0us), then
+/// doubles the sleep duration on each failed attempt: 1us, 2us, 4us, ...
+/// capped at 1ms. Resets to yield when progress is made. This lets
+/// latch-holding threads release their latches and run, instead of
+/// burning CPU in a tight spin loop.
+struct Backoff {
+    attempt: u32,
+    sleep_us: u64,
+}
+
+impl Backoff {
+    fn new() -> Self {
+        Self {
+            attempt: 0,
+            sleep_us: 0,
+        }
+    }
+
+    fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    fn reset(&mut self) {
+        self.attempt = 0;
+        self.sleep_us = 0;
+    }
+
+    fn snooze(&mut self) {
+        self.attempt += 1;
+        if self.sleep_us == 0 {
+            #[cfg(not(loom))]
+            std::thread::yield_now();
+            #[cfg(loom)]
+            loom::thread::yield_now();
+            self.sleep_us = 1;
+        } else {
+            #[cfg(not(loom))]
+            std::thread::sleep(std::time::Duration::from_micros(self.sleep_us));
+            #[cfg(loom)]
+            loom::thread::yield_now();
+            self.sleep_us = (self.sleep_us * 2).min(1000);
+        }
+    }
+}
+
 fn eviction_policy() -> EvictionPolicy {
     static VALUE: OnceLock<EvictionPolicy> = OnceLock::new();
     *VALUE.get_or_init(|| {
@@ -2566,23 +2613,38 @@ impl BufferPool {
     /// Pop a free frame from the FreeList. If empty, evicts to replenish.
     /// Panics if all frames are pinned (pool exhausted).
     fn pop_free_frame(&self) -> *mut BufferFrame {
-        let mut idle = 0u32;
+        let mut backoff = Backoff::new();
         loop {
             if let Some(bf) = self.state.free_list.try_pop() {
                 return bf;
             }
-            if self.try_evict_any_policy(1) > 0 || self.try_evict_any_batch(1) > 0 {
-                idle = 0;
+
+            // Backpressure: if all eviction permits are taken, other
+            // threads are already evicting. Wait for them to complete
+            // rather than competing for the same frames.
+            let in_flight = self.eviction_in_flight.load(Ordering::Acquire);
+            if in_flight >= self.eviction_budget {
+                backoff.snooze();
+                continue;
+            }
+
+            let evicted = self.try_evict_any_policy(1) > 0 || self.try_evict_any_batch(1) > 0;
+            if evicted {
+                backoff.reset();
             } else {
-                idle += 1;
+                // No frame was evictable — all are referenced, pinned,
+                // or latched. Back off to let latch-holders release.
+                if backoff.attempt() >= 16
+                    && let Ok(flushed) = self.try_flush_dirty_batch(64)
+                    && flushed > 0
+                {
+                    backoff.reset();
+                } else {
+                    backoff.snooze();
+                }
             }
-            if idle >= 16
-                && let Ok(flushed) = self.try_flush_dirty_batch(64)
-                && flushed > 0
-            {
-                idle = 0;
-            }
-            if idle >= 1024 {
+
+            if backoff.attempt() >= 8192 {
                 self.panic_pool_exhausted();
             }
         }
