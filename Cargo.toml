@@ -7,7 +7,6 @@ members = [
     "crates/wal",
     "crates/storage",
     "crates/btree",
-    "crates/betree",
     "crates/kvstore",
     "crates/kvbench",
 ]
@@ -19,7 +18,6 @@ default-members = [
     "crates/wal",
     "crates/storage",
     "crates/btree",
-    "crates/betree",
     "crates/kvstore",
 ]
 resolver = "3"
@@ -37,7 +35,6 @@ pagebox-threading = { path = "crates/threading" }
 pagebox-wal = { path = "crates/wal" }
 pagebox-storage = { path = "crates/storage" }
 pagebox-btree = { path = "crates/btree" }
-pagebox-betree = { path = "crates/betree" }
 
 # External dependencies shared across substrate crates.
 crc-fast = "1"

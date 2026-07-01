@@ -14,7 +14,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SPECS_DIR="$SCRIPT_DIR/specs"
 RESULTS_DIR="$SCRIPT_DIR/bench-results"
-ENGINES=(kvstore betree betree-nw fjall redb sled)
+ENGINES=(kvstore fjall redb sled)
 
 # Check for --keep flag.
 KEEP_RESULTS=false
