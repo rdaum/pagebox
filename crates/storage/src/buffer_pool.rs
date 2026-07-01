@@ -1457,11 +1457,11 @@ fn try_claim_prefetch_frame(
     }
 
     unsafe {
-        (*bf)
-            .header
-            .core
-            .state
-            .store(FrameState::Loading, Ordering::Relaxed);
+        (*bf).header.core.state.transition(
+            FrameState::Free,
+            FrameState::Loading,
+            Ordering::Relaxed,
+        );
         (*bf).header.core.pid = pid;
         (*bf).header.core.pin_count.store(0, Ordering::Relaxed);
         (*bf).header.core.dirty.store(false, Ordering::Relaxed);
@@ -1496,11 +1496,11 @@ fn finish_prefetch_frame(
             (*bf).header.core.dirty.store(false, Ordering::Relaxed);
             (*bf).header.core.pin_count.store(0, Ordering::Relaxed);
             (*bf).header.parent_link = ParentLink::None;
-            (*bf)
-                .header
-                .core
-                .state
-                .store(FrameState::Resident, Ordering::Release);
+            (*bf).header.core.state.transition(
+                FrameState::Loading,
+                FrameState::Resident,
+                Ordering::Release,
+            );
         }
         loading.disarm();
     }
@@ -2934,11 +2934,11 @@ impl BufferPool {
         }
         unsafe {
             (*bf).header.core.referenced.store(true, Ordering::Relaxed);
-            (*bf)
-                .header
-                .core
-                .state
-                .store(FrameState::Resident, Ordering::Release);
+            (*bf).header.core.state.transition(
+                FrameState::Loading,
+                FrameState::Resident,
+                Ordering::Release,
+            );
         }
         true
     }
@@ -3185,11 +3185,11 @@ impl BufferPool {
             (*bf).header.core.pid = page_id;
             (*bf).header.parent_link = ParentLink::None;
             (*bf).header.core.referenced.store(true, Ordering::Relaxed);
-            (*bf)
-                .header
-                .core
-                .state
-                .store(FrameState::Loading, Ordering::Release);
+            (*bf).header.core.state.transition(
+                FrameState::Free,
+                FrameState::Loading,
+                Ordering::Release,
+            );
         }
         LoadingFrameReservation::new(self, bf)
     }
@@ -3376,11 +3376,11 @@ impl BufferPool {
                 .core
                 .wal_buffer_offset
                 .store(0, Ordering::Relaxed);
-            (*bf)
-                .header
-                .core
-                .state
-                .store(FrameState::Resident, Ordering::Relaxed);
+            (*bf).header.core.state.transition(
+                FrameState::Free,
+                FrameState::Resident,
+                Ordering::Relaxed,
+            );
         }
         // Register in page_table for orphan-fix lookups.
         self.page_table.insert(pid, bf);
@@ -3523,11 +3523,11 @@ impl BufferPool {
             unsafe {
                 (*bf).header.core.pid = page_id;
                 (*bf).header.core.referenced.store(true, Ordering::Relaxed);
-                (*bf)
-                    .header
-                    .core
-                    .state
-                    .store(FrameState::Loading, Ordering::Relaxed);
+                (*bf).header.core.state.transition(
+                    FrameState::Free,
+                    FrameState::Loading,
+                    Ordering::Relaxed,
+                );
             }
             let loading = LoadingFrameReservation::new(self, bf);
 
@@ -3561,11 +3561,11 @@ impl BufferPool {
                 continue;
             };
             unsafe {
-                (*bf)
-                    .header
-                    .core
-                    .state
-                    .store(FrameState::Resident, Ordering::Relaxed);
+                (*bf).header.core.state.transition(
+                    FrameState::Loading,
+                    FrameState::Resident,
+                    Ordering::Relaxed,
+                );
             }
             loading.disarm();
             return bf;
@@ -3751,11 +3751,11 @@ impl BufferPool {
 
             unsafe {
                 self.install_loaded_frame_metadata(bf, page_id, ParentLink::None, 1);
-                (*bf)
-                    .header
-                    .core
-                    .state
-                    .store(FrameState::Resident, Ordering::Release);
+                (*bf).header.core.state.transition(
+                    FrameState::Evicting,
+                    FrameState::Resident,
+                    Ordering::Release,
+                );
             }
             loading.disarm();
             return bf;
@@ -3879,11 +3879,11 @@ impl BufferPool {
 
         unsafe {
             self.install_loaded_frame_metadata(bf, page_id, ParentLink::None, 1);
-            (*bf)
-                .header
-                .core
-                .state
-                .store(FrameState::Resident, Ordering::Release);
+            (*bf).header.core.state.transition(
+                FrameState::Evicting,
+                FrameState::Resident,
+                Ordering::Release,
+            );
         }
         loading.disarm();
         Some(bf)
@@ -4240,7 +4240,7 @@ impl BufferPool {
         let _permit = self.try_acquire_eviction_permit()?;
 
         let Ok(_) = (unsafe {
-            (*bf).header.core.state.compare_exchange(
+            (*bf).header.core.state.compare_exchange_transition(
                 FrameState::Resident,
                 FrameState::Evicting,
                 Ordering::Relaxed,
@@ -4591,7 +4591,7 @@ impl BufferPool {
             let permit = pool.try_acquire_eviction_permit()?;
 
             let Ok(_) = (unsafe {
-                (*bf).header.core.state.compare_exchange(
+                (*bf).header.core.state.compare_exchange_transition(
                     FrameState::Resident,
                     FrameState::Evicting,
                     Ordering::Relaxed,
@@ -4769,11 +4769,11 @@ impl BufferPool {
     #[cfg(not(miri))]
     fn revert_frame_to_resident(bf: *mut BufferFrame) {
         unsafe {
-            (*bf)
-                .header
-                .core
-                .state
-                .store(FrameState::Resident, Ordering::Relaxed);
+            (*bf).header.core.state.transition(
+                FrameState::Evicting,
+                FrameState::Resident,
+                Ordering::Relaxed,
+            );
         }
     }
 
@@ -4829,11 +4829,11 @@ impl BufferPool {
         self.page_table.remove(pid);
         unsafe {
             (*bf).header.parent_link = ParentLink::None;
-            (*bf)
-                .header
-                .core
-                .state
-                .store(FrameState::Free, Ordering::Relaxed);
+            (*bf).header.core.state.transition(
+                FrameState::Evicting,
+                FrameState::Free,
+                Ordering::Relaxed,
+            );
         }
 
         self.metrics
@@ -5426,11 +5426,11 @@ mod tests {
             assert!(swip.load(Ordering::Acquire).is_hot());
             {
                 let _guard = (*raw).latch.lock_exclusive();
-                (*raw)
-                    .header
-                    .core
-                    .state
-                    .store(FrameState::Evicting, Ordering::Release);
+                (*raw).header.core.state.transition(
+                    FrameState::Resident,
+                    FrameState::Evicting,
+                    Ordering::Release,
+                );
                 (*raw).header.core.pin_count.store(0, Ordering::Relaxed);
                 (*raw)
                     .header
@@ -5937,11 +5937,11 @@ mod tests {
 
         unsafe {
             let _guard = (*raw).latch.lock_exclusive();
-            (*raw)
-                .header
-                .core
-                .state
-                .store(FrameState::Evicting, Ordering::Relaxed);
+            (*raw).header.core.state.transition(
+                FrameState::Resident,
+                FrameState::Evicting,
+                Ordering::Relaxed,
+            );
             (*raw).header.core.pin_count.store(0, Ordering::Relaxed);
         }
 
@@ -5951,11 +5951,11 @@ mod tests {
             let bf = bf_addr as *mut BufferFrame;
             unsafe {
                 let _guard = (*bf).latch.lock_exclusive();
-                (*bf)
-                    .header
-                    .core
-                    .state
-                    .store(FrameState::Resident, Ordering::Release);
+                (*bf).header.core.state.transition(
+                    FrameState::Evicting,
+                    FrameState::Resident,
+                    Ordering::Release,
+                );
                 (*bf).header.core.referenced.store(false, Ordering::Relaxed);
                 (*bf).header.core.pin_count.store(0, Ordering::Relaxed);
             }
