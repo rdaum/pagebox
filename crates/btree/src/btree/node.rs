@@ -3,8 +3,7 @@ use std::marker::PhantomData;
 use pagebox_hybrid_latch::{OptimisticGuard, Restart};
 
 use pagebox_storage::buffer_frame::{
-    BufferFrameReadRef, BufferFrameRef, BufferFrameWriteRef, FrameState, PAGE_SIZE, ParentLink,
-    StableSwipRef,
+    BufferFrameReadRef, BufferFrameRef, BufferFrameWriteRef, PAGE_SIZE, ParentLink, StableSwipRef,
 };
 use pagebox_storage::buffer_pool::{
     BufferPool, ExclusiveFrame, OptimisticFrame, PinnedFrame, SharedFrame,
@@ -188,189 +187,217 @@ impl RoutedChild {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct ResidentFrame {
+/// A reference to a resident frame, bound to the guard that makes it valid.
+///
+/// The lifetime `'g` is tied to the guard (OptimisticFrame, SharedFrame, or
+/// ExclusiveFrame) that was held when this reference was created. Page-byte
+/// accessors return `&'g` borrows, so the borrow checker enforces that page
+/// bytes are only accessed while the guard is alive.
+///
+/// Identity operations (`pid`, `hot_swip`, `same_frame`, `is_in_pool`,
+/// `state`) do not access page bytes and could in principle be unsound, but
+/// they are kept on this type so callers do not need to separately hold a
+/// `BufferFrameRef`. The `'g` lifetime is still required so the type cannot
+/// outlive the guard.
+pub(crate) struct ResidentFrame<'g> {
     bf: BufferFrameRef,
+    _marker: PhantomData<&'g ()>,
 }
 
-impl ResidentFrame {
+impl<'g> ResidentFrame<'g> {
     pub(crate) fn new(bf: BufferFrameRef) -> Self {
-        Self { bf }
-    }
-
-    pub(crate) fn from_hot_swip(swip: Swip) -> Option<Self> {
-        BufferFrameRef::from_hot_swip(swip).map(|bf| Self { bf })
-    }
-
-    pub(crate) fn from_pinned(frame: &PinnedFrame<'_>) -> Self {
         Self {
-            bf: frame.frame_ref(),
+            bf,
+            _marker: PhantomData,
         }
     }
 
-    pub(crate) fn from_optimistic(frame: &OptimisticFrame<'_>) -> Self {
+    /// # Safety
+    /// The caller must ensure the frame is pinned or otherwise protected from
+    /// eviction for the lifetime `'g`.
+    pub(crate) unsafe fn from_hot_swip(swip: Swip) -> Option<Self> {
+        BufferFrameRef::from_hot_swip(swip).map(|bf| Self {
+            bf,
+            _marker: PhantomData,
+        })
+    }
+
+    pub(crate) fn from_pinned(frame: &PinnedFrame<'g>) -> Self {
         Self {
             bf: frame.frame_ref(),
+            _marker: PhantomData,
         }
     }
 
-    pub(crate) fn from_shared(frame: &SharedFrame<'_>) -> Self {
+    pub(crate) fn from_optimistic(frame: &OptimisticFrame<'g>) -> Self {
         Self {
             bf: frame.frame_ref(),
+            _marker: PhantomData,
         }
     }
 
-    pub(crate) fn from_exclusive(frame: &ExclusiveFrame<'_>) -> Self {
+    pub(crate) fn from_shared(frame: &SharedFrame<'g>) -> Self {
         Self {
             bf: frame.frame_ref(),
+            _marker: PhantomData,
         }
     }
 
-    pub(crate) fn same_frame(self, other: ResidentFrame) -> bool {
+    pub(crate) fn from_exclusive(frame: &ExclusiveFrame<'g>) -> Self {
+        Self {
+            bf: frame.frame_ref(),
+            _marker: PhantomData,
+        }
+    }
+
+    pub(crate) fn same_frame(&self, other: &ResidentFrame<'_>) -> bool {
         self.bf.same_frame(other.bf)
     }
 
-    pub(crate) fn is_in_pool(self, pool: &BufferPool) -> bool {
+    pub(crate) fn is_in_pool(&self, pool: &BufferPool) -> bool {
         pool.contains_frame(self.bf)
     }
 
-    pub(crate) fn optimistic_guard<'a>(self) -> Result<OptimisticGuard<'a>, Restart> {
+    /// Return the underlying identity handle. Does not access page bytes.
+    pub(crate) fn bf(&self) -> BufferFrameRef {
+        self.bf
+    }
+
+    /// # Safety
+    /// The caller must ensure the frame remains live while the guard is used.
+    pub(crate) unsafe fn optimistic_guard(&self) -> Result<OptimisticGuard<'g>, Restart> {
         unsafe { self.bf.optimistic_guard() }
     }
 
-    fn read_ref<'a>(self) -> BufferFrameReadRef<'a> {
+    fn read_ref(&self) -> BufferFrameReadRef<'g> {
         unsafe { self.bf.read_ref() }
     }
 
-    fn write_ref<'a>(self) -> BufferFrameWriteRef<'a> {
+    fn write_ref(&self) -> BufferFrameWriteRef<'g> {
         unsafe { self.bf.write_ref() }
     }
 
-    pub(crate) fn pid(self) -> u64 {
+    pub(crate) fn pid(&self) -> u64 {
         self.bf.pid()
     }
 
-    pub(crate) fn state(self) -> FrameState {
-        self.bf.state()
-    }
-
-    pub(crate) fn init(self, is_leaf: bool) {
+    pub(crate) fn init(&self, is_leaf: bool) {
         BTreeNode::init(self.write_ref(), is_leaf)
     }
 
-    pub(crate) fn hot_swip(self) -> Swip {
+    pub(crate) fn hot_swip(&self) -> Swip {
         self.bf.hot_swip()
     }
 
-    pub(crate) fn is_leaf(self) -> bool {
+    pub(crate) fn is_leaf(&self) -> bool {
         BTreeNode::is_leaf(self.read_ref())
     }
 
-    pub(crate) fn sp<'a>(self) -> &'a SlottedPage {
+    pub(crate) fn sp(&self) -> &'g SlottedPage {
         BTreeNode::sp(self.read_ref())
     }
 
-    pub(crate) fn sp_mut<'a>(self) -> &'a mut SlottedPage {
+    pub(crate) fn sp_mut(&self) -> &'g mut SlottedPage {
         BTreeNode::sp_mut(self.write_ref())
     }
 
-    pub(crate) fn num_slots(self) -> u16 {
+    pub(crate) fn num_slots(&self) -> u16 {
         self.sp().num_slots()
     }
 
-    pub(crate) fn lower_bound(self, key: &[u8]) -> (u16, bool) {
+    pub(crate) fn lower_bound(&self, key: &[u8]) -> (u16, bool) {
         self.sp().lower_bound(key)
     }
 
-    pub(crate) fn try_lower_bound(self, key: &[u8]) -> Option<(u16, bool)> {
+    pub(crate) fn try_lower_bound(&self, key: &[u8]) -> Option<(u16, bool)> {
         self.sp().try_lower_bound(key)
     }
 
-    pub(crate) fn get_key<'a>(self, pos: u16) -> &'a [u8] {
+    pub(crate) fn get_key(&self, pos: u16) -> &'g [u8] {
         self.sp().get_key(pos)
     }
 
-    pub(crate) fn try_get_key<'a>(self, pos: u16) -> Option<&'a [u8]> {
+    pub(crate) fn try_get_key(&self, pos: u16) -> Option<&'g [u8]> {
         self.sp().try_get_key(pos)
     }
 
-    pub(crate) fn get_value<'a>(self, pos: u16) -> &'a [u8] {
+    pub(crate) fn get_value(&self, pos: u16) -> &'g [u8] {
         self.sp().get_value(pos)
     }
 
-    pub(crate) fn try_get_value<'a>(self, pos: u16) -> Option<&'a [u8]> {
+    pub(crate) fn try_get_value(&self, pos: u16) -> Option<&'g [u8]> {
         self.sp().try_get_value(pos)
     }
 
-    pub(crate) fn can_insert(self, key_len: usize, value_len: usize) -> bool {
+    pub(crate) fn can_insert(&self, key_len: usize, value_len: usize) -> bool {
         self.sp().can_insert(key_len, value_len)
     }
 
-    pub(crate) fn insert(self, pos: u16, key: &[u8], value: &[u8]) {
+    pub(crate) fn insert(&self, pos: u16, key: &[u8], value: &[u8]) {
         self.sp_mut().insert(pos, key, value);
     }
 
-    pub(crate) fn remove_slot(self, pos: u16) {
+    pub(crate) fn remove_slot(&self, pos: u16) {
         self.sp_mut().remove(pos);
     }
 
-    pub(crate) fn update_value_if_same_length(self, pos: u16, value: &[u8]) -> bool {
+    pub(crate) fn update_value_if_same_length(&self, pos: u16, value: &[u8]) -> bool {
         self.sp_mut().update_value_if_same_length(pos, value)
     }
 
-    pub(crate) fn free_space_after_compaction(self) -> usize {
+    pub(crate) fn free_space_after_compaction(&self) -> usize {
         self.sp().free_space_after_compaction()
     }
 
-    pub(crate) fn leaf_right_pid(self) -> u64 {
+    pub(crate) fn leaf_right_pid(&self) -> u64 {
         BTreeNode::leaf_right_pid(self.read_ref())
     }
 
-    pub(crate) fn leaf_left_pid(self) -> u64 {
+    pub(crate) fn leaf_left_pid(&self) -> u64 {
         BTreeNode::leaf_left_pid(self.read_ref())
     }
 
-    pub(crate) fn set_leaf_right_pid(self, pid: u64) {
+    pub(crate) fn set_leaf_right_pid(&self, pid: u64) {
         BTreeNode::set_leaf_right_pid(self.write_ref(), pid)
     }
 
-    pub(crate) fn set_leaf_left_pid(self, pid: u64) {
+    pub(crate) fn set_leaf_left_pid(&self, pid: u64) {
         BTreeNode::set_leaf_left_pid(self.write_ref(), pid)
     }
 
-    pub(crate) fn upper_swip(self) -> Swip {
+    pub(crate) fn upper_swip(&self) -> Swip {
         BTreeNode::upper_swip(self.read_ref())
     }
 
-    pub(crate) fn set_upper(self, swip: Swip) {
+    pub(crate) fn set_upper(&self, swip: Swip) {
         BTreeNode::set_upper(self.write_ref(), swip)
     }
 
-    pub(crate) fn child_swip_at(self, pos: u16) -> Swip {
+    pub(crate) fn child_swip_at(&self, pos: u16) -> Swip {
         BTreeNode::child_swip_at(self.read_ref(), pos)
     }
 
-    pub(crate) fn set_child_swip_at(self, pos: u16, swip: Swip) {
+    pub(crate) fn set_child_swip_at(&self, pos: u16, swip: Swip) {
         BTreeNode::set_child_swip_at(self.write_ref(), pos, swip)
     }
 
-    pub(crate) fn replace_inner_key(self, pos: u16, key: &[u8]) {
+    pub(crate) fn replace_inner_key(&self, pos: u16, key: &[u8]) {
         BTreeNode::replace_inner_key(self.write_ref(), pos, key)
     }
 
-    pub(crate) fn insert_inner_at(self, pos: u16, key: &[u8], child_swip: Swip) {
+    pub(crate) fn insert_inner_at(&self, pos: u16, key: &[u8], child_swip: Swip) {
         BTreeNode::insert_inner_at(self.write_ref(), pos, key, child_swip)
     }
 
-    pub(crate) fn can_insert_inner(self, key_len: usize) -> bool {
+    pub(crate) fn can_insert_inner(&self, key_len: usize) -> bool {
         BTreeNode::can_insert_inner(self.read_ref(), key_len)
     }
 
-    pub(crate) fn is_underfull_inner(self) -> bool {
+    pub(crate) fn is_underfull_inner(&self) -> bool {
         BTreeNode::is_underfull(self.read_ref())
     }
 
-    pub(crate) fn try_route_to_child(self, key: &[u8]) -> Option<RoutedChild> {
+    pub(crate) fn try_route_to_child(&self, key: &[u8]) -> Option<RoutedChild> {
         let sp = self.sp();
         let count = sp.num_slots();
         let (pos, _) = sp.try_lower_bound(key)?;
@@ -389,15 +416,15 @@ impl ResidentFrame {
         Some(RoutedChild::new(swip, edge))
     }
 
-    pub(crate) fn is_empty_leaf(self) -> bool {
+    pub(crate) fn is_empty_leaf(&self) -> bool {
         self.sp().num_slots() == 0
     }
 
-    pub(crate) fn is_underfull(self) -> bool {
+    pub(crate) fn is_underfull(&self) -> bool {
         BTreeNode::is_underfull(self.read_ref())
     }
 
-    pub(crate) fn should_chase_right(self, key: &[u8]) -> bool {
+    pub(crate) fn should_chase_right(&self, key: &[u8]) -> bool {
         let sp = self.sp();
         let right_pid = self.leaf_right_pid();
         if right_pid == 0 {
@@ -413,16 +440,16 @@ impl ResidentFrame {
         }
     }
 
-    pub(crate) fn set_parent_link_none(self) {
+    pub(crate) fn set_parent_link_none(&self) {
         self.write_ref().set_parent_link_none();
     }
 
-    pub(crate) fn set_parent_link_stable(self, meta_swip: StableSwipRef) {
+    pub(crate) fn set_parent_link_stable(&self, meta_swip: StableSwipRef) {
         self.write_ref().set_parent_link_stable(meta_swip);
     }
 
     pub(crate) fn set_parent_link_inner(
-        self,
+        &self,
         parent_pid: u64,
         slot_index: u16,
         is_upper: bool,
@@ -441,32 +468,45 @@ impl ResidentFrame {
             .set_parent_link_inner(parent_pid, slot_index, is_upper, dt_id);
     }
 
-    pub(crate) fn mark_header_dirty(self) {
+    pub(crate) fn mark_header_dirty(&self) {
         self.write_ref().mark_header_dirty();
     }
 
-    pub(crate) fn replace_page(self, page: &[u8; PAGE_SIZE]) {
+    pub(crate) fn replace_page(&self, page: &[u8; PAGE_SIZE]) {
         self.write_ref().page_mut().copy_from_slice(page);
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct ChildRef {
-    frame: ResidentFrame,
+pub(crate) struct ChildRef<'g> {
+    frame: ResidentFrame<'g>,
     pid: u64,
 }
 
-impl ChildRef {
-    pub(crate) fn from_frame(frame: ResidentFrame) -> Self {
+impl<'g> ChildRef<'g> {
+    pub(crate) fn from_frame(frame: &'g ResidentFrame<'g>) -> Self {
+        let pid = frame.pid();
+        // Reconstruct with the same lifetime — ResidentFrame is just
+        // BufferFrameRef + PhantomData, so copying the inner bf is sound.
         Self {
-            frame,
-            pid: frame.pid(),
+            frame: ResidentFrame::new(frame.bf()),
+            pid,
         }
     }
 
-    fn matches_swip(self, swip: Swip) -> bool {
-        (ResidentFrame::from_hot_swip(swip).is_some_and(|frame| frame.same_frame(self.frame)))
-            || (swip.is_evicted() && swip.as_page_id() == self.pid)
+    /// Construct a ChildRef from identity only (no page-byte access needed).
+    /// Used when the child's guard has already been dropped and only the
+    /// frame identity is needed for parent-edge matching.
+    pub(crate) fn from_pid(bf: BufferFrameRef, pid: u64) -> Self {
+        Self {
+            frame: ResidentFrame::new(bf),
+            pid,
+        }
+    }
+
+    fn matches_swip(&self, swip: Swip) -> bool {
+        let matches_hot = unsafe { ResidentFrame::from_hot_swip(swip) }
+            .is_some_and(|frame| frame.same_frame(&self.frame));
+        (matches_hot) || (swip.is_evicted() && swip.as_page_id() == self.pid)
     }
 }
 
@@ -493,7 +533,7 @@ impl<'a> OptimisticNode<'a, Leaf> {
         }
     }
 
-    pub(crate) fn resident_frame(&self) -> ResidentFrame {
+    pub(crate) fn resident_frame(&self) -> ResidentFrame<'a> {
         ResidentFrame::from_optimistic(&self.frame)
     }
 
@@ -542,16 +582,20 @@ impl<'a> OptimisticNode<'a, Inner> {
         }
     }
 
+    pub(crate) fn resident_frame(&self) -> ResidentFrame<'a> {
+        ResidentFrame::from_optimistic(&self.frame)
+    }
+
     pub(crate) fn validate(&self) -> Result<(), Restart> {
         self.frame.validate()
     }
 
     pub(crate) fn route_to_child(&self, key: &[u8]) -> Option<RoutedChild> {
-        ResidentFrame::from_optimistic(&self.frame).try_route_to_child(key)
+        self.resident_frame().try_route_to_child(key)
     }
 
-    pub(crate) fn child_edge_for(&self, child: ChildRef) -> Option<ParentEdge> {
-        let frame = ResidentFrame::from_optimistic(&self.frame);
+    pub(crate) fn child_edge_for(&self, child: ChildRef<'_>) -> Option<ParentEdge> {
+        let frame = self.resident_frame();
         let sp = frame.sp();
         let count = sp.num_slots();
         if count as usize > PAGE_SIZE / 12 {
@@ -576,7 +620,7 @@ impl<'a> OptimisticNode<'a, Inner> {
     }
 
     pub(crate) fn for_each_child_route(&self, mut f: impl FnMut(RoutedChild)) -> Option<()> {
-        let frame = ResidentFrame::from_optimistic(&self.frame);
+        let frame = self.resident_frame();
         let sp = frame.sp();
         let count = sp.num_slots();
         if count as usize > PAGE_SIZE / 12 {
@@ -612,7 +656,7 @@ impl<'a> SharedNode<'a, Leaf> {
         }
     }
 
-    pub(crate) fn resident_frame(&self) -> ResidentFrame {
+    pub(crate) fn resident_frame(&self) -> ResidentFrame<'a> {
         ResidentFrame::from_shared(&self.frame)
     }
 
@@ -651,10 +695,15 @@ impl<'a> SharedNode<'a, Leaf> {
     pub(crate) fn left_pid(&self) -> u64 {
         self.resident_frame().leaf_left_pid()
     }
+
+    pub(crate) fn into_frame(self) -> SharedFrame<'a> {
+        let this = std::mem::ManuallyDrop::new(self);
+        unsafe { std::ptr::read(&this.frame) }
+    }
 }
 
 impl<'a, Kind> ExclusiveNode<'a, Kind> {
-    pub(crate) fn resident_frame(&self) -> ResidentFrame {
+    pub(crate) fn resident_frame(&self) -> ResidentFrame<'a> {
         ResidentFrame::from_exclusive(&self.frame)
     }
 
@@ -761,7 +810,7 @@ impl<'a> ExclusiveNode<'a, Inner> {
         }
     }
 
-    pub(crate) fn child_edge_for(&self, child: ChildRef) -> Option<ParentEdge> {
+    pub(crate) fn child_edge_for(&self, child: ChildRef<'_>) -> Option<ParentEdge> {
         let count = self.num_slots();
         for pos in 0..count {
             if child.matches_swip(self.resident_frame().child_swip_at(pos)) {
@@ -797,7 +846,7 @@ impl<'a> ExclusiveNode<'a, Inner> {
             .map(|route| {
                 let swip = route.swip();
                 if swip.is_hot() || swip.is_cool() {
-                    ResidentFrame::from_hot_swip(swip).unwrap().pid()
+                    unsafe { ResidentFrame::from_hot_swip(swip) }.unwrap().pid()
                 } else {
                     swip.as_page_id()
                 }
@@ -805,7 +854,7 @@ impl<'a> ExclusiveNode<'a, Inner> {
             .collect()
     }
 
-    pub(crate) fn child_edge_matches(&self, edge: ParentEdge, child: ChildRef) -> bool {
+    pub(crate) fn child_edge_matches(&self, edge: ParentEdge, child: ChildRef<'_>) -> bool {
         child.matches_swip(self.child_edge_swip(edge))
     }
 

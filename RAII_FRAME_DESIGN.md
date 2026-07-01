@@ -321,17 +321,60 @@ needed, not optional — Phase 4 is real work, not conditional.
      `cargo clippy --workspace --all-targets` introduces no new warnings;
      `cargo fmt --all` is a no-op.
 
-2. **Phase 2: Replace `ResidentFrame` with `FrameRef<'g>`**
-   - Add lifetime parameter to `ResidentFrame` → `FrameRef<'g>`
-   - Remove `Copy` impl (it must borrow, not copy)
-   - Update all 64 creation sites to borrow from the guard
-   - Update all 20 `set_parent_link_for_routed_child` call sites
-   - Also retype the escape hatches listed above: `ResidentSharedFrame` /
-     `ResidentOptimisticFrame` `page()` returns, `ChildRef`'s inner frame, and
-     the `with_lookup_fallback_leaf` callback signature (`Option<ResidentFrame>`
-     → `Option<FrameRef<'g>>`, threading through `lookup_fallback` /
-     `lookup_with_fallback` / `lookup_fixed_fallback`). If any of these is left
-     as a `Copy`/`'static`-leaking handle, the race survives through that handle.
+2. **Phase 2: Replace `ResidentFrame` with `ResidentFrame<'g>`** — *DONE*
+   - Added lifetime parameter `'g` to `ResidentFrame`; removed `Copy` impl.
+   - `from_pinned` / `from_optimistic` / `from_shared` / `from_exclusive` now
+     take `&Guard<'g>` and return `ResidentFrame<'g>` borrowing the guard's
+     own lifetime `'g` (not the `&self` borrow). Page-byte accessors
+     (`sp`, `get_key`, `num_slots`, `is_leaf`, etc.) return `&'g`.
+   - `from_hot_swip` is now `unsafe` — the caller asserts the frame is
+     protected for `'g`.
+   - All function signatures that took `ResidentFrame` by value now take
+     `&ResidentFrame<'_>`: `set_parent_link_for_routed_child`,
+     `set_parent_link_for_edge`, `set_inner_parent_link`, `set_root_parent_link`,
+     `collapse_empty_root_to_child`, `unlink_merged_*`, `eviction_unswizzle`,
+     `find_parent`, `repair_separators_after_delete`,
+     `refresh_inner_child_parent_links_for_frame`, `collect_evicted_child_pids`.
+   - `ChildRef` now carries a lifetime `'g` and holds a `ResidentFrame<'g>` by
+     value. `from_frame` borrows from a `&'g ResidentFrame<'g>`; `from_pid`
+     constructs from identity-only `BufferFrameRef` + pid (no page-byte access).
+   - `with_lookup_fallback_leaf` callback retyped to
+     `FnOnce(Option<&ResidentFrame<'_>>) -> R`, threaded through `lookup_fallback`,
+     `lookup_with_fallback`, `lookup_fixed_fallback`.
+   - `SplitChild::resident_frame` returns `ResidentFrame<'guard>`.
+   - **Race sites surfaced and fixed:**
+     - `find_leaf_*` functions: `current_frame` previously borrowed from `opt`
+       but `opt` was moved into `OptimisticNode`. Fixed by checking `is_leaf`
+       via `BTreeNode::is_leaf(opt.read_ref())` before moving `opt`, then using
+       `inner.resident_frame()` as `current_frame` in the inner path.
+     - `find_leaf_exclusive_fallback` / `find_leaf_exclusive_with_path_fallback`:
+       `current_frame` was used after `drop(current_shared)`. Fixed by wrapping
+       in `SharedNode` and keeping the guard alive through the inner path.
+     - `find_leaf_shared_fallback`: `current_frame` was used after
+       `drop(current_shared)` in the cold-SWIP path. Fixed by keeping `shared`
+       alive until after `set_parent_link_for_routed_child`.
+     - `repair_separators_after_delete`: `child` was a copied `ResidentFrame`
+       used across loop iterations after the parent guard was dropped. Fixed
+       by using `BufferFrameRef` + pid for identity-only matching across
+       iterations.
+     - `rebalance_delete_path`: `leaf_frame` was created before `leaf.exclusive()`
+       consumed `leaf`. Fixed by extracting `leaf_bf` / `leaf_pid` before
+       consuming `leaf`.
+     - `eviction_unswizzle`: `node_frame` was created before `node.optimistic()`
+       consumed `node`. Fixed by using `node.frame_ref()` for the state check
+       and `BTreeNode::is_leaf(opt.read_ref())` for the leaf check.
+   - **`extend_*_guard` transmutes (buffer_pool.rs:420-432):** still
+     unconstrained. The `from_*` constructors now tie `'g` to the guard's
+     lifetime parameter (not the `&self` borrow), which prevents the guard
+     lifetime from being lengthened past the pool borrow it was created from.
+     The transmutes remain as the mechanism by which the guard's lifetime is
+     set to `'a` (the pool borrow), but `'a` is now constrained by the pin/pool
+     it was created from. Further constraining the transmutes is Phase 3/4
+     work.
+   - Verified: `cargo build --workspace` passes; `cargo test --workspace`
+     passes (1 pre-existing `shuttle_pin_evict_minimal` failure, unrelated);
+     `cargo clippy --workspace --all-targets` introduces no new warnings;
+     `cargo fmt --all` is a no-op.
 
 3. **Phase 3: Replace `RoutedChild` with `RoutedChildRef<'g>`**
    - Add lifetime parameter tying it to the guard that read the SWIP

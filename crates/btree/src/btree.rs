@@ -24,8 +24,8 @@ mod split_publish;
 mod stats;
 
 use self::node::{
-    ChildRef, ExclusiveNode, FLAG_IS_LEAF, Inner, LEFT_SIBLING_OFFSET, Leaf, OptimisticNode,
-    RIGHT_SIBLING_OFFSET, ResidentFrame, RoutedChild, SharedNode, TmpBuf,
+    BTreeNode, ChildRef, ExclusiveNode, FLAG_IS_LEAF, Inner, LEFT_SIBLING_OFFSET, Leaf,
+    OptimisticNode, RIGHT_SIBLING_OFFSET, ResidentFrame, RoutedChild, SharedNode, TmpBuf,
 };
 use self::parent_edge::ParentEdge;
 use self::split_child::SplitChild;
@@ -60,7 +60,7 @@ pub struct BTree {
 
 impl ParentFinder for BTree {
     fn find_and_unswizzle(&self, child: BufferFrameRef, child_pid: u64) -> bool {
-        unsafe { self.eviction_unswizzle(ResidentFrame::new(child), child_pid) }
+        unsafe { self.eviction_unswizzle(&ResidentFrame::new(child), child_pid) }
     }
 }
 
@@ -70,7 +70,7 @@ impl BTree {
 
     fn swip_page_id(swip: Swip) -> u64 {
         if swip.is_hot() || swip.is_cool() {
-            ResidentFrame::from_hot_swip(swip).unwrap().pid()
+            unsafe { ResidentFrame::from_hot_swip(swip) }.unwrap().pid()
         } else {
             swip.as_page_id()
         }
@@ -78,20 +78,20 @@ impl BTree {
 
     unsafe fn set_parent_link_for_edge(
         &self,
-        child: ResidentFrame,
+        child: &ResidentFrame<'_>,
         parent: &ExclusiveNode<'_, Inner>,
         edge: ParentEdge,
     ) {
         let count = parent.num_slots();
         let pos = edge.pos(count);
         let is_upper = matches!(edge, ParentEdge::Upper);
-        unsafe { self.set_inner_parent_link(child, parent.resident_frame(), pos, is_upper) };
+        unsafe { self.set_inner_parent_link(child, &parent.resident_frame(), pos, is_upper) };
     }
 
     unsafe fn set_parent_link_for_routed_child(
         &self,
-        child: ResidentFrame,
-        parent: ResidentFrame,
+        child: &ResidentFrame<'_>,
+        parent: &ResidentFrame<'_>,
         routed: RoutedChild,
     ) {
         let count = parent.num_slots();
@@ -103,7 +103,7 @@ impl BTree {
     fn parent_edge_for_child(
         &self,
         parent: &ExclusiveNode<'_, Inner>,
-        child: ResidentFrame,
+        child: &ResidentFrame<'_>,
     ) -> Option<ParentEdge> {
         parent.child_edge_for(ChildRef::from_frame(child))
     }
@@ -117,7 +117,11 @@ impl BTree {
         Some(child.exclusive())
     }
 
-    unsafe fn collapse_empty_root_to_child(&self, root: ResidentFrame, child: ResidentFrame) {
+    unsafe fn collapse_empty_root_to_child(
+        &self,
+        root: &ResidentFrame<'_>,
+        child: &ResidentFrame<'_>,
+    ) {
         self.meta_swip.store(child.hot_swip(), Ordering::Release);
         unsafe { self.set_root_parent_link(child) };
         self.height.fetch_sub(1, Ordering::Relaxed);
@@ -127,8 +131,8 @@ impl BTree {
     unsafe fn unlink_merged_right_leaf(
         &self,
         parent: &ExclusiveNode<'_, Inner>,
-        merged_leaf: ResidentFrame,
-        removed_leaf: ResidentFrame,
+        merged_leaf: &ResidentFrame<'_>,
+        removed_leaf: &ResidentFrame<'_>,
         merged_edge: ParentEdge,
         removed_slot: u16,
     ) {
@@ -162,8 +166,8 @@ impl BTree {
     unsafe fn unlink_merged_left_leaf(
         &self,
         parent: &ExclusiveNode<'_, Inner>,
-        merged_leaf: ResidentFrame,
-        removed_leaf: ResidentFrame,
+        merged_leaf: &ResidentFrame<'_>,
+        removed_leaf: &ResidentFrame<'_>,
         merged_separator_slot: u16,
         removed_slot: u16,
         replacement_key: Option<&[u8]>,
@@ -195,8 +199,8 @@ impl BTree {
     unsafe fn unlink_merged_right_inner(
         &self,
         parent: &ExclusiveNode<'_, Inner>,
-        merged: ResidentFrame,
-        removed: ResidentFrame,
+        merged: &ResidentFrame<'_>,
+        removed: &ResidentFrame<'_>,
         merged_edge: ParentEdge,
         removed_slot: u16,
     ) {
@@ -209,8 +213,8 @@ impl BTree {
     unsafe fn unlink_merged_left_inner(
         &self,
         parent: &ExclusiveNode<'_, Inner>,
-        merged: ResidentFrame,
-        removed: ResidentFrame,
+        merged: &ResidentFrame<'_>,
+        removed: &ResidentFrame<'_>,
         merged_separator_slot: u16,
         removed_slot: u16,
         replacement_key: Option<&[u8]>,
@@ -337,14 +341,14 @@ impl BTree {
         node.child_page_ids()
     }
 
-    unsafe fn set_root_parent_link(&self, root: ResidentFrame) {
+    unsafe fn set_root_parent_link(&self, root: &ResidentFrame<'_>) {
         root.set_parent_link_stable(unsafe { StableSwipRef::from_ref(&self.meta_swip) });
     }
 
     unsafe fn set_inner_parent_link(
         &self,
-        child: ResidentFrame,
-        parent: ResidentFrame,
+        child: &ResidentFrame<'_>,
+        parent: &ResidentFrame<'_>,
         slot_index: u16,
         is_upper: bool,
     ) {
@@ -468,8 +472,8 @@ impl BTree {
 
         loop {
             let opt = current.optimistic().map_err(|_| Restart)?;
-            let current_frame = ResidentFrame::from_optimistic(&opt);
-            if current_frame.is_leaf() {
+            let is_leaf = BTreeNode::is_leaf(opt.read_ref());
+            if is_leaf {
                 let leaf = OptimisticNode::from_leaf_frame(opt);
                 if leaf.should_chase_right(key) {
                     self.stats.inc(BTreeEvent::LeftChases);
@@ -493,6 +497,7 @@ impl BTree {
                 }
             }
             let inner = OptimisticNode::<Inner>::from_inner_frame(opt);
+            let current_frame = inner.resident_frame();
             let routed_child = match inner.route_to_child(key) {
                 Some(r) => r,
                 None => {
@@ -524,7 +529,11 @@ impl BTree {
                     return Err(Restart);
                 }
                 unsafe {
-                    self.set_parent_link_for_routed_child(child_frame, current_frame, routed_child)
+                    self.set_parent_link_for_routed_child(
+                        &child_frame,
+                        &current_frame,
+                        routed_child,
+                    )
                 };
                 current = child;
             } else {
@@ -532,7 +541,11 @@ impl BTree {
                 let child = unsafe { pool.fix_orphan_frame(child_swip.as_page_id()) };
                 let child_frame = ResidentFrame::from_pinned(&child);
                 unsafe {
-                    self.set_parent_link_for_routed_child(child_frame, current_frame, routed_child)
+                    self.set_parent_link_for_routed_child(
+                        &child_frame,
+                        &current_frame,
+                        routed_child,
+                    )
                 };
                 // Swizzle-in: write HOT pointer back to parent's page bytes
                 // so future traversals (and the eviction DFS) see HOT, not
@@ -555,13 +568,13 @@ impl BTree {
         let pool = self.pool();
         let root_swip = self.meta_swip.load(Ordering::Acquire);
         let mut current = if root_swip.is_hot() || root_swip.is_cool() {
-            let root = ResidentFrame::from_hot_swip(root_swip).ok_or(Restart)?;
+            let root = unsafe { ResidentFrame::from_hot_swip(root_swip) }.ok_or(Restart)?;
             debug_assert!(
                 root.is_in_pool(pool),
                 "find_leaf_exclusive: invalid hot root swip: {:?}",
                 root_swip,
             );
-            let opt = root.optimistic_guard()?;
+            let opt = unsafe { root.optimistic_guard() }?;
             if root.is_leaf() {
                 let _ = opt;
                 unsafe { pool.fix_frame(&self.meta_swip) }
@@ -580,7 +593,7 @@ impl BTree {
                         return Err(Restart);
                     }
                     unsafe {
-                        self.set_parent_link_for_routed_child(child_frame, root, routed_child)
+                        self.set_parent_link_for_routed_child(&child_frame, &root, routed_child)
                     };
                     child
                 } else {
@@ -588,7 +601,7 @@ impl BTree {
                     let child = unsafe { pool.fix_orphan_frame(child_swip.as_page_id()) };
                     let child_frame = ResidentFrame::from_pinned(&child);
                     unsafe {
-                        self.set_parent_link_for_routed_child(child_frame, root, routed_child)
+                        self.set_parent_link_for_routed_child(&child_frame, &root, routed_child)
                     };
                     if let Ok(guard) = opt.upgrade_to_exclusive() {
                         match routed_child.edge() {
@@ -608,8 +621,8 @@ impl BTree {
 
         loop {
             let opt = current.optimistic().map_err(|_| Restart)?;
-            let current_frame = ResidentFrame::from_optimistic(&opt);
-            if current_frame.is_leaf() {
+            let is_leaf = BTreeNode::is_leaf(opt.read_ref());
+            if is_leaf {
                 let leaf = OptimisticNode::from_leaf_frame(opt);
                 if leaf.should_chase_right(key) {
                     self.stats.inc(BTreeEvent::LeftChases);
@@ -634,6 +647,7 @@ impl BTree {
             }
 
             let inner = OptimisticNode::<Inner>::from_inner_frame(opt);
+            let current_frame = inner.resident_frame();
             let routed_child = match inner.route_to_child(key) {
                 Some(r) => r,
                 None => {
@@ -658,7 +672,11 @@ impl BTree {
                     return Err(Restart);
                 }
                 unsafe {
-                    self.set_parent_link_for_routed_child(child_frame, current_frame, routed_child)
+                    self.set_parent_link_for_routed_child(
+                        &child_frame,
+                        &current_frame,
+                        routed_child,
+                    )
                 };
                 current = child;
             } else {
@@ -666,7 +684,11 @@ impl BTree {
                 let child = unsafe { pool.fix_orphan_frame(child_swip.as_page_id()) };
                 let child_frame = ResidentFrame::from_pinned(&child);
                 unsafe {
-                    self.set_parent_link_for_routed_child(child_frame, current_frame, routed_child)
+                    self.set_parent_link_for_routed_child(
+                        &child_frame,
+                        &current_frame,
+                        routed_child,
+                    )
                 };
                 if let Ok(parent) = inner.upgrade_to_exclusive() {
                     parent.set_child_edge_swip(routed_child.edge(), child_frame.hot_swip());
@@ -690,8 +712,8 @@ impl BTree {
                 self.stats.inc(BTreeEvent::SplitPathRestarts);
                 Restart
             })?;
-            let current_frame = ResidentFrame::from_optimistic(&opt);
-            if current_frame.is_leaf() {
+            let is_leaf = BTreeNode::is_leaf(opt.read_ref());
+            if is_leaf {
                 let leaf = OptimisticNode::from_leaf_frame(opt);
                 if leaf.should_chase_right(key) {
                     let empty_leaf = leaf.resident_frame().is_empty_leaf();
@@ -715,6 +737,7 @@ impl BTree {
             }
 
             let inner = OptimisticNode::<Inner>::from_inner_frame(opt);
+            let current_frame = inner.resident_frame();
             let routed_child = match inner.route_to_child(key) {
                 Some(r) => r,
                 None => {
@@ -753,7 +776,7 @@ impl BTree {
             };
             let child_frame = ResidentFrame::from_pinned(&child);
             unsafe {
-                self.set_parent_link_for_routed_child(child_frame, current_frame, routed_child)
+                self.set_parent_link_for_routed_child(&child_frame, &current_frame, routed_child)
             };
             path.push(current);
             current = child;
@@ -769,13 +792,13 @@ impl BTree {
         let root_swip = self.meta_swip.load(Ordering::Acquire);
         let mut steps = 0usize;
         let mut current = if root_swip.is_hot() || root_swip.is_cool() {
-            let root = ResidentFrame::from_hot_swip(root_swip).ok_or(Restart)?;
+            let root = unsafe { ResidentFrame::from_hot_swip(root_swip) }.ok_or(Restart)?;
             debug_assert!(
                 root.is_in_pool(pool),
                 "find_leaf_optimistic: invalid hot root swip: {:?}",
                 root_swip,
             );
-            let opt = root.optimistic_guard()?;
+            let opt = unsafe { root.optimistic_guard() }?;
             if root.is_leaf() {
                 let _ = opt;
                 unsafe { pool.fix_frame(&self.meta_swip) }
@@ -794,7 +817,7 @@ impl BTree {
                         return Err(Restart);
                     }
                     unsafe {
-                        self.set_parent_link_for_routed_child(child_frame, root, routed_child)
+                        self.set_parent_link_for_routed_child(&child_frame, &root, routed_child)
                     }
                     child
                 } else {
@@ -802,7 +825,7 @@ impl BTree {
                     let child = unsafe { pool.fix_orphan_frame(child_swip.as_page_id()) };
                     let child_frame = ResidentFrame::from_pinned(&child);
                     unsafe {
-                        self.set_parent_link_for_routed_child(child_frame, root, routed_child)
+                        self.set_parent_link_for_routed_child(&child_frame, &root, routed_child)
                     };
                     if let Ok(parent) = opt.upgrade_to_exclusive() {
                         match routed_child.edge() {
@@ -827,8 +850,8 @@ impl BTree {
                 return Err(Restart);
             }
             let opt = current.optimistic().map_err(|_| Restart)?;
-            let current_frame = ResidentFrame::from_optimistic(&opt);
-            if current_frame.is_leaf() {
+            let is_leaf = BTreeNode::is_leaf(opt.read_ref());
+            if is_leaf {
                 let leaf = OptimisticNode::from_leaf_frame(opt);
                 if leaf.should_chase_right(key) {
                     self.stats.inc(BTreeEvent::LeftChases);
@@ -849,6 +872,7 @@ impl BTree {
             }
 
             let inner = OptimisticNode::<Inner>::from_inner_frame(opt);
+            let current_frame = inner.resident_frame();
             let routed_child = inner.route_to_child(key).ok_or(Restart)?;
             if inner.validate().is_err() {
                 return Err(Restart);
@@ -864,7 +888,11 @@ impl BTree {
                     return Err(Restart);
                 }
                 unsafe {
-                    self.set_parent_link_for_routed_child(child_frame, current_frame, routed_child)
+                    self.set_parent_link_for_routed_child(
+                        &child_frame,
+                        &current_frame,
+                        routed_child,
+                    )
                 };
                 current = child;
             } else {
@@ -884,7 +912,11 @@ impl BTree {
                 }
                 let child_frame = ResidentFrame::from_pinned(&child);
                 unsafe {
-                    self.set_parent_link_for_routed_child(child_frame, current_frame, routed_child)
+                    self.set_parent_link_for_routed_child(
+                        &child_frame,
+                        &current_frame,
+                        routed_child,
+                    )
                 };
                 if let Ok(parent) = inner.upgrade_to_exclusive() {
                     parent.set_child_edge_swip(routed_child.edge(), child_frame.hot_swip());
@@ -904,20 +936,22 @@ impl BTree {
 
         loop {
             let current_shared = current.clone_pin().shared();
-            let current_frame = ResidentFrame::from_shared(&current_shared);
+            let shared = SharedNode::<Leaf>::from_leaf_frame(current_shared);
+            let current_frame = shared.resident_frame();
             if current_frame.is_leaf() {
                 if current_frame.should_chase_right(key) {
                     let right_pid = current_frame.leaf_right_pid();
                     if right_pid == 0 {
                         return Err(Restart);
                     }
-                    drop(current_shared);
+                    drop(shared);
                     current = unsafe { pool.fix_orphan_frame(right_pid) };
                     continue;
                 }
-                let leaf = current_shared.into_pinned().exclusive();
-                if ResidentFrame::from_exclusive(&leaf).should_chase_right(key) {
-                    let right_pid = current_frame.leaf_right_pid();
+                let leaf =
+                    ExclusiveNode::from_leaf_frame(shared.into_frame().into_pinned().exclusive());
+                if leaf.resident_frame().should_chase_right(key) {
+                    let right_pid = leaf.right_pid();
                     if right_pid == 0 {
                         return Err(Restart);
                     }
@@ -925,7 +959,7 @@ impl BTree {
                     current = unsafe { pool.fix_orphan_frame(right_pid) };
                     continue;
                 }
-                return Ok(ExclusiveNode::from_leaf_frame(leaf));
+                return Ok(leaf);
             }
 
             let routed_child = current_frame.try_route_to_child(key).ok_or(Restart)?;
@@ -936,8 +970,8 @@ impl BTree {
             };
             unsafe {
                 self.set_parent_link_for_routed_child(
-                    ResidentFrame::from_pinned(&child),
-                    current_frame,
+                    &ResidentFrame::from_pinned(&child),
+                    &current_frame,
                     routed_child,
                 )
             };
@@ -955,20 +989,22 @@ impl BTree {
 
         loop {
             let current_shared = current.clone_pin().shared();
-            let current_frame = ResidentFrame::from_shared(&current_shared);
+            let shared = SharedNode::<Leaf>::from_leaf_frame(current_shared);
+            let current_frame = shared.resident_frame();
             if current_frame.is_leaf() {
                 if current_frame.should_chase_right(key) {
                     let right_pid = current_frame.leaf_right_pid();
                     if right_pid == 0 {
                         return Err(Restart);
                     }
-                    drop(current_shared);
+                    drop(shared);
                     current = unsafe { pool.fix_orphan_frame(right_pid) };
                     continue;
                 }
-                let leaf = current_shared.into_pinned().exclusive();
-                if ResidentFrame::from_exclusive(&leaf).should_chase_right(key) {
-                    let right_pid = current_frame.leaf_right_pid();
+                let leaf =
+                    ExclusiveNode::from_leaf_frame(shared.into_frame().into_pinned().exclusive());
+                if leaf.resident_frame().should_chase_right(key) {
+                    let right_pid = leaf.right_pid();
                     if right_pid == 0 {
                         return Err(Restart);
                     }
@@ -976,7 +1012,7 @@ impl BTree {
                     current = unsafe { pool.fix_orphan_frame(right_pid) };
                     continue;
                 }
-                return Ok((path, ExclusiveNode::from_leaf_frame(leaf)));
+                return Ok((path, leaf));
             }
 
             let routed_child = current_frame.try_route_to_child(key).ok_or(Restart)?;
@@ -993,14 +1029,15 @@ impl BTree {
                 };
                 child
             };
+            let parent_pin = shared.into_frame().into_pinned();
             unsafe {
                 self.set_parent_link_for_routed_child(
-                    ResidentFrame::from_pinned(&child),
-                    current_frame,
+                    &ResidentFrame::from_pinned(&child),
+                    &current_frame,
                     routed_child,
                 )
             };
-            path.push(current_shared.into_pinned());
+            path.push(parent_pin);
             current = child;
         }
     }
@@ -1152,8 +1189,8 @@ impl BTree {
             );
             node_frame.replace_page(&tmp.0);
             node_frame.set_upper(left_upper);
-            unsafe { self.refresh_inner_child_parent_links_for_frame(node_frame) };
-            unsafe { self.refresh_inner_child_parent_links_for_frame(new_sibling_frame) };
+            unsafe { self.refresh_inner_child_parent_links_for_frame(&node_frame) };
+            unsafe { self.refresh_inner_child_parent_links_for_frame(&new_sibling_frame) };
         }
 
         new_sibling.mark_dirty();
@@ -1187,14 +1224,14 @@ impl BTree {
             ) {
                 Ok(_) => {
                     unsafe {
-                        self.set_root_parent_link(new_root.resident_frame());
+                        self.set_root_parent_link(&new_root.resident_frame());
                         self.set_parent_link_for_edge(
-                            left.resident_frame(),
+                            &left.resident_frame(),
                             &new_root,
                             ParentEdge::Slot(0),
                         );
                         self.set_parent_link_for_edge(
-                            right.resident_frame(),
+                            &right.resident_frame(),
                             &new_root,
                             ParentEdge::Upper,
                         );
@@ -1323,14 +1360,14 @@ impl BTree {
             ) {
                 Ok(_) => {
                     unsafe {
-                        self.set_root_parent_link(new_root.resident_frame());
+                        self.set_root_parent_link(&new_root.resident_frame());
                         self.set_parent_link_for_edge(
-                            left.resident_frame(),
+                            &left.resident_frame(),
                             &new_root,
                             ParentEdge::Slot(0),
                         );
                         self.set_parent_link_for_edge(
-                            right.resident_frame(),
+                            &right.resident_frame(),
                             &new_root,
                             ParentEdge::Upper,
                         );
@@ -1415,7 +1452,7 @@ impl BTree {
             return false;
         };
         let parent = ExclusiveNode::from_inner_frame(parent.exclusive());
-        let Some(edge) = self.parent_edge_for_child(&parent, left.resident_frame()) else {
+        let Some(edge) = self.parent_edge_for_child(&parent, &left.resident_frame()) else {
             drop(parent);
             return false;
         };
@@ -1456,8 +1493,8 @@ impl BTree {
             parent.set_child_edge_swip(ParentEdge::Upper, right.swip());
         }
         unsafe {
-            self.set_parent_link_for_edge(left.resident_frame(), parent, left_link_edge);
-            self.set_parent_link_for_edge(right.resident_frame(), parent, right_link_edge);
+            self.set_parent_link_for_edge(&left.resident_frame(), parent, left_link_edge);
+            self.set_parent_link_for_edge(&right.resident_frame(), parent, right_link_edge);
         }
     }
 
@@ -1469,7 +1506,7 @@ impl BTree {
     ) -> bool {
         let root = unsafe { self.pool().fix_frame(&self.meta_swip).exclusive() };
         let root_inner = ExclusiveNode::from_inner_frame(root);
-        let Some(edge) = self.parent_edge_for_child(&root_inner, left.resident_frame()) else {
+        let Some(edge) = self.parent_edge_for_child(&root_inner, &left.resident_frame()) else {
             drop(root_inner);
             return false;
         };
@@ -1502,7 +1539,7 @@ impl BTree {
                 continue;
             }
 
-            if let Some(edge) = current.child_edge_for(ChildRef::from_frame(left.resident_frame()))
+            if let Some(edge) = current.child_edge_for(ChildRef::from_frame(&left.resident_frame()))
             {
                 if !current.can_insert_separator(sep_key.len()) {
                     let mut empty_path = Vec::new();
@@ -1520,8 +1557,8 @@ impl BTree {
 
             for routed in child_routes.into_iter().rev() {
                 let swip = routed.swip();
-                if ResidentFrame::from_hot_swip(swip)
-                    .is_some_and(|frame| frame.same_frame(left.resident_frame()))
+                if unsafe { ResidentFrame::from_hot_swip(swip) }
+                    .is_some_and(|frame| frame.same_frame(&left.resident_frame()))
                 {
                     continue;
                 }
@@ -1545,7 +1582,7 @@ impl BTree {
     /// Swip::evicted(child_pid) to the parent's routing edge.
     /// Called by eviction when the cached ParentLink::InnerNode hint
     /// is stale.
-    unsafe fn eviction_unswizzle(&self, child: ResidentFrame, child_pid: u64) -> bool {
+    unsafe fn eviction_unswizzle(&self, child: &ResidentFrame<'_>, child_pid: u64) -> bool {
         // This fallback only runs after the cached parent hint failed. Under a
         // tight pool, giving up early can strand all candidate leaves resident.
         const MAX_EVICTION_UNSWIZZLE_VISITS: usize = 262_144;
@@ -1557,7 +1594,7 @@ impl BTree {
         if !root_swip.is_hot() {
             return false;
         }
-        let Some(root) = ResidentFrame::from_hot_swip(root_swip) else {
+        let Some(root) = (unsafe { ResidentFrame::from_hot_swip(root_swip) }) else {
             return false;
         };
         // Check if child IS the root.
@@ -1580,9 +1617,9 @@ impl BTree {
             {
                 return false;
             }
-            let node_frame = ResidentFrame::from_pinned(&node);
+            let node_bf = node.frame_ref();
             // Skip frames that are no longer resident (evicted/freed).
-            let frame_state = node_frame.state();
+            let frame_state = node_bf.state();
             if frame_state != pagebox_storage::buffer_frame::FrameState::Resident {
                 continue;
             }
@@ -1590,7 +1627,8 @@ impl BTree {
             let Ok(opt) = node.optimistic() else {
                 continue;
             };
-            if node_frame.is_leaf() {
+            let is_leaf = BTreeNode::is_leaf(opt.read_ref());
+            if is_leaf {
                 continue;
             }
             let opt_inner = OptimisticNode::from_inner_frame(opt);
@@ -1621,7 +1659,7 @@ impl BTree {
 
                 if let Some(edge) = parent.child_edge_for(ChildRef::from_frame(child)) {
                     parent.set_child_edge_swip(edge, Swip::evicted(child_pid));
-                    node_frame.mark_header_dirty();
+                    parent.resident_frame().mark_header_dirty();
                 }
                 drop(parent);
                 return true;
@@ -1641,7 +1679,7 @@ impl BTree {
                     if !(swip.is_hot() || swip.is_cool()) {
                         return;
                     }
-                    let child_frame = ResidentFrame::from_hot_swip(swip).unwrap();
+                    let child_frame = unsafe { ResidentFrame::from_hot_swip(swip) }.unwrap();
                     if child_frame.is_in_pool(pool)
                         && let Some(child) = unsafe { pool.try_pin_child(swip) }
                     {
@@ -1670,7 +1708,7 @@ impl BTree {
                 if let Some(edge) = parent.child_edge_for(ChildRef::from_frame(child)) {
                     self.stats.inc(BTreeEvent::EvictionUnswizzleParentHits);
                     parent.set_child_edge_swip(edge, Swip::evicted(child_pid));
-                    node_frame.mark_header_dirty();
+                    parent.resident_frame().mark_header_dirty();
                 }
                 drop(parent);
                 return true;
@@ -1709,7 +1747,7 @@ impl BTree {
     #[cfg(test)]
     unsafe fn find_parent<'a>(
         &'a self,
-        target: ResidentFrame,
+        target: &ResidentFrame<'_>,
     ) -> Result<(PinnedFrame<'a>, u16), Restart> {
         let pool = self.pool();
         let mut stack = vec![unsafe { pool.fix_frame(&self.meta_swip) }];
@@ -1763,15 +1801,17 @@ impl BTree {
     unsafe fn repair_separators_after_delete(
         &self,
         path: &mut Vec<PinnedFrame<'_>>,
-        leaf: ResidentFrame,
+        leaf_bf: BufferFrameRef,
+        leaf_pid: u64,
         new_max: Option<Vec<u8>>,
     ) {
-        let mut child = leaf;
+        let mut child_pid = leaf_pid;
+        let mut child_bf = leaf_bf;
         let mut new_max = new_max;
 
         while let Some(parent) = path.pop() {
             let parent = ExclusiveNode::from_inner_frame(parent.exclusive());
-            let Some(edge) = self.parent_edge_for_child(&parent, child) else {
+            let Some(edge) = parent.child_edge_for(ChildRef::from_pid(child_bf, child_pid)) else {
                 break;
             };
 
@@ -1787,7 +1827,8 @@ impl BTree {
                 break;
             }
 
-            child = parent.resident_frame();
+            child_pid = parent.pid();
+            child_bf = parent.resident_frame().bf();
             new_max = new_max.take();
         }
     }
@@ -1812,20 +1853,20 @@ impl BTree {
         right: &ExclusiveNode<'_, Leaf>,
         left_pos: u16,
     ) -> bool {
-        if left.resident_frame().same_frame(right.resident_frame()) {
+        if left.resident_frame().same_frame(&right.resident_frame()) {
             return false;
         }
 
         if !parent.child_edge_matches(
             ParentEdge::Slot(left_pos),
-            ChildRef::from_frame(left.resident_frame()),
+            ChildRef::from_frame(&left.resident_frame()),
         ) {
             return false;
         }
 
         let count = parent.num_slots();
         let right_edge = ParentEdge::from_pos(left_pos + 1, count);
-        if !parent.child_edge_matches(right_edge, ChildRef::from_frame(right.resident_frame())) {
+        if !parent.child_edge_matches(right_edge, ChildRef::from_frame(&right.resident_frame())) {
             return false;
         }
 
@@ -1994,10 +2035,10 @@ impl BTree {
     }
 
     unsafe fn refresh_inner_child_parent_links(&self, node: &ExclusiveNode<'_, Inner>) {
-        unsafe { self.refresh_inner_child_parent_links_for_frame(node.resident_frame()) };
+        unsafe { self.refresh_inner_child_parent_links_for_frame(&node.resident_frame()) };
     }
 
-    unsafe fn refresh_inner_child_parent_links_for_frame(&self, node: ResidentFrame) {
+    unsafe fn refresh_inner_child_parent_links_for_frame(&self, node: &ResidentFrame<'_>) {
         let count = node.num_slots();
         for pos in 0..count {
             let swip = node.child_swip_at(pos);
@@ -2006,7 +2047,7 @@ impl BTree {
             }
             unsafe {
                 self.set_inner_parent_link(
-                    ResidentFrame::from_hot_swip(swip).unwrap(),
+                    &ResidentFrame::from_hot_swip(swip).unwrap(),
                     node,
                     pos,
                     false,
@@ -2018,7 +2059,7 @@ impl BTree {
         if upper.is_hot() || upper.is_cool() {
             unsafe {
                 self.set_inner_parent_link(
-                    ResidentFrame::from_hot_swip(upper).unwrap(),
+                    &ResidentFrame::from_hot_swip(upper).unwrap(),
                     node,
                     count,
                     true,
@@ -2080,7 +2121,7 @@ impl BTree {
             return false;
         }
 
-        let Some(edge) = self.parent_edge_for_child(&parent, leaf_frame) else {
+        let Some(edge) = self.parent_edge_for_child(&parent, &leaf_frame) else {
             return false;
         };
         let count = parent.num_slots();
@@ -2099,7 +2140,13 @@ impl BTree {
                 && unsafe { self.merge_leaf_pages_into_left(&leaf, &right) }
             {
                 unsafe {
-                    self.unlink_merged_right_leaf(&parent, leaf_frame, right_frame, right_edge, pos)
+                    self.unlink_merged_right_leaf(
+                        &parent,
+                        &leaf_frame,
+                        &right_frame,
+                        right_edge,
+                        pos,
+                    )
                 };
                 parent.mark_dirty();
 
@@ -2109,7 +2156,7 @@ impl BTree {
                     Self::swip_page_id(self.meta_swip.load(Ordering::Acquire)) == parent.pid();
                 let parent_count = parent.num_slots();
                 if parent_is_root && parent_count == 0 {
-                    unsafe { self.collapse_empty_root_to_child(parent_frame, leaf_frame) };
+                    unsafe { self.collapse_empty_root_to_child(&parent_frame, &leaf_frame) };
                     drop(parent);
                 } else if !parent_is_root && parent.is_underfull() {
                     let _ = unsafe { self.try_merge_inner_with_path(parent_path, parent) };
@@ -2138,8 +2185,8 @@ impl BTree {
                 unsafe {
                     self.unlink_merged_left_leaf(
                         &parent,
-                        left_frame,
-                        leaf_frame,
+                        &left_frame,
+                        &leaf_frame,
                         left_pos,
                         if pos == count { left_pos } else { pos },
                         replacement_key.as_deref(),
@@ -2153,7 +2200,7 @@ impl BTree {
                     Self::swip_page_id(self.meta_swip.load(Ordering::Acquire)) == parent.pid();
                 let parent_count = parent.num_slots();
                 if parent_is_root && parent_count == 0 {
-                    unsafe { self.collapse_empty_root_to_child(parent_frame, left_frame) };
+                    unsafe { self.collapse_empty_root_to_child(&parent_frame, &left_frame) };
                     drop(parent);
                 } else if !parent_is_root && parent.is_underfull() {
                     let _ = unsafe { self.try_merge_inner_with_path(parent_path, parent) };
@@ -2181,7 +2228,7 @@ impl BTree {
             return false;
         }
 
-        let Some(edge) = self.parent_edge_for_child(&parent, node_frame) else {
+        let Some(edge) = self.parent_edge_for_child(&parent, &node_frame) else {
             return false;
         };
         let count = parent.num_slots();
@@ -2202,8 +2249,8 @@ impl BTree {
                     unsafe {
                         self.unlink_merged_right_inner(
                             &parent,
-                            node_frame,
-                            right_frame,
+                            &node_frame,
+                            &right_frame,
                             ParentEdge::Upper,
                             pos,
                         )
@@ -2213,8 +2260,8 @@ impl BTree {
                     unsafe {
                         self.unlink_merged_left_inner(
                             &parent,
-                            node_frame,
-                            right_frame,
+                            &node_frame,
+                            &right_frame,
                             pos,
                             pos + 1,
                             Some(replacement_key.as_slice()),
@@ -2228,7 +2275,7 @@ impl BTree {
                     Self::swip_page_id(self.meta_swip.load(Ordering::Acquire)) == parent.pid();
                 let parent_count = parent.num_slots();
                 if parent_is_root && parent_count == 0 {
-                    unsafe { self.collapse_empty_root_to_child(parent_frame, node_frame) };
+                    unsafe { self.collapse_empty_root_to_child(&parent_frame, &node_frame) };
                     drop(parent);
                 } else if !parent_is_root && parent.is_underfull() {
                     let _ = unsafe { self.try_merge_inner_with_path(parent_path, parent) };
@@ -2256,8 +2303,8 @@ impl BTree {
                 unsafe {
                     self.unlink_merged_left_inner(
                         &parent,
-                        left_frame,
-                        node_frame,
+                        &left_frame,
+                        &node_frame,
                         left_pos,
                         if pos == count { left_pos } else { pos },
                         replacement_key.as_deref(),
@@ -2269,7 +2316,7 @@ impl BTree {
                     Self::swip_page_id(self.meta_swip.load(Ordering::Acquire)) == parent.pid();
                 let parent_count = parent.num_slots();
                 if parent_is_root && parent_count == 0 {
-                    unsafe { self.collapse_empty_root_to_child(parent_frame, left_frame) };
+                    unsafe { self.collapse_empty_root_to_child(&parent_frame, &left_frame) };
                     drop(parent);
                 } else if !parent_is_root && parent.is_underfull() {
                     let _ = unsafe { self.try_merge_inner_with_path(parent_path, parent) };
@@ -2289,7 +2336,8 @@ impl BTree {
         new_max: Option<Vec<u8>>,
         should_merge: bool,
     ) {
-        let leaf_frame = ResidentFrame::from_pinned(&leaf);
+        let leaf_bf = leaf.frame_ref();
+        let leaf_pid = leaf.pid();
         let merged_leaf = should_merge
             && unsafe {
                 self.try_merge_leaf_with_path(
@@ -2299,7 +2347,7 @@ impl BTree {
             };
 
         if deleted_was_max && !merged_leaf {
-            unsafe { self.repair_separators_after_delete(parent_path, leaf_frame, new_max) };
+            unsafe { self.repair_separators_after_delete(parent_path, leaf_bf, leaf_pid, new_max) };
         }
     }
 
@@ -2578,7 +2626,7 @@ impl BTree {
     fn with_lookup_fallback_leaf<R>(
         &self,
         key: &[u8],
-        read: impl FnOnce(Option<ResidentFrame>) -> R,
+        read: impl FnOnce(Option<&ResidentFrame<'_>>) -> R,
     ) -> R {
         let pool = self.pool();
         let mut attempts = 0u32;
@@ -2609,7 +2657,7 @@ impl BTree {
                         current = right;
                         continue;
                     }
-                    let result = read.take().unwrap()(Some(current_frame));
+                    let result = read.take().unwrap()(Some(&current_frame));
                     let _ = guard;
                     return result;
                 }
@@ -2632,8 +2680,8 @@ impl BTree {
                                 unsafe { pool.fix_orphan_frame(routed_child.swip().as_page_id()) };
                             unsafe {
                                 self.set_parent_link_for_routed_child(
-                                    ResidentFrame::from_pinned(&child),
-                                    current_frame,
+                                    &ResidentFrame::from_pinned(&child),
+                                    &current_frame,
                                     routed_child,
                                 )
                             };
@@ -2652,8 +2700,8 @@ impl BTree {
                 };
                 unsafe {
                     self.set_parent_link_for_routed_child(
-                        ResidentFrame::from_pinned(&child),
-                        current_frame,
+                        &ResidentFrame::from_pinned(&child),
+                        &current_frame,
                         routed_child,
                     )
                 };
@@ -2699,19 +2747,20 @@ impl BTree {
 
         loop {
             let current_shared = current.shared();
-            let current_frame = ResidentFrame::from_shared(&current_shared);
+            let shared = SharedNode::<Leaf>::from_leaf_frame(current_shared);
+            let current_frame = shared.resident_frame();
             if current_frame.is_leaf() {
                 if current_frame.should_chase_right(key) {
                     let right_pid = current_frame.leaf_right_pid();
                     if right_pid == 0 {
                         return Err(Restart);
                     }
-                    drop(current_shared);
+                    drop(shared);
                     let right = unsafe { pool.fix_orphan_frame(right_pid) };
                     current = right;
                     continue;
                 }
-                return Ok(SharedNode::from_leaf_frame(current_shared));
+                return Ok(shared);
             }
 
             let routed_child = current_frame.try_route_to_child(key).ok_or(Restart)?;
@@ -2721,22 +2770,22 @@ impl BTree {
                 };
                 child
             } else {
-                drop(current_shared);
                 let child = unsafe { pool.fix_orphan_frame(routed_child.swip().as_page_id()) };
                 unsafe {
                     self.set_parent_link_for_routed_child(
-                        ResidentFrame::from_pinned(&child),
-                        current_frame,
+                        &ResidentFrame::from_pinned(&child),
+                        &current_frame,
                         routed_child,
                     )
                 };
+                drop(shared);
                 current = child;
                 continue;
             };
             unsafe {
                 self.set_parent_link_for_routed_child(
-                    ResidentFrame::from_pinned(&child),
-                    current_frame,
+                    &ResidentFrame::from_pinned(&child),
+                    &current_frame,
                     routed_child,
                 )
             };
@@ -2785,8 +2834,8 @@ impl BTree {
             };
             unsafe {
                 self.set_parent_link_for_routed_child(
-                    ResidentFrame::from_pinned(&child),
-                    current_frame,
+                    &ResidentFrame::from_pinned(&child),
+                    &current_frame,
                     routed_child,
                 )
             };
@@ -2813,8 +2862,8 @@ impl BTree {
             };
             unsafe {
                 self.set_parent_link_for_routed_child(
-                    ResidentFrame::from_pinned(&child),
-                    current_frame,
+                    &ResidentFrame::from_pinned(&child),
+                    &current_frame,
                     RoutedChild::new(upper, ParentEdge::Upper),
                 )
             };
@@ -2889,12 +2938,12 @@ impl BTree {
             self.pool()
                 .with_fixed_exclusive(&self.meta_swip, |root_frame| {
                     let root = ResidentFrame::from_exclusive(root_frame);
-                    Self::collect_evicted_child_pids(root)
+                    Self::collect_evicted_child_pids(&root)
                 })
         }
     }
 
-    fn collect_evicted_child_pids(root: ResidentFrame) -> Vec<u64> {
+    fn collect_evicted_child_pids(root: &ResidentFrame<'_>) -> Vec<u64> {
         if root.is_leaf() {
             return Vec::new();
         }
@@ -3632,7 +3681,7 @@ mod tests {
             assert!(BTreeNode::is_leaf(leaf_bf.frame_ref().read_ref()));
 
             let (parent_bf, pos) = tree
-                .find_parent(ResidentFrame::from_pinned(&leaf_bf))
+                .find_parent(&ResidentFrame::from_pinned(&leaf_bf))
                 .expect("should find parent under non-leftmost subtree");
 
             let parent_ref = parent_bf.frame_ref();

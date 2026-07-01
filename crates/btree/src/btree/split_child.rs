@@ -27,7 +27,7 @@ impl<'frame, 'guard> SplitChild<'frame, 'guard> {
         Self { frame }
     }
 
-    pub(crate) fn resident_frame(self) -> ResidentFrame {
+    pub(crate) fn resident_frame(&self) -> ResidentFrame<'guard> {
         ResidentFrame::from_exclusive(self.frame)
     }
 
