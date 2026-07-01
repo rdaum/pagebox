@@ -4081,14 +4081,17 @@ impl BufferPool {
                 }
             }
             EvictionPolicy::RandomSecondChance => {
-                let attempts = (max_batch.saturating_mul(4)).max(self.allocated_slots() * 2);
+                // try_evict_one already does a full clock-hand sweep
+                // (up to num_slots probes). Call it just once — the
+                // sweep clears referenced bits and evicts the first
+                // unreferenced frame it finds. If it returns false,
+                // no frame in the pool is currently evictable.
                 let mut evicted = 0usize;
-                for _ in 0..attempts {
+                for _ in 0..max_batch {
                     if self.try_evict_one() {
                         evicted += 1;
-                        if evicted >= max_batch {
-                            break;
-                        }
+                    } else {
+                        break;
                     }
                 }
                 evicted
