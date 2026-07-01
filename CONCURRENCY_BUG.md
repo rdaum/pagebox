@@ -134,3 +134,28 @@ model the race deterministically. Results:
 The bug must be in a code path that bypasses `unswizzle_and_free` — either
 a direct call to `free_evicting_frame` without the `can_free` check, or a
 race in the SWIP unswizzle that corrupts routing before the frame is freed.
+
+### Z3 verification of `try_fix_orphan_raw` vs `free_evicting_frame`
+
+Z3 proved UNSAT that a reader can pin a frame in Free state. The state
+machine transitions (Resident→Evicting→Free) are monotonic, and the reader's
+`state.load(Acquire)` always sees the current or a later state. If the
+state is Evicting, the reader's pin fails (returns None). If Free, also
+fails. The reader can only pin when state == Resident, which means the
+frame was not yet evicted or was reverted to Resident (not freed).
+
+### Remaining hypothesis
+
+Since shuttle and Z3 both confirm the pin/evict paths are individually
+correct, the bug likely lies in the **interaction between the optimistic
+read path and the eviction path at the B+tree level** — specifically in
+`find_leaf_optimistic` (btree.rs:763), where the reader holds an
+optimistic guard on the inner node, reads the routed child SWIP, and
+then calls `try_pin_child` or `try_fix_orphan_frame` — all without
+re-validating the optimistic guard after the child pin (at least in the
+cold-SWIP path at btree.rs:870-884). If the inner node is concurrently
+evicted and the optimistic guard is invalidated, the reader may traverse
+to a child page that is no longer the correct routing target.
+
+This is distinct from the buffer pool's pin/evict race — it's a
+tree-level traversal correctness issue under concurrent eviction.

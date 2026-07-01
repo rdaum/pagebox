@@ -550,3 +550,316 @@ fn shuttle_fast_path_reader_holds_no_lock() {
         1000,
     );
 }
+
+/// Model the stale-SWIP-after-revert race.
+///
+/// Scenario:
+/// 1. Evictor: CAS child state Resident→Evicting (succeeds)
+/// 2. Evictor: re-check pin_count → 0
+/// 3. Evictor: unswizzle_parent → writes EVICTED(pid) to parent's SWIP
+/// 4. Reader: reads parent's SWIP → sees EVICTED(pid) (cold)
+/// 5. Reader: calls fix_orphan_frame(pid) → page_table.lookup(pid)
+///    → finds child frame → state is Evicting → tries to pin
+/// 6. Evictor: eviction_mu.write() → can_free → pin_count > 0 (reader pinned it in step 5's fetch_add?)
+///
+/// Wait: in step 5, fix_orphan_raw does:
+///   a. page_table.lookup(pid) → finds bf
+///   b. state.load(Acquire) → Evicting (not Resident) → enters Loading/Evicting handling
+///   c. In the Evicting branch: try_rescue_evicting_orphan → tries to revert to Resident
+///   d. If rescue succeeds: continues with the pin
+///   e. If rescue fails: returns None
+///
+/// But between step 3 (unswizzle_parent) and step 6 (eviction_mu.write),
+/// the reader can:
+///   - Read the parent's SWIP (EVICTED)
+///   - Look up the child in page_table (finds it, state=Evicting)
+///   - Try try_rescue_evicting_orphan (exclusively latches the child)
+///     But the child is already exclusively latched by the evictor!
+///     So try_lock_exclusive FAILS → rescue fails → returns None.
+///
+/// Then the evictor:
+///   - eviction_mu.write()
+///   - can_free: pin_count == 0 (reader didn't pin) → frees the frame
+///   - page_table.remove(pid)
+///
+/// Now the reader retries fix_orphan_frame(pid):
+///   - page_table.lookup(pid) → NOT FOUND (removed) → tries free_list
+///   - Pops a free frame → tries try_insert(pid, bf) → succeeds
+///   - Loads the page from disk → Resident
+///
+/// This should work. But what if the frame was reused for a DIFFERENT page
+/// before the reader retries? Then page_table.lookup(pid) fails, the reader
+/// pops a new free frame, loads the page from disk, and everything is fine.
+///
+/// So the stale-SWIP-after-revert path seems correct...
+/// Unless the reader sees EVICTED but the frame is REVERTED to Resident
+/// (pin_count > 0 at can_free check). Then:
+///   - Reader reads parent SWIP → EVICTED(pid)
+///   - Reader calls fix_orphan_frame(pid)
+///   - page_table.lookup(pid) → finds bf (still in page_table, not freed)
+///   - state.load(Acquire) → Resident (reverted by evictor)
+///   - Tries to pin: pin_count.fetch_add(1) → state still Resident → pin succeeds
+///   - Reader uses the frame → correct!
+///
+/// So this path is also fine. The race must be elsewhere.
+///
+/// Let me test a different hypothesis: the parent's SWIP is read by
+/// try_route_to_child under a SHARED guard (optimistic or shared latch).
+/// The unswizzle_parent writes EVICTED to the parent's page bytes under
+/// an exclusive latch. But if the reader holds a shared guard, the
+/// exclusive write should block... unless it's optimistic.
+///
+/// In find_leaf_optimistic, the reader uses an optimistic guard on the
+/// parent. Optimistic guards DON'T block exclusive writers. The writer
+/// (unswizzle_parent) does try_lock_exclusive on the parent. If the
+/// optimistic reader is mid-read, the exclusive write succeeds, and the
+/// reader's subsequent validate() fails → Restart.
+///
+/// But in find_leaf_optimistic, between reading the SWIP and validating,
+/// the reader may have already called try_pin_child on the STALE hot SWIP.
+/// If the child was evicted (SWIP changed to EVICTED), the reader's
+/// try_pin_child would use the OLD hot SWIP (from before the unswizzle).
+/// The hot SWIP points to a frame that may have been freed and reused.
+///
+/// THIS is the real race: optimistic reader reads hot SWIP → unswizzle
+/// changes it to EVICTED → reader tries try_pin_child on stale hot SWIP
+/// → if the frame was freed and reused, try_pin_child pins the wrong page.
+#[test]
+fn shuttle_optimistic_stale_swip_race() {
+    shuttle::check_random(
+        || {
+            // Model: parent has a SWIP that can be read optimistically.
+            // The SWIP is either HOT (points to child frame) or EVICTED (page_id).
+            // Reader reads SWIP optimistically; evictor changes HOT→EVICTED.
+
+            let swip = Arc::new(AtomicU64::new(0)); // 0 = HOT (points to frame 0)
+            let child_state = Arc::new(AtomicU64::new(RESIDENT));
+            let child_pid = Arc::new(AtomicU64::new(42));
+            let child_freed = Arc::new(AtomicU64::new(0));
+            let child_reused_pid = Arc::new(AtomicU64::new(99));
+
+            let swip_r = swip.clone();
+            let cs_r = child_state.clone();
+            let cp_r = child_pid.clone();
+            let cf_r = child_freed.clone();
+            let cr_r = child_reused_pid.clone();
+            let reader = thread::spawn(move || {
+                // Optimistic read of SWIP
+                let raw = swip_r.load(Ordering::Acquire);
+                let is_hot = raw == 0; // 0 = HOT
+
+                if is_hot {
+                    // try_pin_child on the hot SWIP
+                    // (no lock_hot_pin on fast path)
+                    // Check child state
+                    let st = cs_r.load(Ordering::Acquire);
+                    if st != RESIDENT {
+                        return false; // pin failed
+                    }
+                    // Pin succeeded — read the child's pid
+                    let pid = cp_r.load(Ordering::Acquire);
+                    let was_freed = cf_r.load(Ordering::Acquire) != 0;
+                    if was_freed {
+                        // The child was freed and reused for a different page.
+                        // We're reading the WRONG pid!
+                        let reused_pid = cr_r.load(Ordering::Acquire);
+                        if reused_pid != pid {
+                            panic!(
+                                "BUG: reader pinned freed frame, read pid={pid} but actual={reused_pid}"
+                            );
+                        }
+                    }
+                }
+                true
+            });
+
+            let swip_e = swip.clone();
+            let cs_e = child_state.clone();
+            let cp_e = child_pid.clone();
+            let cf_e = child_freed.clone();
+            let cr_e = child_reused_pid.clone();
+            let evictor = thread::spawn(move || {
+                // Evict the child:
+                // 1. CAS state Resident→Evicting
+                if cs_e
+                    .compare_exchange(RESIDENT, EVICTING, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_err()
+                {
+                    return;
+                }
+                // 2. Re-check pin_count (not modeled — assume 0)
+                // 3. unswizzle_parent: write EVICTED(pid) to parent's SWIP
+                let pid = cp_e.load(Ordering::Relaxed);
+                swip_e.store(pid, Ordering::Release); // EVICTED(pid)
+                // 4. eviction_mu.write() + can_free + free (not modeled with lock)
+                // 5. free: state = Free, page_table.remove
+                cf_e.store(1, Ordering::Release);
+                cs_e.store(FREE, Ordering::Relaxed);
+                // 6. Frame is reused for a different page
+                cp_e.store(99, Ordering::Relaxed); // new pid
+                cs_e.store(RESIDENT, Ordering::Relaxed); // back to Resident
+            });
+
+            reader.join().unwrap();
+            evictor.join().unwrap();
+        },
+        1000,
+    );
+}
+
+/// Model the page_table race between fix_orphan_raw (reader loading a cold page)
+/// and free_evicting_frame (evictor freeing the same page).
+///
+/// fix_orphan_raw:
+///   1. page_table.lookup(pid) → finds existing frame (Resident)
+///   2. pin_count.fetch_add(1) → pin succeeds (state == Resident)
+///   3. return pinned frame
+///
+/// free_evicting_frame (called from unswizzle_and_free after can_free passes):
+///   1. page_table.remove(pid)
+///   2. state = Free
+///
+/// The race: between step 1 and step 2 of fix_orphan_raw, the evictor may
+/// run free_evicting_frame. But can_free_evicting_frame checks pin_count == 0,
+/// and the reader's fetch_add in step 2 happens before the evictor's can_free
+/// check (because eviction_mu.write() blocks until the reader's lock_hot_pin
+/// read lock is released... but on the fast path, there IS no read lock).
+///
+/// Wait — fix_orphan_raw does NOT use try_pin_hot_or_cool_swip. It uses its
+/// own pin logic at line 3695:
+///   pin_count.fetch_add(1, Relaxed)
+///   state.load(Acquire)
+///   if Resident: Some
+///   else: undo, None
+///
+/// And it uses try_lock_hot_pin (line 3692) which is conditional.
+/// On the fast path (budget high), try_lock_hot_pin returns Some(None) → no lock.
+/// Then pin_count.fetch_add + state.load race with the evictor.
+///
+/// But the evictor's can_free check (under eviction_mu.write) should catch
+/// any non-zero pin_count... UNLESS the reader is on the fast path (no read
+/// lock) and the evictor's eviction_mu.write doesn't block the reader.
+///
+/// The key question: can the reader's fetch_add happen AFTER the evictor's
+/// can_free check but BEFORE the evictor's page_table.remove + state=Free?
+///
+/// Timeline:
+/// 1. Evictor: CAS state Resident→Evicting
+/// 2. Evictor: re-check pin_count → 0
+/// 3. Evictor: unswizzle_parent (modifies parent SWIP)
+/// 4. Evictor: eviction_mu.write()
+/// 5. Evictor: can_free → pin_count == 0
+/// 6. Reader: (fast path, no read lock) page_table.lookup → finds frame
+/// 7. Reader: try_lock_hot_pin → Some(None) (fast path, ewp was set by evictor at step 4... wait, ewp is set BEFORE eviction_mu.write())
+///
+/// Actually: evp.fetch_add(1) at line 4709, THEN eviction_mu.write() at 4710.
+/// So the reader's lock_hot_pin checks ewp:
+///   - If ewp > 0: takes read lock → blocks on eviction_mu.write()
+///   - If ewp == 0: fast path, no lock
+///
+/// The reader can check ewp BEFORE the evictor sets it (step 4). Then:
+/// 6. Reader: ewp.load → 0 → fast path
+/// 7. Reader: page_table.lookup → finds frame
+/// 8. Evictor: ewp.fetch_add(1) (step 4a)
+/// 9. Evictor: eviction_mu.write() (step 4b)
+/// 10. Evictor: can_free → pin_count still 0 (reader hasn't fetched yet)
+/// 11. Evictor: page_table.remove(pid), state = Free
+/// 12. Reader: pin_count.fetch_add(1) → pins a FREE frame!
+/// 13. Reader: state.load → Free (not Resident) → undo pin, return None
+///
+/// Step 13 returns None, so the reader retries. No harm.
+/// But what if step 12 and 13 happen BETWEEN step 10 and 11?
+/// 10. Evictor: can_free → pin_count == 0
+/// 11. Reader: pin_count.fetch_add(1) → pin_count = 1
+/// 12. Reader: state.load → Evicting → undo pin, return None
+/// 13. Evictor: page_table.remove, state = Free
+///
+/// Also fine — reader sees Evicting, backs off.
+///
+/// What if step 12 sees Resident? State was CAS'd to Evicting at step 1.
+/// So state.load can't see Resident after the CAS. Unless the frame was
+/// reverted to Resident by another path...
+///
+/// I can't find the race through this path either. Let me just commit the
+/// tests and move on to running the actual benchmark with the Kimi fix.
+#[test]
+fn shuttle_page_table_race() {
+    shuttle::check_random(
+        || {
+            let state = Arc::new(AtomicU64::new(RESIDENT));
+            let pin_count = Arc::new(AtomicU64::new(0));
+            let in_page_table = Arc::new(AtomicU64::new(1)); // 1 = yes
+            let ewp = Arc::new(AtomicU64::new(0));
+            let mu = Arc::new(shuttle::sync::RwLock::new(()));
+            let freed_while_pinned = Arc::new(AtomicU64::new(0));
+
+            let s = state.clone();
+            let pc = pin_count.clone();
+            let ipt = in_page_table.clone();
+            let ewp_r = ewp.clone();
+            let mu_r = mu.clone();
+            let fwp_r = freed_while_pinned.clone();
+            let reader = thread::spawn(move || {
+                // fix_orphan_raw: lookup → pin
+                // try_lock_hot_pin: conditional
+                let _guard = if ewp_r.load(Ordering::Acquire) != 0 {
+                    Some(mu_r.read())
+                } else {
+                    None
+                };
+                // page_table.lookup → found (in_page_table == 1)
+                if ipt.load(Ordering::Acquire) == 0 {
+                    return; // not in page_table
+                }
+                pc.fetch_add(1, Ordering::Relaxed);
+                let st = s.load(Ordering::Acquire);
+                if st != RESIDENT {
+                    pc.fetch_sub(1, Ordering::Relaxed);
+                    return; // pin failed
+                }
+                // Pin succeeded — check if frame was freed while pinned
+                let was_freed = fwp_r.load(Ordering::Acquire) != 0;
+                pc.fetch_sub(1, Ordering::Relaxed);
+                if was_freed {
+                    panic!("BUG: page_table reader pinned a freed frame");
+                }
+            });
+
+            let s2 = state.clone();
+            let pc2 = pin_count.clone();
+            let ipt2 = in_page_table.clone();
+            let ewp2 = ewp.clone();
+            let mu_w = mu.clone();
+            let fwp2 = freed_while_pinned.clone();
+            let evictor = thread::spawn(move || {
+                // CAS Resident→Evicting
+                if s2
+                    .compare_exchange(RESIDENT, EVICTING, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_err()
+                {
+                    return;
+                }
+                if pc2.load(Ordering::Acquire) != 0 {
+                    s2.store(RESIDENT, Ordering::Relaxed);
+                    return;
+                }
+                // unswizzle_and_free:
+                ewp2.fetch_add(1, Ordering::AcqRel);
+                let _g = mu_w.write();
+                ewp2.fetch_sub(1, Ordering::AcqRel);
+                if pc2.load(Ordering::Acquire) != 0 {
+                    s2.store(RESIDENT, Ordering::Relaxed);
+                    return;
+                }
+                // free: page_table.remove, state = Free
+                ipt2.store(0, Ordering::Release);
+                fwp2.store(1, Ordering::Release);
+                s2.store(FREE, Ordering::Relaxed);
+            });
+
+            reader.join().unwrap();
+            evictor.join().unwrap();
+        },
+        1000,
+    );
+}

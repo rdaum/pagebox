@@ -4111,6 +4111,16 @@ impl BufferPool {
             return None;
         };
 
+        // A concurrent reader can increment pin_count between the earlier
+        // inspection and the CAS above while still seeing Resident state.
+        // Re-check pin_count under the Evicting state before any writeback or
+        // parent unswizzle; if a pin sneaked in, revert to Resident so the
+        // reader keeps a valid frame and the parent SWIP stays correct.
+        if unsafe { (*bf).header.core.pin_count.load(Ordering::Acquire) } != 0 {
+            Self::revert_frame_to_resident(bf);
+            return None;
+        }
+
         let pid = unsafe { (*bf).header.core.pid };
         if unsafe { (*bf).header.core.dirty.load(Ordering::Relaxed) }
             && is_no_steal_page(unsafe { (*bf).page_bytes() })
@@ -4148,14 +4158,7 @@ impl BufferPool {
 
     #[cfg(not(miri))]
     fn finish_latched_evicting_frame(&self, bf: *mut BufferFrame, pid: u64) -> bool {
-        let parent_updated = self.unswizzle_parent(bf, pid);
-        if !self.parent_link_allows_free(bf, parent_updated) {
-            Self::revert_frame_to_resident(bf);
-            return false;
-        }
-
-        self.free_evicting_frame(bf);
-        true
+        self.unswizzle_and_free(bf, pid)
     }
 
     pub(crate) fn try_evict_policy(&self, max_batch: usize) -> usize {
@@ -4175,7 +4178,7 @@ impl BufferPool {
                 }
             }
             EvictionPolicy::RandomSecondChance => {
-                let attempts = (max_batch.saturating_mul(4)).max(8);
+                let attempts = (max_batch.saturating_mul(4)).max(self.allocated_slots() * 2);
                 let mut evicted = 0usize;
                 for _ in 0..attempts {
                     if self.try_evict_one() {
@@ -4702,14 +4705,11 @@ impl BufferPool {
         // Block new hot pins only for the final free window. DFS parent
         // discovery can run without stopping the world; once the parent
         // swip is updated, we only need to ensure no in-flight hot pin
-        // still references this frame before freeing it.
+        // observes the Evicting-to-Free transition.
         self.eviction_writer_pending.fetch_add(1, Ordering::AcqRel);
-        let eviction_guard = self.eviction_mu.try_write();
+        let _eviction_guard = self.eviction_mu.write();
         self.eviction_writer_pending.fetch_sub(1, Ordering::AcqRel);
-        let Some(_eviction_guard) = eviction_guard else {
-            Self::revert_frame_to_resident(bf);
-            return false;
-        };
+
         if !Self::can_free_evicting_frame(bf) {
             Self::revert_frame_to_resident(bf);
             return false;
