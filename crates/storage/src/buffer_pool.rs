@@ -579,6 +579,12 @@ pub struct BufferPool {
     /// Readers back off when this is non-zero so they don't starve
     /// `Evicting -> Free` transitions.
     eviction_writer_pending: AtomicUsize,
+    /// Bounded budget for concurrent evictions. At most `eviction_budget`
+    /// frames can be in the Evicting state simultaneously. Acquired before
+    /// transitioning a frame to Evicting; released when the frame reaches
+    /// Free or reverts to Resident.
+    eviction_budget: usize,
+    eviction_in_flight: AtomicUsize,
     /// Best-effort reclaim callbacks keyed by owning page ID.
     page_reclaimers: parking_lot::Mutex<HashMap<u64, Arc<dyn PageReclaimer>>>,
     /// Page-image preparation callbacks keyed by common page type.
@@ -899,6 +905,27 @@ fn eviction_policy() -> EvictionPolicy {
         };
         parse_eviction_policy(raw.trim()).unwrap_or(EvictionPolicy::RandomSecondChance)
     })
+}
+
+/// A permit to transition a frame into the Evicting state.
+///
+/// Bounds the number of frames simultaneously in Evicting to
+/// `BufferPool::eviction_budget` (pool_size / 4, min 1). Without this bound,
+/// concurrent eviction calls on a small pool can transition most frames to
+/// Evicting before any finishes the unswizzle → Free transition, leaving no
+/// Resident frames for readers and panicking with "buffer pool exhausted."
+///
+/// Acquired via [`BufferPool::try_acquire_eviction_permit`] before the CAS
+/// that transitions a frame to Evicting. Released on Drop — whether the frame
+/// reaches Free (eviction succeeded) or reverts to Resident (eviction
+/// aborted), the permit is released when the Evicting state ends.
+struct EvictionPermit<'a> {
+    in_flight: &'a AtomicUsize,
+}
+impl Drop for EvictionPermit<'_> {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::Release);
+    }
 }
 
 /// Name of the eviction policy in effect for this process.
@@ -2777,8 +2804,6 @@ impl BufferPool {
             if let Some(bf) = self.state.free_list.try_pop() {
                 return bf;
             }
-            // Evict one frame at a time to avoid swamping the pool with
-            // Evicting-state frames under concurrent fix_orphan_frame calls.
             if self.try_evict_any_policy(1) > 0 || self.try_evict_any_batch(1) > 0 {
                 idle = 0;
             } else {
@@ -2790,18 +2815,7 @@ impl BufferPool {
             {
                 idle = 0;
             }
-            if idle >= 32 {
-                // Under heavy read contention on a small pool, optimistic
-                // readers hold latches that prevent try_lock_exclusive in
-                // eviction, and the second-chance referenced bit cycles.
-                // Yield to let readers release latches so eviction can
-                // proceed.
-                #[cfg(not(loom))]
-                std::thread::yield_now();
-                #[cfg(loom)]
-                loom::thread::yield_now();
-            }
-            if idle >= 4096 {
+            if idle >= 1024 {
                 self.panic_pool_exhausted();
             }
         }
@@ -2935,6 +2949,8 @@ impl BufferPool {
             dt_registry: parking_lot::Mutex::new(HashMap::new()),
             eviction_mu: parking_lot::RwLock::new(()),
             eviction_writer_pending: AtomicUsize::new(0),
+            eviction_budget: (num_frames / 4).max(1),
+            eviction_in_flight: AtomicUsize::new(0),
             page_reclaimers: parking_lot::Mutex::new(HashMap::new()),
             page_writeback_preparers: parking_lot::Mutex::new(HashMap::new()),
             pending_reusable_extents: parking_lot::Mutex::new(Vec::new()),
@@ -4010,7 +4026,7 @@ impl BufferPool {
             "buffer pool exhausted: all frames pinned \
              (total={}, allocated={}, free_counter={}, free_actual={}, resident={}, \
              pinned={}, dirty={}, inner_idx={}, \
-             evicting={}, loading={})",
+             evicting={}, loading={}, eviction_budget={}, eviction_in_flight={})",
             arena.len,
             num_slots,
             self.resident_base_pages_available.load(Ordering::Relaxed),
@@ -4021,6 +4037,8 @@ impl BufferPool {
             inner,
             evicting,
             loading,
+            self.eviction_budget,
+            self.eviction_in_flight.load(Ordering::Relaxed),
         )
     }
 
@@ -4078,6 +4096,29 @@ impl BufferPool {
         .unwrap_or(false)
     }
 
+    /// Try to acquire an eviction permit. Returns `None` if the pool already
+    /// has `eviction_budget` frames in the Evicting state. The permit must be
+    /// held for the entire lifetime of the Evicting state — from the CAS that
+    /// transitions Resident → Evicting until the frame reaches Free or reverts
+    /// to Resident.
+    fn try_acquire_eviction_permit(&self) -> Option<EvictionPermit<'_>> {
+        loop {
+            let current = self.eviction_in_flight.load(Ordering::Acquire);
+            if current >= self.eviction_budget {
+                return None;
+            }
+            if self
+                .eviction_in_flight
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(EvictionPermit {
+                    in_flight: &self.eviction_in_flight,
+                });
+            }
+        }
+    }
+
     #[cfg(not(miri))]
     fn with_single_evict_candidate<T>(
         &self,
@@ -4112,6 +4153,12 @@ impl BufferPool {
         if unsafe { (*bf).header.core.referenced.swap(false, Ordering::Relaxed) } {
             return None;
         }
+
+        // Acquire eviction permit before transitioning to Evicting.
+        // This bounds the number of frames simultaneously in Evicting to
+        // eviction_budget, preventing pool exhaustion under concurrent
+        // eviction attempts.
+        let _permit = self.try_acquire_eviction_permit()?;
 
         let Ok(_) = (unsafe {
             (*bf).header.core.state.compare_exchange(
@@ -4402,16 +4449,26 @@ impl BufferPool {
         struct LatchedCandidate {
             candidate: Candidate,
             _guard: ExclusiveGuard<'static>,
+            _permit: EvictionPermit<'static>,
         }
 
         impl LatchedCandidate {
-            unsafe fn new(candidate: Candidate, guard: ExclusiveGuard<'_>) -> Self {
+            unsafe fn new(
+                candidate: Candidate,
+                guard: ExclusiveGuard<'_>,
+                permit: EvictionPermit<'_>,
+            ) -> Self {
                 // SAFETY: frame latches live in the pool's frame array and
-                // outlive this eviction batch.
+                // outlive this eviction batch. The eviction_in_flight counter
+                // lives in the pool's struct and outlives this batch.
                 let guard = unsafe { extend_exclusive_guard(guard) };
+                let permit = unsafe {
+                    std::mem::transmute::<EvictionPermit<'_>, EvictionPermit<'static>>(permit)
+                };
                 Self {
                     candidate,
                     _guard: guard,
+                    _permit: permit,
                 }
             }
 
@@ -4451,6 +4508,9 @@ impl BufferPool {
                 return None;
             }
 
+            // Acquire eviction permit before transitioning to Evicting.
+            let permit = pool.try_acquire_eviction_permit()?;
+
             let Ok(_) = (unsafe {
                 (*bf).header.core.state.compare_exchange(
                     FrameState::Resident,
@@ -4478,7 +4538,10 @@ impl BufferPool {
                 page_lsn,
                 dirty_buf_idx: None,
             };
-            Some((unsafe { LatchedCandidate::new(candidate, guard) }, is_dirty))
+            Some((
+                unsafe { LatchedCandidate::new(candidate, guard, permit) },
+                is_dirty,
+            ))
         }
 
         fn try_finalize_evicting_candidate(pool: &BufferPool, candidate: &Candidate) -> bool {
