@@ -667,11 +667,10 @@ unsafe impl Sync for BufferPool {}
 fn background_page_provider_enabled() -> bool {
     static VALUE: OnceLock<bool> = OnceLock::new();
     *VALUE.get_or_init(|| {
-        // Disabled by default. The background thread adds condvar latency
-        // on the eviction path and competes for CPU with workers. The
-        // hot-pin fence is still gated on budget pressure (see
-        // lock_hot_pin) regardless of this setting, so the in-memory read
-        // path remains lock-free when there's no eviction.
+        // Disabled by default. The background thread competes with worker
+        // threads for CPU under high contention, reducing throughput. The
+        // inline backoff strategy in pop_free_frame handles eviction
+        // contention without a separate thread.
         // Set PAGEBOX_ENABLE_BACKGROUND_PAGE_PROVIDER=1 to enable for
         // experiments.
         matches!(
@@ -2617,6 +2616,15 @@ impl BufferPool {
         loop {
             if let Some(bf) = self.state.free_list.try_pop() {
                 return bf;
+            }
+
+            // Notify the background page provider that we need frames.
+            // It will evict clean pages and flush dirty ones in the
+            // background, replenishing the free list without blocking
+            // the caller.
+            if backoff.attempt() == 0 {
+                let pp = self.page_provider.lock().unwrap();
+                pp.need_frames_notify();
             }
 
             // Backpressure: if all eviction permits are taken, other
