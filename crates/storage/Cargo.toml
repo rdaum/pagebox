@@ -9,7 +9,7 @@ default = ["metrics"]
 metrics = ["dep:fast-telemetry"]
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(miri)', 'cfg(metrics)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(miri)', 'cfg(metrics)', 'cfg(shuttle)'] }
 
 [dependencies]
 pagebox-frame-kernel.workspace = true
@@ -29,6 +29,7 @@ loom.workspace = true
 micromeasure.workspace = true
 paste.workspace = true
 proptest.workspace = true
+shuttle.workspace = true
 tempfile.workspace = true
 
 [[bench]]
