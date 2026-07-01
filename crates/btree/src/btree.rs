@@ -873,6 +873,15 @@ impl BTree {
                 else {
                     return Err(Restart);
                 };
+                // Re-validate the optimistic guard after loading the child.
+                // Between route_to_child (line 852) and try_fix_orphan_frame,
+                // another thread could have exclusively latched this inner
+                // node (e.g., during eviction's unswizzle_parent) and modified
+                // its routing entries. Without this check, we'd proceed with
+                // a stale routed_child that points to the wrong subtree.
+                if inner.validate().is_err() {
+                    return Err(Restart);
+                }
                 let child_frame = ResidentFrame::from_pinned(&child);
                 unsafe {
                     self.set_parent_link_for_routed_child(child_frame, current_frame, routed_child)

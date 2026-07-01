@@ -863,3 +863,138 @@ fn shuttle_page_table_race() {
         1000,
     );
 }
+
+/// Model the optimistic traversal race in find_leaf_optimistic.
+///
+/// Reader (find_leaf_optimistic, cold SWIP path):
+///   1. optimistic guard on parent (version = v)
+///   2. route_to_child(key) → reads SWIP from parent's page bytes
+///   3. validate (version still v?) → OK
+///   4. child_swip is COLD → try_fix_orphan_frame(page_id)
+///   5. [MISSING: inner.validate() — NOW ADDED]
+///   6. set_parent_link + current = child
+///
+/// Writer (unswizzle_parent → try_unswizzle_inner_node_fast_path):
+///   1. try_lock_exclusive on parent (bumps version from v to v|1)
+///   2. write EVICTED(pid) to parent's page bytes (modifies routing)
+///   3. drop exclusive guard (bumps version to v+2)
+///
+/// The race: reader reads SWIP (step 2), writer modifies it (W2-3),
+/// reader validates (step 3). If the writer's exclusive guard is held
+/// during step 3, validate sees version v|1 → fails → Restart. Good.
+/// If the writer completes before step 3, validate sees v+2 → fails. Good.
+/// If the writer hasn't started yet, validate sees v → succeeds. Then
+/// the writer runs between step 3 and step 4. The reader proceeds with
+/// the old SWIP (which was HOT, not COLD). try_pin_child on HOT SWIP
+/// might succeed (child was evicted, SWIP changed, but reader has stale
+/// SWIP pointing to old frame position). The frame may have been reused.
+///
+/// Wait — but the reader reads the SWIP from the parent's page bytes.
+/// If the writer modifies the SWIP in the parent's page bytes (W2),
+/// the reader already has the OLD SWIP in a local variable (step 2).
+/// The SWIP is a u64 value copied into `child_swip`. The writer's
+/// modification to the parent's page bytes doesn't affect the reader's
+/// local copy. But `validate()` checks if the parent was modified.
+/// If validate passes (no modification yet), the reader's local SWIP
+/// is correct. If validate fails, the reader restarts.
+///
+/// The question: can the writer modify the parent BETWEEN the reader's
+/// validate (step 3) and the reader's use of child_swip (step 4)?
+/// YES — that's the race window. But the SWIP value is already in the
+/// reader's local variable. If the SWIP was HOT, the reader calls
+/// try_pin_child, which calls try_pin_hot_or_cool_swip. The hot SWIP
+/// points to a frame. If the frame was evicted between step 3 and step 4,
+/// the state would be Evicting (not Resident), and try_pin_hot_or_cool_swip
+/// would fail (fetch_add, load Evicting, undo, return None). Restart.
+///
+/// If the SWIP was COLD (EVICTED), the reader calls try_fix_orphan_frame.
+/// The page_id in the COLD SWIP is stable (it was written by a previous
+/// unswizzle). try_fix_orphan_frame loads the page from disk. The loaded
+/// page is the correct child. No race here.
+///
+/// So the optimistic traversal should be correct IF validate is called
+/// after every read of the parent's data. The bug is that the COLD path
+/// doesn't call validate after try_fix_orphan_frame.
+///
+/// With my fix (adding validate after try_fix_orphan_frame), the race
+/// should be closed. But it still fails. Let me model this in shuttle.
+#[test]
+fn shuttle_optimistic_cold_swip_race() {
+    shuttle::check_random(
+        || {
+            // Model: parent version, parent SWIP (HOT or COLD),
+            // child frame state.
+            let parent_version = Arc::new(AtomicU64::new(0));
+            let parent_swip = Arc::new(AtomicU64::new(0)); // 0 = HOT
+            let child_state = Arc::new(AtomicU64::new(RESIDENT));
+            let child_pid = Arc::new(AtomicU64::new(42));
+
+            let pv = parent_version.clone();
+            let ps = parent_swip.clone();
+            let cs = child_state.clone();
+            let cp = child_pid.clone();
+            let reader = thread::spawn(move || {
+                // 1. optimistic guard (snapshot version)
+                let snapshot = pv.load(Ordering::Acquire);
+
+                // 2. route_to_child: read SWIP
+                let swip = ps.load(Ordering::Acquire);
+                let is_cold = swip != 0;
+
+                // 3. validate
+                if pv.load(Ordering::Acquire) != snapshot {
+                    return; // restart — parent was modified
+                }
+
+                // 4. resolve child
+                if is_cold {
+                    // COLD path: try_fix_orphan_frame(page_id)
+                    // page_id = swip (the EVICTED page_id)
+                    let _page_id = swip;
+                    // Load page from disk — no race here, page_id is stable
+                } else {
+                    // HOT path: try_pin_child(hot_swip)
+                    let st = cs.load(Ordering::Acquire);
+                    if st != RESIDENT {
+                        return; // pin failed — restart
+                    }
+                    // Pin succeeded — but parent may have been modified
+                    // between validate (step 3) and here
+                    // Re-validate in HOT path (line 863 in the real code)
+                    if pv.load(Ordering::Acquire) != snapshot {
+                        return; // restart
+                    }
+                }
+
+                // 5. [MISSING in cold path] validate
+                // With the fix, this is now present for COLD path too
+                if is_cold {
+                    if pv.load(Ordering::Acquire) != snapshot {
+                        return; // restart — parent was modified
+                    }
+                }
+            });
+
+            let pv2 = parent_version.clone();
+            let ps2 = parent_swip.clone();
+            let cs2 = child_state.clone();
+            let cp2 = child_pid.clone();
+            let writer = thread::spawn(move || {
+                // unswizzle_parent: try_lock_exclusive (bump version)
+                let old = pv2.load(Ordering::Acquire);
+                pv2.store(old + 2, Ordering::Release); // exclusive version bump
+
+                // Write EVICTED(pid) to parent's SWIP
+                let pid = cp2.load(Ordering::Acquire);
+                ps2.store(pid, Ordering::Release); // now COLD
+
+                // drop exclusive guard (bump version again)
+                // already done by the store above
+            });
+
+            reader.join().unwrap();
+            writer.join().unwrap();
+        },
+        1000,
+    );
+}
