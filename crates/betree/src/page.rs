@@ -293,6 +293,15 @@ pub(crate) fn encode_leaf_page(
     )
 }
 
+pub(crate) fn encode_leaf_page_direct(
+    page: &mut [u8],
+    fence: &Fence,
+    entries: &[LeafEntry],
+) -> Result<usize, CowBeTreeError> {
+    let body = encode_leaf_body(fence, entries)?;
+    finish_page(page, PageKind::Leaf, entries.len(), body)
+}
+
 #[derive(Debug)]
 pub(crate) struct SplitLeafResult {
     pub(crate) separator: Vec<u8>,
@@ -472,6 +481,7 @@ fn encode_leaf_body(fence: &Fence, entries: &[LeafEntry]) -> Result<Vec<u8>, Cow
     Ok(body.into_inner())
 }
 
+#[allow(dead_code)]
 pub(crate) fn encode_internal_page(
     page: &mut [u8],
     fence: &Fence,
@@ -479,12 +489,19 @@ pub(crate) fn encode_internal_page(
     separators: &[Vec<u8>],
     buffer: &[BufferedMessage],
 ) -> Result<usize, CowBeTreeError> {
-    finish_page(
-        page,
-        PageKind::Internal,
-        children.len(),
-        encode_internal_body(fence, children, separators, buffer)?,
-    )
+    let body = encode_internal_body(fence, children, separators, buffer)?;
+    finish_page(page, PageKind::Internal, children.len(), body)
+}
+
+pub(crate) fn encode_internal_page_direct(
+    page: &mut [u8],
+    fence: &Fence,
+    children: &[u64],
+    separators: &[Vec<u8>],
+    buffer: &[BufferedMessage],
+) -> Result<usize, CowBeTreeError> {
+    let body = encode_internal_body(fence, children, separators, buffer)?;
+    finish_page(page, PageKind::Internal, children.len(), body)
 }
 
 fn encode_internal_body(

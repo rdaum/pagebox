@@ -22,10 +22,10 @@ use crate::page::{
     CowBeTreeError, Fence, LeafEntry, LeafPageReader, LeafUpdateResult, LookupStep, NodePage,
     PageKindDebug, RawVisibleVersion, append_internal_buffer_kv, append_internal_buffer_message,
     append_leaf_entry_message, append_leaf_entry_prefix, append_leaf_kv, apply_message_to_entries,
-    buffer_encoded_len, decode_page, encode_internal_page, encode_leaf_page, encoded_page_len,
-    internal_child_array_range, leaf_should_chase_right, lookup_child_slot, lookup_step,
-    lower_bound_entries, read_child_swip_at, read_right_sibling, route_child,
-    split_leaf_into_pages, update_leaf_kv, write_child_swip_at, write_right_sibling,
+    buffer_encoded_len, decode_page, encode_internal_page_direct, encode_leaf_page,
+    encode_leaf_page_direct, encoded_page_len, internal_child_array_range, leaf_should_chase_right,
+    lookup_child_slot, lookup_step, lower_bound_entries, read_child_swip_at, read_right_sibling,
+    route_child, split_leaf_into_pages, update_leaf_kv, write_child_swip_at, write_right_sibling,
 };
 use crate::stats::{CowBeTreeEvent, CowBeTreeStats};
 
@@ -2195,14 +2195,13 @@ impl CowBeTree {
         right_sibling: u64,
         dirty_lsn: Option<Lsn>,
     ) -> Result<u64, CowBeTreeError> {
-        let mut image = vec![0u8; PAGE_SIZE];
-        let bytes = encode_leaf_page(&mut image, fence, entries)?;
-        if right_sibling != 0 {
-            write_right_sibling(&mut image, right_sibling);
-        }
         let (pid, frame) = self.allocate_frame();
         let mut frame = frame.exclusive();
-        frame.page_bytes_mut().copy_from_slice(&image);
+        let page = frame.page_bytes_mut();
+        let bytes = encode_leaf_page_direct(page, fence, entries)?;
+        if right_sibling != 0 {
+            write_right_sibling(page, right_sibling);
+        }
         frame.set_parent_link_none();
         mark_frame_dirty(&frame, dirty_lsn);
         self.stats.inc(CowBeTreeEvent::CowPagesAllocated);
@@ -2218,11 +2217,10 @@ impl CowBeTree {
         buffer: &[BufferedMessage],
         dirty_lsn: Option<Lsn>,
     ) -> Result<u64, CowBeTreeError> {
-        let mut image = vec![0u8; PAGE_SIZE];
-        let bytes = encode_internal_page(&mut image, fence, children, separators, buffer)?;
         let (pid, frame) = self.allocate_frame();
         let mut frame = frame.exclusive();
-        frame.page_bytes_mut().copy_from_slice(&image);
+        let page = frame.page_bytes_mut();
+        let bytes = encode_internal_page_direct(page, fence, children, separators, buffer)?;
         frame.set_parent_link_none();
         mark_frame_dirty(&frame, dirty_lsn);
         self.stats.inc(CowBeTreeEvent::CowPagesAllocated);
@@ -2283,17 +2281,16 @@ impl CowBeTree {
         right_sibling: u64,
         dirty_lsn: Option<Lsn>,
     ) -> Result<(), CowBeTreeError> {
-        let mut image = vec![0u8; page_size(page_id)];
-        let bytes = encode_leaf_page(&mut image, fence, entries)?;
+        let mut frame = unsafe { self.pool().fix_orphan_frame(page_id) }.exclusive();
+        let page = frame.page_bytes_mut();
+        let bytes = encode_leaf_page_direct(page, fence, entries)?;
         if right_sibling != 0 {
-            write_right_sibling(&mut image, right_sibling);
+            write_right_sibling(page, right_sibling);
         }
-        let page_image_bytes = image.len();
-        self.write_page_image(page_id, image, dirty_lsn);
+        mark_frame_dirty(&frame, dirty_lsn);
         self.stats.inc(CowBeTreeEvent::InPlacePageRewrites);
         self.stats.add_leaf_bytes(bytes);
-        self.stats
-            .add_leaf_page_image_rewrite_bytes(page_image_bytes);
+        self.stats.add_leaf_page_image_rewrite_bytes(PAGE_SIZE);
         Ok(())
     }
 
@@ -2306,17 +2303,17 @@ impl CowBeTree {
         buffer: &[BufferedMessage],
         dirty_lsn: Option<Lsn>,
     ) -> Result<(), CowBeTreeError> {
-        let mut image = vec![0u8; page_size(page_id)];
-        let bytes = encode_internal_page(&mut image, fence, children, separators, buffer)?;
-        let page_image_bytes = image.len();
-        self.write_page_image(page_id, image, dirty_lsn);
+        let mut frame = unsafe { self.pool().fix_orphan_frame(page_id) }.exclusive();
+        let page = frame.page_bytes_mut();
+        let bytes = encode_internal_page_direct(page, fence, children, separators, buffer)?;
+        mark_frame_dirty(&frame, dirty_lsn);
         self.stats.inc(CowBeTreeEvent::InPlacePageRewrites);
         self.stats.add_internal_bytes(bytes);
-        self.stats
-            .add_internal_page_image_rewrite_bytes(page_image_bytes);
+        self.stats.add_internal_page_image_rewrite_bytes(PAGE_SIZE);
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn write_page_image(&self, page_id: u64, image: Vec<u8>, dirty_lsn: Option<Lsn>) {
         let mut frame = unsafe { self.pool().fix_orphan_frame(page_id) }.exclusive();
         let page = frame.page_bytes_mut();
@@ -3073,7 +3070,8 @@ mod tests {
         let children = vec![left_pid, right_pid];
         let separators = vec![b"mid".to_vec()];
         let mut page = vec![0u8; PAGE_SIZE];
-        encode_internal_page(&mut page, &Fence::root(), &children, &separators, &[]).unwrap();
+        encode_internal_page_direct(&mut page, &Fence::root(), &children, &separators, &[])
+            .unwrap();
         assert_eq!(
             page_header::read_page_type(&page),
             PageType::BeTreeInternal,
@@ -3127,7 +3125,7 @@ mod tests {
         let (child_pid, _pinned) = pool.allocate_and_fix();
         let children = vec![child_pid];
         let mut page = vec![0u8; PAGE_SIZE];
-        encode_internal_page(&mut page, &Fence::root(), &children, &[], &[]).unwrap();
+        encode_internal_page_direct(&mut page, &Fence::root(), &children, &[], &[]).unwrap();
 
         let (_, child_offset) = internal_child_array_range(&page).unwrap();
         // A Hot-tagged word pointing at a plausible-but-unowned address: a
