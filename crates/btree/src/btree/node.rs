@@ -159,30 +159,47 @@ impl TmpBuf {
 pub(crate) struct Leaf;
 pub(crate) struct Inner;
 
-#[derive(Clone, Copy)]
-pub(crate) struct RoutedChild {
+/// A routing decision read from an inner node under a guard.
+///
+/// The lifetime `'g` ties it to the guard that read the SWIP from the parent's
+/// page bytes. The SWIP value and edge are `Copy`, but the type is not `Copy`
+/// so the compiler flags use-after-guard-drop as a lifetime error. Callers that
+/// only need the `Swip` value (identity, not routing decision) should extract
+/// it via `swip()` while the guard is alive.
+pub(crate) struct RoutedChildRef<'g> {
     swip: Swip,
     edge: ParentEdge,
+    _marker: PhantomData<&'g ()>,
 }
 
-impl RoutedChild {
+impl<'g> RoutedChildRef<'g> {
+    /// Create a routing decision bound to lifetime `'g`.
+    ///
+    /// The `Swip` and `ParentEdge` are `Copy` values that don't actually
+    /// borrow anything; the lifetime `'g` is a compile-time marker that
+    /// prevents use-after-guard-drop. The caller chooses `'g` to match the
+    /// guard that authorized reading the SWIP from the parent's page bytes.
     pub(crate) fn new(swip: Swip, edge: ParentEdge) -> Self {
-        Self { swip, edge }
+        Self {
+            swip,
+            edge,
+            _marker: PhantomData,
+        }
     }
 
-    pub(crate) fn swip(self) -> Swip {
+    pub(crate) fn swip(&self) -> Swip {
         self.swip
     }
 
-    pub(crate) fn edge(self) -> ParentEdge {
+    pub(crate) fn edge(&self) -> ParentEdge {
         self.edge
     }
 
-    pub(crate) fn slot_index(self, count: u16) -> u16 {
+    pub(crate) fn slot_index(&self, count: u16) -> u16 {
         self.edge.pos(count)
     }
 
-    pub(crate) fn is_upper(self) -> bool {
+    pub(crate) fn is_upper(&self) -> bool {
         self.edge.is_upper()
     }
 }
@@ -397,7 +414,7 @@ impl<'g> ResidentFrame<'g> {
         BTreeNode::is_underfull(self.read_ref())
     }
 
-    pub(crate) fn try_route_to_child(&self, key: &[u8]) -> Option<RoutedChild> {
+    pub(crate) fn try_route_to_child(&self, key: &[u8]) -> Option<RoutedChildRef<'g>> {
         let sp = self.sp();
         let count = sp.num_slots();
         let (pos, _) = sp.try_lower_bound(key)?;
@@ -413,7 +430,7 @@ impl<'g> ResidentFrame<'g> {
                 Swip::from_raw(u64::from_ne_bytes(val[..8].try_into().unwrap()))
             }
         };
-        Some(RoutedChild::new(swip, edge))
+        Some(RoutedChildRef::new(swip, edge))
     }
 
     pub(crate) fn is_empty_leaf(&self) -> bool {
@@ -590,8 +607,24 @@ impl<'a> OptimisticNode<'a, Inner> {
         self.frame.validate()
     }
 
-    pub(crate) fn route_to_child(&self, key: &[u8]) -> Option<RoutedChild> {
-        self.resident_frame().try_route_to_child(key)
+    pub(crate) fn route_to_child(&self, key: &[u8]) -> Option<RoutedChildRef<'a>> {
+        let frame = self.resident_frame();
+        let sp = frame.sp();
+        let count = sp.num_slots();
+        let (pos, _) = sp.try_lower_bound(key)?;
+        let edge = ParentEdge::from_pos(pos, count);
+        let slot = parent_edge_round_trip_pos(pos, count);
+        let swip = match edge {
+            ParentEdge::Upper => frame.upper_swip(),
+            ParentEdge::Slot(_) => {
+                let val = sp.try_get_value(slot)?;
+                if val.len() < 8 {
+                    return None;
+                }
+                Swip::from_raw(u64::from_ne_bytes(val[..8].try_into().unwrap()))
+            }
+        };
+        Some(RoutedChildRef::new(swip, edge))
     }
 
     pub(crate) fn child_edge_for(&self, child: ChildRef<'_>) -> Option<ParentEdge> {
@@ -619,7 +652,7 @@ impl<'a> OptimisticNode<'a, Inner> {
         None
     }
 
-    pub(crate) fn for_each_child_route(&self, mut f: impl FnMut(RoutedChild)) -> Option<()> {
+    pub(crate) fn for_each_child_route(&self, mut f: impl FnMut(RoutedChildRef<'a>)) -> Option<()> {
         let frame = self.resident_frame();
         let sp = frame.sp();
         let count = sp.num_slots();
@@ -633,9 +666,9 @@ impl<'a> OptimisticNode<'a, Inner> {
                 _ => return None,
             };
             let swip = Swip::from_raw(u64::from_ne_bytes(val[..8].try_into().unwrap()));
-            f(RoutedChild::new(swip, ParentEdge::Slot(pos)));
+            f(RoutedChildRef::new(swip, ParentEdge::Slot(pos)));
         }
-        f(RoutedChild::new(frame.upper_swip(), ParentEdge::Upper));
+        f(RoutedChildRef::new(frame.upper_swip(), ParentEdge::Upper));
         Some(())
     }
 
@@ -824,16 +857,16 @@ impl<'a> ExclusiveNode<'a, Inner> {
         None
     }
 
-    pub(crate) fn child_routes(&self) -> Vec<RoutedChild> {
+    pub(crate) fn child_routes(&self) -> Vec<RoutedChildRef<'a>> {
         let count = self.num_slots();
         let mut routes = Vec::with_capacity(count as usize + 1);
         for pos in 0..count {
-            routes.push(RoutedChild::new(
+            routes.push(RoutedChildRef::new(
                 self.resident_frame().child_swip_at(pos),
                 ParentEdge::Slot(pos),
             ));
         }
-        routes.push(RoutedChild::new(
+        routes.push(RoutedChildRef::new(
             self.resident_frame().upper_swip(),
             ParentEdge::Upper,
         ));

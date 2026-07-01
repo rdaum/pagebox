@@ -376,12 +376,37 @@ needed, not optional — Phase 4 is real work, not conditional.
      `cargo clippy --workspace --all-targets` introduces no new warnings;
      `cargo fmt --all` is a no-op.
 
-3. **Phase 3: Replace `RoutedChild` with `RoutedChildRef<'g>`**
-   - Add lifetime parameter tying it to the guard that read the SWIP
-   - Remove `Copy` impl
-   - Update `try_route_to_child` / `route_to_child` signatures
-   - The compiler will flag every site that uses a `RoutedChild` after the
-     guard is dropped
+3. **Phase 3: Replace `RoutedChild` with `RoutedChildRef<'g>`** — *DONE*
+   - Renamed `RoutedChild` to `RoutedChildRef<'g>` with `PhantomData<&'g ()>`
+     marker. Removed `Copy` impl.
+   - `RoutedChildRef::new(swip, edge)` creates `RoutedChildRef<'g>` where `'g`
+     is chosen by the caller. The `Swip` and `ParentEdge` are `Copy` values
+     that don't actually borrow anything; the lifetime `'g` is a compile-time
+     marker that documents which guard authorized reading the SWIP.
+   - `try_route_to_child` / `route_to_child` / `for_each_child_route` /
+     `child_routes` now return `RoutedChildRef<'g>` (or `Vec<RoutedChildRef<'g>>`)
+     tied to the guard's lifetime `'g`.
+   - `set_parent_link_for_routed_child` takes `&RoutedChildRef<'_>` (by
+     reference, not by value) so the caller can use `routed_child.edge()` after
+     the call.
+   - **What the compiler catches:** `RoutedChildRef` is not `Copy`, so using
+     it after moving it (e.g., passing by value to a function and then using
+     `routed_child.edge()` again) is a compile error (E0382). This surfaced
+     5 sites where `routed_child` was moved into
+     `set_parent_link_for_routed_child` and then used again for
+     `routed_child.edge()` — all fixed by passing `&routed_child`.
+   - **Limitation:** because `RoutedChildRef`'s data is all owned (`Copy`
+     `Swip` + `ParentEdge`), the `PhantomData<&'g ()>` marker doesn't create a
+     real borrow. The compiler cannot catch use-after-guard-drop for
+     `RoutedChildRef` alone — the `'g` lifetime is a documentation marker,
+     not an enforced borrow. Enforcing use-after-guard-drop for routing
+     decisions requires tying `'g` to a real borrow (e.g., a `ValidatedToken`
+     from Phase 4), or making `RoutedChildRef::new` require a `&Guard<'g>`
+     argument. The `child_routes()` → `Vec<RoutedChildRef<'a>>` pattern in
+     `try_publish_leaf_split_via_blocking_search` (btree.rs:1555) uses
+     `RoutedChildRef` values after `drop(current)` — this is acceptable because
+     the values are used only for their `swip()` (identity, not routing
+     decision), and the caller re-validates by re-fixing the parent.
 
 4. **Phase 4: Add `ValidatedToken` for post-blocking-call validation**
    - Needed: the `find_leaf_optimistic` root prologue (btree.rs:802) uses

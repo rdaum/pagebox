@@ -25,7 +25,7 @@ mod stats;
 
 use self::node::{
     BTreeNode, ChildRef, ExclusiveNode, FLAG_IS_LEAF, Inner, LEFT_SIBLING_OFFSET, Leaf,
-    OptimisticNode, RIGHT_SIBLING_OFFSET, ResidentFrame, RoutedChild, SharedNode, TmpBuf,
+    OptimisticNode, RIGHT_SIBLING_OFFSET, ResidentFrame, RoutedChildRef, SharedNode, TmpBuf,
 };
 use self::parent_edge::ParentEdge;
 use self::split_child::SplitChild;
@@ -92,7 +92,7 @@ impl BTree {
         &self,
         child: &ResidentFrame<'_>,
         parent: &ResidentFrame<'_>,
-        routed: RoutedChild,
+        routed: &RoutedChildRef<'_>,
     ) {
         let count = parent.num_slots();
         unsafe {
@@ -532,7 +532,7 @@ impl BTree {
                     self.set_parent_link_for_routed_child(
                         &child_frame,
                         &current_frame,
-                        routed_child,
+                        &routed_child,
                     )
                 };
                 current = child;
@@ -544,7 +544,7 @@ impl BTree {
                     self.set_parent_link_for_routed_child(
                         &child_frame,
                         &current_frame,
-                        routed_child,
+                        &routed_child,
                     )
                 };
                 // Swizzle-in: write HOT pointer back to parent's page bytes
@@ -593,7 +593,7 @@ impl BTree {
                         return Err(Restart);
                     }
                     unsafe {
-                        self.set_parent_link_for_routed_child(&child_frame, &root, routed_child)
+                        self.set_parent_link_for_routed_child(&child_frame, &root, &routed_child)
                     };
                     child
                 } else {
@@ -601,7 +601,7 @@ impl BTree {
                     let child = unsafe { pool.fix_orphan_frame(child_swip.as_page_id()) };
                     let child_frame = ResidentFrame::from_pinned(&child);
                     unsafe {
-                        self.set_parent_link_for_routed_child(&child_frame, &root, routed_child)
+                        self.set_parent_link_for_routed_child(&child_frame, &root, &routed_child)
                     };
                     if let Ok(guard) = opt.upgrade_to_exclusive() {
                         match routed_child.edge() {
@@ -675,7 +675,7 @@ impl BTree {
                     self.set_parent_link_for_routed_child(
                         &child_frame,
                         &current_frame,
-                        routed_child,
+                        &routed_child,
                     )
                 };
                 current = child;
@@ -687,7 +687,7 @@ impl BTree {
                     self.set_parent_link_for_routed_child(
                         &child_frame,
                         &current_frame,
-                        routed_child,
+                        &routed_child,
                     )
                 };
                 if let Ok(parent) = inner.upgrade_to_exclusive() {
@@ -776,7 +776,7 @@ impl BTree {
             };
             let child_frame = ResidentFrame::from_pinned(&child);
             unsafe {
-                self.set_parent_link_for_routed_child(&child_frame, &current_frame, routed_child)
+                self.set_parent_link_for_routed_child(&child_frame, &current_frame, &routed_child)
             };
             path.push(current);
             current = child;
@@ -817,7 +817,7 @@ impl BTree {
                         return Err(Restart);
                     }
                     unsafe {
-                        self.set_parent_link_for_routed_child(&child_frame, &root, routed_child)
+                        self.set_parent_link_for_routed_child(&child_frame, &root, &routed_child)
                     }
                     child
                 } else {
@@ -825,7 +825,7 @@ impl BTree {
                     let child = unsafe { pool.fix_orphan_frame(child_swip.as_page_id()) };
                     let child_frame = ResidentFrame::from_pinned(&child);
                     unsafe {
-                        self.set_parent_link_for_routed_child(&child_frame, &root, routed_child)
+                        self.set_parent_link_for_routed_child(&child_frame, &root, &routed_child)
                     };
                     if let Ok(parent) = opt.upgrade_to_exclusive() {
                         match routed_child.edge() {
@@ -891,7 +891,7 @@ impl BTree {
                     self.set_parent_link_for_routed_child(
                         &child_frame,
                         &current_frame,
-                        routed_child,
+                        &routed_child,
                     )
                 };
                 current = child;
@@ -915,7 +915,7 @@ impl BTree {
                     self.set_parent_link_for_routed_child(
                         &child_frame,
                         &current_frame,
-                        routed_child,
+                        &routed_child,
                     )
                 };
                 if let Ok(parent) = inner.upgrade_to_exclusive() {
@@ -972,7 +972,7 @@ impl BTree {
                 self.set_parent_link_for_routed_child(
                     &ResidentFrame::from_pinned(&child),
                     &current_frame,
-                    routed_child,
+                    &routed_child,
                 )
             };
             current = child;
@@ -1034,7 +1034,7 @@ impl BTree {
                 self.set_parent_link_for_routed_child(
                     &ResidentFrame::from_pinned(&child),
                     &current_frame,
-                    routed_child,
+                    &routed_child,
                 )
             };
             path.push(parent_pin);
@@ -2682,7 +2682,7 @@ impl BTree {
                                 self.set_parent_link_for_routed_child(
                                     &ResidentFrame::from_pinned(&child),
                                     &current_frame,
-                                    routed_child,
+                                    &routed_child,
                                 )
                             };
                             current = child;
@@ -2702,7 +2702,7 @@ impl BTree {
                     self.set_parent_link_for_routed_child(
                         &ResidentFrame::from_pinned(&child),
                         &current_frame,
-                        routed_child,
+                        &routed_child,
                     )
                 };
                 let _ = guard;
@@ -2775,7 +2775,7 @@ impl BTree {
                     self.set_parent_link_for_routed_child(
                         &ResidentFrame::from_pinned(&child),
                         &current_frame,
-                        routed_child,
+                        &routed_child,
                     )
                 };
                 drop(shared);
@@ -2786,7 +2786,7 @@ impl BTree {
                 self.set_parent_link_for_routed_child(
                     &ResidentFrame::from_pinned(&child),
                     &current_frame,
-                    routed_child,
+                    &routed_child,
                 )
             };
             current = child;
@@ -2836,7 +2836,7 @@ impl BTree {
                 self.set_parent_link_for_routed_child(
                     &ResidentFrame::from_pinned(&child),
                     &current_frame,
-                    routed_child,
+                    &routed_child,
                 )
             };
             current = child;
@@ -2864,7 +2864,7 @@ impl BTree {
                 self.set_parent_link_for_routed_child(
                     &ResidentFrame::from_pinned(&child),
                     &current_frame,
-                    RoutedChild::new(upper, ParentEdge::Upper),
+                    &RoutedChildRef::new(upper, ParentEdge::Upper),
                 )
             };
             current = child;
