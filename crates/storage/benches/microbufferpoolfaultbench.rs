@@ -7,7 +7,7 @@ use micromeasure::{
     Throughput, benchmark_main, black_box,
 };
 use pagebox_storage::buffer_frame::PAGE_SIZE;
-use pagebox_storage::buffer_pool::BufferPool;
+use pagebox_storage::buffer_pool::{BufferPool, NoLatches};
 use pagebox_storage::page_store::{FilePageStore, PageStore};
 
 #[repr(align(4096))]
@@ -153,7 +153,7 @@ fn fault_worker(
 
     while !control.should_stop() {
         for &pid in pages {
-            let frame = unsafe { pool.fix_orphan_frame(pid) };
+            let frame = unsafe { pool.fix_orphan_frame(pid, NoLatches::new(pool)) };
             checksum ^= u64::from_le_bytes(frame.page[0..8].try_into().expect("pid bytes"));
             operations = operations.wrapping_add(1);
             drop(frame);

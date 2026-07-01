@@ -10,7 +10,9 @@ use parking_lot::Mutex;
 
 use pagebox_storage::buffer_frame::PAGE_SIZE;
 use pagebox_storage::buffer_frame::{BufferFrameRef, ParentFinder, StableSwipRef};
-use pagebox_storage::buffer_pool::{BufferPool, BufferPoolHandle, ExclusiveFrame, PinnedFrame};
+use pagebox_storage::buffer_pool::{
+    BufferPool, BufferPoolHandle, ExclusiveFrame, NoLatches, PinnedFrame,
+};
 use pagebox_storage::slotted_page::SlottedPage;
 use pagebox_swip_kernel::{AtomicSwipWord as AtomicSwip, SwipWord as Swip};
 
@@ -110,9 +112,12 @@ impl BTree {
 
     unsafe fn pin_exclusive_child(&self, swip: Swip) -> Option<ExclusiveFrame<'_>> {
         let child = if swip.is_hot() || swip.is_cool() {
-            unsafe { self.pool().pin_child(swip) }?
+            unsafe { self.pool().pin_child(swip, NoLatches::new(self.pool())) }?
         } else {
-            unsafe { self.pool().fix_orphan_frame(swip.as_page_id()) }
+            unsafe {
+                self.pool()
+                    .fix_orphan_frame(swip.as_page_id(), NoLatches::new(self.pool()))
+            }
         };
         Some(child.exclusive())
     }
@@ -238,7 +243,11 @@ impl BTree {
         if leaf_pid == 0 {
             return;
         }
-        let leaf = unsafe { self.pool().fix_orphan_frame(leaf_pid) }.exclusive();
+        let leaf = unsafe {
+            self.pool()
+                .fix_orphan_frame(leaf_pid, NoLatches::new(self.pool()))
+        }
+        .exclusive();
         let leaf = ExclusiveNode::from_leaf_frame(leaf);
         leaf.resident_frame().set_leaf_left_pid(left_pid);
         leaf.mark_dirty();
@@ -249,7 +258,8 @@ impl BTree {
         P: Into<BufferPoolHandle>,
     {
         let pool = pool.into();
-        let (_root_pid, root_bf) = pool.allocate_and_fix();
+        let pool_ref = pool.as_pool();
+        let (_root_pid, root_bf) = pool_ref.allocate_and_fix(NoLatches::new(pool_ref));
         let root = root_bf.exclusive();
         ResidentFrame::from_exclusive(&root).init(true);
         root.mark_dirty();
@@ -312,7 +322,7 @@ impl BTree {
                 continue;
             }
 
-            let frame = unsafe { pool.fix_orphan_frame(pid) }.shared();
+            let frame = unsafe { pool.fix_orphan_frame(pid, NoLatches::new(pool)) }.shared();
             let resident = ResidentFrame::from_shared(&frame);
             if resident.is_leaf() {
                 continue;
@@ -368,10 +378,14 @@ impl BTree {
     #[cfg(test)]
     unsafe fn resolve_swip(&self, swip: Swip) -> PinnedFrame<'_> {
         if swip.is_hot() || swip.is_cool() {
-            unsafe { self.pool().pin_child(swip) }.expect("hot/cool test swip should pin")
+            unsafe { self.pool().pin_child(swip, NoLatches::new(self.pool())) }
+                .expect("hot/cool test swip should pin")
         } else {
             self.stats.inc(BTreeEvent::ResolveCold);
-            unsafe { self.pool().fix_orphan_frame(swip.as_page_id()) }
+            unsafe {
+                self.pool()
+                    .fix_orphan_frame(swip.as_page_id(), NoLatches::new(self.pool()))
+            }
         }
     }
 
@@ -468,7 +482,7 @@ impl BTree {
         key: &[u8],
     ) -> Result<ExclusiveNode<'a, Leaf>, Restart> {
         let pool = self.pool();
-        let mut current = unsafe { pool.fix_frame(&self.meta_swip) };
+        let mut current = unsafe { pool.fix_frame(&self.meta_swip, NoLatches::new(pool)) };
 
         loop {
             let opt = current.optimistic().map_err(|_| Restart)?;
@@ -485,7 +499,7 @@ impl BTree {
                     if right_pid == 0 {
                         return Err(Restart);
                     }
-                    current = unsafe { pool.fix_orphan_frame(right_pid) };
+                    current = unsafe { pool.fix_orphan_frame(right_pid, NoLatches::new(pool)) };
                     continue;
                 }
                 match leaf.upgrade_to_exclusive() {
@@ -517,7 +531,8 @@ impl BTree {
             // to read a different page's data.
             // EVICTED: must fix (load from disk) to continue.
             if child_swip.is_hot() || child_swip.is_cool() {
-                let Some(child) = (unsafe { pool.pin_child(child_swip) }) else {
+                let Some(child) = (unsafe { pool.pin_child(child_swip, NoLatches::new(pool)) })
+                else {
                     self.stats.inc(BTreeEvent::LeafDescentRestarts);
                     return Err(Restart);
                 };
@@ -538,7 +553,8 @@ impl BTree {
                 current = child;
             } else {
                 self.stats.inc(BTreeEvent::ResolveCold);
-                let child = unsafe { pool.fix_orphan_frame(child_swip.as_page_id()) };
+                let child =
+                    unsafe { pool.fix_orphan_frame(child_swip.as_page_id(), NoLatches::new(pool)) };
                 // Re-validate after the blocking fix: another thread could
                 // have exclusively latched this inner node during the fix and
                 // modified its routing entries.
@@ -584,7 +600,7 @@ impl BTree {
             let opt = unsafe { root.optimistic_guard() }?;
             if root.is_leaf() {
                 let _ = opt;
-                unsafe { pool.fix_frame(&self.meta_swip) }
+                unsafe { pool.fix_frame(&self.meta_swip, NoLatches::new(pool)) }
             } else {
                 let routed_child = root.try_route_to_child(key).ok_or(Restart)?;
                 let child_swip = routed_child.swip();
@@ -605,7 +621,9 @@ impl BTree {
                     child
                 } else {
                     self.stats.inc(BTreeEvent::ResolveCold);
-                    let child = unsafe { pool.fix_orphan_frame(child_swip.as_page_id()) };
+                    let child = unsafe {
+                        pool.fix_orphan_frame(child_swip.as_page_id(), NoLatches::new(pool))
+                    };
                     // Re-validate after the blocking fix: another thread could
                     // have exclusively latched the root during the fix and
                     // modified its routing entries.
@@ -629,7 +647,7 @@ impl BTree {
                 }
             }
         } else {
-            unsafe { pool.fix_frame(&self.meta_swip) }
+            unsafe { pool.fix_frame(&self.meta_swip, NoLatches::new(pool)) }
         };
 
         loop {
@@ -647,7 +665,7 @@ impl BTree {
                     if right_pid == 0 {
                         return Err(Restart);
                     }
-                    current = unsafe { pool.fix_orphan_frame(right_pid) };
+                    current = unsafe { pool.fix_orphan_frame(right_pid, NoLatches::new(pool)) };
                     continue;
                 }
                 match leaf.upgrade_to_exclusive() {
@@ -675,7 +693,8 @@ impl BTree {
             let child_swip = routed_child.swip();
 
             if child_swip.is_hot() || child_swip.is_cool() {
-                let Some(child) = (unsafe { pool.pin_child(child_swip) }) else {
+                let Some(child) = (unsafe { pool.pin_child(child_swip, NoLatches::new(pool)) })
+                else {
                     self.stats.inc(BTreeEvent::LeafDescentRestarts);
                     return Err(Restart);
                 };
@@ -694,7 +713,8 @@ impl BTree {
                 current = child;
             } else {
                 self.stats.inc(BTreeEvent::ResolveCold);
-                let child = unsafe { pool.fix_orphan_frame(child_swip.as_page_id()) };
+                let child =
+                    unsafe { pool.fix_orphan_frame(child_swip.as_page_id(), NoLatches::new(pool)) };
                 // Re-validate after the blocking fix: another thread could
                 // have exclusively latched this inner node during the fix and
                 // modified its routing entries.
@@ -725,7 +745,7 @@ impl BTree {
     ) -> Result<(Vec<PinnedFrame<'a>>, ExclusiveNode<'a, Leaf>), Restart> {
         let pool = self.pool();
         let mut path = Vec::new();
-        let mut current = unsafe { pool.fix_frame(&self.meta_swip) };
+        let mut current = unsafe { pool.fix_frame(&self.meta_swip, NoLatches::new(pool)) };
 
         loop {
             let opt = current.clone_pin().optimistic().map_err(|_| {
@@ -772,7 +792,8 @@ impl BTree {
             let child_swip = routed_child.swip();
 
             let child = if child_swip.is_hot() || child_swip.is_cool() {
-                let Some(child) = (unsafe { pool.pin_child(child_swip) }) else {
+                let Some(child) = (unsafe { pool.pin_child(child_swip, NoLatches::new(pool)) })
+                else {
                     self.stats.inc(BTreeEvent::SplitPathRestarts);
                     return Err(Restart);
                 };
@@ -785,7 +806,8 @@ impl BTree {
                 child
             } else {
                 self.stats.inc(BTreeEvent::ResolveCold);
-                let child = unsafe { pool.fix_orphan_frame(child_swip.as_page_id()) };
+                let child =
+                    unsafe { pool.fix_orphan_frame(child_swip.as_page_id(), NoLatches::new(pool)) };
                 // Re-validate after the blocking fix: another thread could
                 // have exclusively latched this inner node during the fix and
                 // modified its routing entries.
@@ -828,7 +850,7 @@ impl BTree {
             let opt = unsafe { root.optimistic_guard() }?;
             if root.is_leaf() {
                 let _ = opt;
-                unsafe { pool.fix_frame(&self.meta_swip) }
+                unsafe { pool.fix_frame(&self.meta_swip, NoLatches::new(pool)) }
             } else {
                 let routed_child = root.try_route_to_child(key).ok_or(Restart)?;
                 let child_swip = routed_child.swip();
@@ -836,7 +858,8 @@ impl BTree {
                     return Err(Restart);
                 }
                 if child_swip.is_hot() || child_swip.is_cool() {
-                    let Some(child) = (unsafe { pool.pin_child(child_swip) }) else {
+                    let Some(child) = (unsafe { pool.pin_child(child_swip, NoLatches::new(pool)) })
+                    else {
                         return Err(Restart);
                     };
                     let child_frame = ResidentFrame::from_pinned(&child);
@@ -849,7 +872,9 @@ impl BTree {
                     child
                 } else {
                     self.stats.inc(BTreeEvent::ResolveCold);
-                    let child = unsafe { pool.fix_orphan_frame(child_swip.as_page_id()) };
+                    let child = unsafe {
+                        pool.fix_orphan_frame(child_swip.as_page_id(), NoLatches::new(pool))
+                    };
                     // Re-validate after the blocking fix: another thread could
                     // have exclusively latched the root during the fix and
                     // modified its routing entries.
@@ -873,7 +898,7 @@ impl BTree {
                 }
             }
         } else {
-            unsafe { pool.fix_frame(&self.meta_swip) }
+            unsafe { pool.fix_frame(&self.meta_swip, NoLatches::new(pool)) }
         };
 
         loop {
@@ -965,7 +990,7 @@ impl BTree {
         key: &[u8],
     ) -> Result<ExclusiveNode<'a, Leaf>, Restart> {
         let pool = self.pool();
-        let mut current = unsafe { pool.fix_frame(&self.meta_swip) };
+        let mut current = unsafe { pool.fix_frame(&self.meta_swip, NoLatches::new(pool)) };
 
         loop {
             let current_shared = current.clone_pin().shared();
@@ -978,7 +1003,7 @@ impl BTree {
                         return Err(Restart);
                     }
                     drop(shared);
-                    current = unsafe { pool.fix_orphan_frame(right_pid) };
+                    current = unsafe { pool.fix_orphan_frame(right_pid, NoLatches::new(pool)) };
                     continue;
                 }
                 let leaf =
@@ -989,7 +1014,7 @@ impl BTree {
                         return Err(Restart);
                     }
                     drop(leaf);
-                    current = unsafe { pool.fix_orphan_frame(right_pid) };
+                    current = unsafe { pool.fix_orphan_frame(right_pid, NoLatches::new(pool)) };
                     continue;
                 }
                 return Ok(leaf);
@@ -1018,7 +1043,7 @@ impl BTree {
     ) -> Result<(Vec<PinnedFrame<'a>>, ExclusiveNode<'a, Leaf>), Restart> {
         let pool = self.pool();
         let mut path = Vec::new();
-        let mut current = unsafe { pool.fix_frame(&self.meta_swip) };
+        let mut current = unsafe { pool.fix_frame(&self.meta_swip, NoLatches::new(pool)) };
 
         loop {
             let current_shared = current.clone_pin().shared();
@@ -1031,7 +1056,7 @@ impl BTree {
                         return Err(Restart);
                     }
                     drop(shared);
-                    current = unsafe { pool.fix_orphan_frame(right_pid) };
+                    current = unsafe { pool.fix_orphan_frame(right_pid, NoLatches::new(pool)) };
                     continue;
                 }
                 let leaf =
@@ -1042,7 +1067,7 @@ impl BTree {
                         return Err(Restart);
                     }
                     drop(leaf);
-                    current = unsafe { pool.fix_orphan_frame(right_pid) };
+                    current = unsafe { pool.fix_orphan_frame(right_pid, NoLatches::new(pool)) };
                     continue;
                 }
                 return Ok((path, leaf));
@@ -1134,7 +1159,7 @@ impl BTree {
 
         // Allocate new sibling. Use allocate_and_fix to avoid setting
         // parent_swip to a stack-local swip reference.
-        let (_new_sibling_pid, new_sibling) = pool.allocate_and_fix_frame();
+        let (_new_sibling_pid, new_sibling) = pool.allocate_and_fix_frame(NoLatches::new(pool));
         let new_sibling = new_sibling.exclusive();
         let new_sibling_frame = ResidentFrame::from_exclusive(&new_sibling);
         new_sibling_frame.init(is_leaf);
@@ -1238,7 +1263,7 @@ impl BTree {
 
         if is_root {
             // Root split: create new root.
-            let (_new_root_pid, new_root) = pool.allocate_and_fix_frame();
+            let (_new_root_pid, new_root) = pool.allocate_and_fix_frame(NoLatches::new(pool));
             let new_root = new_root.exclusive();
             let new_root_frame = ResidentFrame::from_exclusive(&new_root);
             new_root_frame.init(false);
@@ -1312,7 +1337,7 @@ impl BTree {
         self.stats.inc(BTreeEvent::LeafSplits);
         let node_frame = ResidentFrame::from_exclusive(&node);
 
-        let (_new_sibling_pid, new_sibling) = pool.allocate_and_fix_frame();
+        let (_new_sibling_pid, new_sibling) = pool.allocate_and_fix_frame(NoLatches::new(pool));
         let new_sibling = new_sibling.exclusive();
         let new_sibling_frame = ResidentFrame::from_exclusive(&new_sibling);
         new_sibling_frame.init(true);
@@ -1375,7 +1400,7 @@ impl BTree {
         let is_root = Self::swip_page_id(current_root) == node_frame.pid();
 
         if is_root {
-            let (_new_root_pid, new_root) = pool.allocate_and_fix_frame();
+            let (_new_root_pid, new_root) = pool.allocate_and_fix_frame(NoLatches::new(pool));
             let new_root = new_root.exclusive();
             let new_root_frame = ResidentFrame::from_exclusive(&new_root);
             new_root_frame.init(false);
@@ -1446,7 +1471,10 @@ impl BTree {
                 let left_pid = left.pid();
                 let right_pid = right.pid();
                 let root_pid = Self::swip_page_id(self.meta_swip.load(Ordering::Acquire));
-                let root = unsafe { self.pool().fix_frame(&self.meta_swip) };
+                let root = unsafe {
+                    self.pool()
+                        .fix_frame(&self.meta_swip, NoLatches::new(self.pool()))
+                };
                 let root_frame = ResidentFrame::from_pinned(&root);
                 let root_is_leaf = root_frame.is_leaf();
                 let root_children = if root_is_leaf {
@@ -1537,7 +1565,11 @@ impl BTree {
         left: SplitChild<'_, '_>,
         right: SplitChild<'_, '_>,
     ) -> bool {
-        let root = unsafe { self.pool().fix_frame(&self.meta_swip).exclusive() };
+        let root = unsafe {
+            self.pool()
+                .fix_frame(&self.meta_swip, NoLatches::new(self.pool()))
+                .exclusive()
+        };
         let root_inner = ExclusiveNode::from_inner_frame(root);
         let Some(edge) = self.parent_edge_for_child(&root_inner, &left.resident_frame()) else {
             drop(root_inner);
@@ -1563,7 +1595,7 @@ impl BTree {
     ) -> bool {
         let pool = self.pool();
         let left_pid = left.pid();
-        let mut stack = vec![unsafe { pool.fix_frame(&self.meta_swip) }];
+        let mut stack = vec![unsafe { pool.fix_frame(&self.meta_swip, NoLatches::new(pool)) }];
 
         while let Some(current) = stack.pop() {
             let current = ExclusiveNode::from_inner_frame(current.exclusive());
@@ -1761,7 +1793,8 @@ impl BTree {
                 self.stats.inc(BTreeEvent::EvictionUnswizzleRestarts);
                 restarts += 1;
                 stack.clear();
-                let Some(root) = (unsafe { pool.pin_child(root_swip) }) else {
+                let Some(root) = (unsafe { pool.pin_child(root_swip, NoLatches::new(pool)) })
+                else {
                     return false;
                 };
                 stack.push(root);
@@ -1783,7 +1816,7 @@ impl BTree {
         target: &ResidentFrame<'_>,
     ) -> Result<(PinnedFrame<'a>, u16), Restart> {
         let pool = self.pool();
-        let mut stack = vec![unsafe { pool.fix_frame(&self.meta_swip) }];
+        let mut stack = vec![unsafe { pool.fix_frame(&self.meta_swip, NoLatches::new(pool)) }];
 
         while let Some(current) = stack.pop() {
             let opt = current.clone_pin().optimistic().map_err(|_| Restart)?;
@@ -1811,9 +1844,11 @@ impl BTree {
                 .for_each_child_route(|routed| {
                     let swip = routed.swip();
                     let child = if swip.is_hot() || swip.is_cool() {
-                        unsafe { pool.pin_child(swip) }
+                        unsafe { pool.pin_child(swip, NoLatches::new(pool)) }
                     } else {
-                        Some(unsafe { pool.fix_orphan_frame(swip.as_page_id()) })
+                        Some(unsafe {
+                            pool.fix_orphan_frame(swip.as_page_id(), NoLatches::new(pool))
+                        })
                     };
                     if let Some(child) = child {
                         children.push(child);
@@ -2666,7 +2701,7 @@ impl BTree {
         let mut read = Some(read);
 
         'restart: loop {
-            let mut current = unsafe { pool.fix_frame(&self.meta_swip) };
+            let mut current = unsafe { pool.fix_frame(&self.meta_swip, NoLatches::new(pool)) };
 
             loop {
                 let guard = current.shared_guard();
@@ -2683,7 +2718,7 @@ impl BTree {
                             None => {
                                 attempts += 1;
                                 let _ = guard;
-                                unsafe { pool.fix_orphan_frame(right_pid) }
+                                unsafe { pool.fix_orphan_frame(right_pid, NoLatches::new(pool)) }
                             }
                         };
                         let _ = guard;
@@ -2702,35 +2737,38 @@ impl BTree {
                         return read.take().unwrap()(None);
                     }
                 };
-                let child = match unsafe {
-                    Self::try_resolve_child_for_read(pool, routed_child.swip())
-                } {
-                    Some(child) => child,
-                    None => {
-                        if !(routed_child.swip().is_hot() || routed_child.swip().is_cool()) {
+                let child =
+                    match unsafe { Self::try_resolve_child_for_read(pool, routed_child.swip()) } {
+                        Some(child) => child,
+                        None => {
+                            if !(routed_child.swip().is_hot() || routed_child.swip().is_cool()) {
+                                let _ = guard;
+                                let child = unsafe {
+                                    pool.fix_orphan_frame(
+                                        routed_child.swip().as_page_id(),
+                                        NoLatches::new(pool),
+                                    )
+                                };
+                                unsafe {
+                                    self.set_parent_link_for_routed_child(
+                                        &ResidentFrame::from_pinned(&child),
+                                        &current_frame,
+                                        &routed_child,
+                                    )
+                                };
+                                current = child;
+                                continue;
+                            }
+                            attempts += 1;
+                            if attempts >= Self::LOOKUP_OPTIMISTIC_RESTART_LIMIT {
+                                let _ = guard;
+                                return read.take().unwrap()(None);
+                            }
                             let _ = guard;
-                            let child =
-                                unsafe { pool.fix_orphan_frame(routed_child.swip().as_page_id()) };
-                            unsafe {
-                                self.set_parent_link_for_routed_child(
-                                    &ResidentFrame::from_pinned(&child),
-                                    &current_frame,
-                                    &routed_child,
-                                )
-                            };
-                            current = child;
-                            continue;
+                            std::thread::yield_now();
+                            continue 'restart;
                         }
-                        attempts += 1;
-                        if attempts >= Self::LOOKUP_OPTIMISTIC_RESTART_LIMIT {
-                            let _ = guard;
-                            return read.take().unwrap()(None);
-                        }
-                        let _ = guard;
-                        std::thread::yield_now();
-                        continue 'restart;
-                    }
-                };
+                    };
                 unsafe {
                     self.set_parent_link_for_routed_child(
                         &ResidentFrame::from_pinned(&child),
@@ -2776,7 +2814,7 @@ impl BTree {
         key: &[u8],
     ) -> Result<SharedNode<'a, Leaf>, Restart> {
         let pool = self.pool();
-        let mut current = unsafe { pool.fix_frame(&self.meta_swip) };
+        let mut current = unsafe { pool.fix_frame(&self.meta_swip, NoLatches::new(pool)) };
 
         loop {
             let current_shared = current.clone_pin().shared();
@@ -2789,7 +2827,7 @@ impl BTree {
                         return Err(Restart);
                     }
                     drop(shared);
-                    let right = unsafe { pool.fix_orphan_frame(right_pid) };
+                    let right = unsafe { pool.fix_orphan_frame(right_pid, NoLatches::new(pool)) };
                     current = right;
                     continue;
                 }
@@ -2811,7 +2849,7 @@ impl BTree {
                 let child_pid = routed_child.swip().as_page_id();
                 let parent_pid = current.pid();
                 drop(shared);
-                let child = unsafe { pool.fix_orphan_frame(child_pid) };
+                let child = unsafe { pool.fix_orphan_frame(child_pid, NoLatches::new(pool)) };
                 // Re-fix the parent under a new shared guard and re-read
                 // the routing. The shared guard was dropped during the
                 // blocking fix, so the parent's routing may have changed
@@ -2819,7 +2857,7 @@ impl BTree {
                 // to the same child, set the parent link; otherwise skip —
                 // the child is loaded, and the next traversal will set the
                 // link correctly.
-                let parent = unsafe { pool.fix_orphan_frame(parent_pid) };
+                let parent = unsafe { pool.fix_orphan_frame(parent_pid, NoLatches::new(pool)) };
                 let parent_shared = parent.shared();
                 let parent_frame = ResidentFrame::from_shared(&parent_shared);
                 if let Some(re_routed) = parent_frame.try_route_to_child(key) {
@@ -2860,7 +2898,7 @@ impl BTree {
         key: &[u8],
     ) -> Result<SharedNode<'a, Leaf>, Restart> {
         let pool = self.pool();
-        let mut current = unsafe { pool.fix_frame(&self.meta_swip) };
+        let mut current = unsafe { pool.fix_frame(&self.meta_swip, NoLatches::new(pool)) };
 
         loop {
             let current_shared = current.shared();
@@ -2909,7 +2947,7 @@ impl BTree {
         &'a self,
     ) -> Result<SharedNode<'a, Leaf>, Restart> {
         let pool = self.pool();
-        let mut current = unsafe { pool.fix_frame(&self.meta_swip) };
+        let mut current = unsafe { pool.fix_frame(&self.meta_swip, NoLatches::new(pool)) };
 
         loop {
             let current_shared = current.shared();
@@ -2997,11 +3035,14 @@ impl BTree {
 
     fn collect_evicted_root_child_pids(&self) -> Vec<u64> {
         unsafe {
-            self.pool()
-                .with_fixed_exclusive(&self.meta_swip, |root_frame| {
+            self.pool().with_fixed_exclusive(
+                &self.meta_swip,
+                NoLatches::new(self.pool()),
+                |root_frame| {
                     let root = ResidentFrame::from_exclusive(root_frame);
                     Self::collect_evicted_child_pids(&root)
-                })
+                },
+            )
         }
     }
 
@@ -3194,7 +3235,7 @@ impl BTree {
                 return;
             }
 
-            let right = unsafe { pool.fix_orphan_frame(right_pid) };
+            let right = unsafe { pool.fix_orphan_frame(right_pid, NoLatches::new(pool)) };
             leaf = SharedNode::from_leaf_frame(right.shared());
         }
     }
@@ -3291,7 +3332,7 @@ impl BTree {
                 return;
             }
 
-            let right = unsafe { pool.fix_orphan_frame(right_pid) };
+            let right = unsafe { pool.fix_orphan_frame(right_pid, NoLatches::new(pool)) };
             leaf = SharedNode::from_leaf_frame(right.shared());
         }
     }
@@ -3406,7 +3447,7 @@ impl BTree {
                 return;
             }
 
-            let left = unsafe { pool.fix_orphan_frame(left_pid) };
+            let left = unsafe { pool.fix_orphan_frame(left_pid, NoLatches::new(pool)) };
             leaf = SharedNode::from_leaf_frame(left.shared());
         }
     }
@@ -3724,7 +3765,7 @@ mod tests {
         assert!(tree.height() >= 2, "expected a multi-level tree");
 
         unsafe {
-            let root_bf = pool.fix_frame(&tree.meta_swip);
+            let root_bf = pool.fix_frame(&tree.meta_swip, NoLatches::new(&pool));
             let root_ref = root_bf.frame_ref();
             assert!(!BTreeNode::is_leaf(root_ref.read_ref()));
 
@@ -4666,7 +4707,7 @@ mod tests {
         let pool = std::sync::Arc::new(BufferPool::with_store(4096, Box::new(store)));
         let tree = BTree::open(&pool, root_pid, height, 0);
 
-        let root = unsafe { pool.fix_frame(&tree.meta_swip) };
+        let root = unsafe { pool.fix_frame(&tree.meta_swip, NoLatches::new(&pool)) };
         let root_swip = ResidentFrame::from_pinned(&root).hot_swip();
         drop(root);
         let mut cooled = root_swip;

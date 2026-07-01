@@ -7,7 +7,7 @@ use micromeasure::{
     ConcurrentWorkerResult, Throughput, benchmark_main, black_box,
 };
 use pagebox_storage::buffer_frame::physical_page_number;
-use pagebox_storage::buffer_pool::BufferPool;
+use pagebox_storage::buffer_pool::{BufferPool, NoLatches};
 use pagebox_storage::free_page_allocator::{FreeExtent, FreePageAllocator};
 
 const OPS_PER_CHUNK: usize = 10_000;
@@ -147,7 +147,7 @@ fn buffer_pool_reuse_allocate_and_fix(
     for _ in 0..chunk_size {
         ctx.pool
             .promote_reusable_extent(FreeExtent::new(ctx.reusable_page_number, 1));
-        let (pid, frame) = ctx.pool.allocate_and_fix();
+        let (pid, frame) = ctx.pool.allocate_and_fix(NoLatches::new(&ctx.pool));
         drop(frame);
         ctx.reusable_page_number = physical_page_number(pid);
         black_box(pid);
@@ -258,7 +258,7 @@ benchmark_main!(|runner| {
         g.throughput(Throughput::per_operation(OPS_PER_CHUNK_U64, "allocations"))
             .factory(&|| {
                 let pool = Arc::new(BufferPool::new(128));
-                let (pid, frame) = pool.allocate_and_fix();
+                let (pid, frame) = pool.allocate_and_fix(NoLatches::new(&pool));
                 drop(frame);
                 BufferPoolAllocCtx {
                     pool,

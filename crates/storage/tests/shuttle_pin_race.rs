@@ -43,7 +43,7 @@ fn shuttle_pin_evict_minimal() {
 
             let s = state.clone();
             let pc = pin_count.clone();
-            let fwp = freed_while_pinned.clone();
+            let _fwp = freed_while_pinned.clone();
             let reader = thread::spawn(move || {
                 // try_pin_hot_or_cool_swip
                 pc.fetch_add(1, Ordering::Relaxed);
@@ -677,7 +677,7 @@ fn shuttle_optimistic_stale_swip_race() {
             let cs_e = child_state.clone();
             let cp_e = child_pid.clone();
             let cf_e = child_freed.clone();
-            let cr_e = child_reused_pid.clone();
+            let _cr_e = child_reused_pid.clone();
             let evictor = thread::spawn(move || {
                 // Evict the child:
                 // 1. CAS state Resident→Evicting
@@ -932,7 +932,7 @@ fn shuttle_optimistic_cold_swip_race() {
             let pv = parent_version.clone();
             let ps = parent_swip.clone();
             let cs = child_state.clone();
-            let cp = child_pid.clone();
+            let _cp = child_pid.clone();
             let reader = thread::spawn(move || {
                 // 1. optimistic guard (snapshot version)
                 let snapshot = pv.load(Ordering::Acquire);
@@ -968,16 +968,13 @@ fn shuttle_optimistic_cold_swip_race() {
 
                 // 5. [MISSING in cold path] validate
                 // With the fix, this is now present for COLD path too
-                if is_cold {
-                    if pv.load(Ordering::Acquire) != snapshot {
-                        return; // restart — parent was modified
-                    }
+                if is_cold && pv.load(Ordering::Acquire) != snapshot { // restart — parent was modified
                 }
             });
 
             let pv2 = parent_version.clone();
             let ps2 = parent_swip.clone();
-            let cs2 = child_state.clone();
+            let _cs2 = child_state.clone();
             let cp2 = child_pid.clone();
             let writer = thread::spawn(move || {
                 // unswizzle_parent: try_lock_exclusive (bump version)
