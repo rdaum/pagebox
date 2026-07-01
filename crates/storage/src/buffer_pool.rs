@@ -10,8 +10,7 @@
 //! 2. **latch** — acquire an optimistic / shared / exclusive guard on the
 //!    frame's [`HybridLatch`]. Higher layers usually compose step 1 + 2: see
 //!    [`PinnedFrame::optimistic`] / [`PinnedFrame::shared`] /
-//!    [`PinnedFrame::exclusive`] and the resident-only
-//!    `try_optimistic_resident_*` / `try_shared_resident_*` shortcuts.
+//!    [`PinnedFrame::exclusive`].
 //! 3. **evict** — pick a resident unpinned page and transition it through
 //!    `Resident → Evicting → Free`, writing back its bytes if dirty and
 //!    unswizzling the routing edge in its parent (see [`ParentFinder`]).
@@ -959,8 +958,9 @@ impl Drop for EvictionPermit<'_> {
 /// Constructing `NoLatches` while any of these are alive is a contract
 /// violation that may cause pool exhaustion or deadlock:
 /// - [`SharedFrame`], [`ExclusiveFrame`], [`OptimisticFrame`]
-/// - [`ResidentSharedFrame`], [`ResidentOptimisticFrame`]
-/// - `SharedGuard`, `ExclusiveGuard`, `OptimisticGuard` (from `hybrid-latch`)
+/// - [`SharedGuard`](pagebox_hybrid_latch::SharedGuard),
+///   [`ExclusiveGuard`](pagebox_hybrid_latch::ExclusiveGuard),
+///   [`OptimisticGuard`](pagebox_hybrid_latch::OptimisticGuard)
 pub struct NoLatches<'a> {
     _marker: core::marker::PhantomData<&'a BufferPool>,
 }
@@ -1587,16 +1587,6 @@ impl<'a> PinnedFrame<'a> {
     pub fn mark_dirty_with_lsn(&self, lsn: Lsn) {
         unsafe { self.pool.mark_dirty_with_lsn_raw(self.bf, lsn) };
     }
-
-    pub fn shared_guard(&self) -> SharedGuard<'a> {
-        let guard = self.latch.lock_shared();
-        unsafe { extend_shared_guard(guard) }
-    }
-
-    pub fn exclusive_guard(&self) -> ExclusiveGuard<'a> {
-        let guard = self.latch.lock_exclusive();
-        unsafe { extend_exclusive_guard(guard) }
-    }
 }
 
 impl PoolState {
@@ -1730,67 +1720,6 @@ pub struct SharedFrame<'a> {
     guard: SharedGuard<'a>,
 }
 
-/// A resident-frame view carrying a shared (read) latch, *without* a pin.
-///
-/// Returned by the `try_shared_resident_*` shortcut methods: attempts to take
-/// a shared latch on a frame that is already known to be resident. If the
-/// caller already holds a pin (via a stable reference) this avoids the
-/// redundant pin cycle. `Clone` re-acquires a fresh shared lock. Because no
-/// pin is held, the underlying frame is **not** protected from eviction across
-/// drop — callers must keep an external pin alive for the duration of use.
-pub struct ResidentSharedFrame<'a> {
-    bf: *mut BufferFrame,
-    _guard: SharedGuard<'a>,
-}
-
-/// A resident-frame view carrying an optimistic guard, *without* a pin.
-///
-/// Returned by the `try_optimistic_resident_*` shortcut methods. Like
-/// [`ResidentSharedFrame`], the caller is responsible for keeping the frame
-/// resident (typically by holding an external `PinnedFrame`). The optimistic
-/// guard must still be re-validated via [`ResidentOptimisticFrame::validate`]
-/// before committing — note that this variant additionally checks the frame
-/// state, so an eviction that began after the optimistic snapshot was taken
-/// is reported as [`Restart`].
-pub struct ResidentOptimisticFrame<'a> {
-    bf: *mut BufferFrame,
-    guard: OptimisticGuard<'a>,
-}
-
-impl<'a> Clone for ResidentSharedFrame<'a> {
-    fn clone(&self) -> Self {
-        let guard = unsafe { (&*self.bf).latch.lock_shared() };
-        let guard = unsafe { extend_shared_guard(guard) };
-        Self {
-            bf: self.bf,
-            _guard: guard,
-        }
-    }
-}
-
-impl<'a> ResidentSharedFrame<'a> {
-    pub fn try_clone(&self) -> Option<Self> {
-        let guard = unsafe { (&*self.bf).latch.try_lock_shared()? };
-        let guard = unsafe { extend_shared_guard(guard) };
-        Some(Self {
-            bf: self.bf,
-            _guard: guard,
-        })
-    }
-
-    pub fn page(&self) -> &[u8; PAGE_SIZE] {
-        unsafe { &(*self.bf).page }
-    }
-
-    pub fn read_ref(&self) -> BufferFrameReadRef<'a> {
-        unsafe { BufferFrameRef::from_raw(self.bf).read_ref() }
-    }
-
-    pub fn page_bytes(&self) -> &[u8] {
-        unsafe { (*self.bf).page_bytes() }
-    }
-}
-
 impl<'a> Clone for SharedFrame<'a> {
     fn clone(&self) -> Self {
         let pinned = self.pinned.clone();
@@ -1846,44 +1775,6 @@ impl Deref for SharedFrame<'_> {
 
     fn deref(&self) -> &Self::Target {
         &self.pinned
-    }
-}
-
-impl Deref for ResidentSharedFrame<'_> {
-    type Target = BufferFrame;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.bf }
-    }
-}
-
-impl<'a> ResidentOptimisticFrame<'a> {
-    pub fn page(&self) -> &[u8; PAGE_SIZE] {
-        unsafe { &(*self.bf).page }
-    }
-
-    pub fn read_ref(&self) -> BufferFrameReadRef<'a> {
-        unsafe { BufferFrameRef::from_raw(self.bf).read_ref() }
-    }
-
-    pub fn page_bytes(&self) -> &[u8] {
-        unsafe { (*self.bf).page_bytes() }
-    }
-
-    pub fn validate(&self) -> Result<(), Restart> {
-        self.guard.validate()?;
-        if unsafe { (*self.bf).header.core.state.load(Ordering::Acquire) } != FrameState::Resident {
-            return Err(Restart);
-        }
-        Ok(())
-    }
-}
-
-impl Deref for ResidentOptimisticFrame<'_> {
-    type Target = BufferFrame;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.bf }
     }
 }
 
@@ -2498,206 +2389,6 @@ impl BufferPool {
         }
         let bf = unsafe { swip.as_ptr::<BufferFrame>() };
         self.contains_frame_ptr(bf)
-    }
-
-    /// Try to acquire a shared latch on an already-resident HOT/COOL frame
-    /// without taking a pin.
-    ///
-    /// The caller must be able to tolerate a `None` result and fall back to
-    /// `fix_frame`. This is only valid for stable SWIP owners: eviction must
-    /// update the SWIP while holding the frame latch exclusively, so validating
-    /// the SWIP and frame state after acquiring the shared latch proves the
-    /// frame cannot be freed or reused while the returned guard is live.
-    ///
-    /// # Safety
-    /// `swip` must be a stable routing edge managed by this pool.
-    #[track_caller]
-    pub unsafe fn try_shared_resident_frame<'a>(
-        &'a self,
-        swip: &AtomicSwip,
-    ) -> Option<ResidentSharedFrame<'a>> {
-        let s = swip.load(Ordering::Acquire);
-        if !(s.is_hot() || s.is_cool()) {
-            return None;
-        }
-
-        let bf = unsafe { s.as_ptr::<BufferFrame>() };
-        debug_assert!(
-            self.contains_frame_ptr(bf),
-            "pool.try_shared_resident_frame: stale HOT/COOL pointer: raw={:#x} ptr={:#x}",
-            s.raw(),
-            bf as usize,
-        );
-        if !self.contains_frame_ptr(bf) {
-            return None;
-        }
-
-        if unsafe { (*bf).header.core.state.load(Ordering::Acquire) } != FrameState::Resident {
-            return None;
-        }
-
-        let guard = unsafe { (&*bf).latch.lock_shared() };
-
-        let current = swip.load(Ordering::Acquire);
-        if current.raw() != s.raw() {
-            return None;
-        }
-        if unsafe { (*bf).header.core.state.load(Ordering::Acquire) } != FrameState::Resident {
-            return None;
-        }
-
-        self.mark_referenced(bf);
-        let guard = unsafe { extend_shared_guard(guard) };
-        Some(ResidentSharedFrame { bf, _guard: guard })
-    }
-
-    pub fn try_shared_resident_stable_frame<'a>(
-        &'a self,
-        swip: StableSwipRef,
-    ) -> Option<ResidentSharedFrame<'a>> {
-        unsafe { self.try_shared_resident_frame(swip.as_ref()) }
-    }
-
-    /// Try to acquire a shared latch on an already-resident child frame without
-    /// taking a pin.
-    ///
-    /// # Safety
-    /// `swip` must be a child routing edge managed by this pool. The caller
-    /// must hold whatever protects that routing edge from successful eviction
-    /// unswizzling while this method acquires the child latch. For inner-tree
-    /// child edges this usually means holding the parent frame latch.
-    pub unsafe fn try_shared_resident_child<'a>(
-        &'a self,
-        swip: Swip,
-    ) -> Option<ResidentSharedFrame<'a>> {
-        if !(swip.is_hot() || swip.is_cool()) {
-            return None;
-        }
-
-        let bf = unsafe { swip.as_ptr::<BufferFrame>() };
-        debug_assert!(
-            self.contains_frame_ptr(bf),
-            "pool.try_shared_resident_child: stale HOT/COOL pointer: raw={:#x} ptr={:#x}",
-            swip.raw(),
-            bf as usize,
-        );
-        if !self.contains_frame_ptr(bf) {
-            return None;
-        }
-
-        if unsafe { (*bf).header.core.state.load(Ordering::Acquire) } != FrameState::Resident {
-            return None;
-        }
-
-        let guard = unsafe { (&*bf).latch.lock_shared() };
-        if unsafe { (*bf).header.core.state.load(Ordering::Acquire) } != FrameState::Resident {
-            return None;
-        }
-
-        self.mark_referenced(bf);
-        let guard = unsafe { extend_shared_guard(guard) };
-        Some(ResidentSharedFrame { bf, _guard: guard })
-    }
-
-    /// Try to start an optimistic read on an already-resident child frame
-    /// without taking a pin or a shared latch.
-    ///
-    /// # Safety
-    /// `swip` must be a child routing edge managed by this pool. The caller
-    /// must hold and later validate whatever protects that routing edge from
-    /// successful eviction unswizzling while this method starts the child read.
-    pub unsafe fn try_optimistic_resident_child<'a>(
-        &'a self,
-        swip: Swip,
-    ) -> Option<ResidentOptimisticFrame<'a>> {
-        if !(swip.is_hot() || swip.is_cool()) {
-            return None;
-        }
-
-        let bf = unsafe { swip.as_ptr::<BufferFrame>() };
-        debug_assert!(
-            self.contains_frame_ptr(bf),
-            "pool.try_optimistic_resident_child: stale HOT/COOL pointer: raw={:#x} ptr={:#x}",
-            swip.raw(),
-            bf as usize,
-        );
-        if !self.contains_frame_ptr(bf) {
-            return None;
-        }
-
-        if unsafe { (*bf).header.core.state.load(Ordering::Acquire) } != FrameState::Resident {
-            return None;
-        }
-
-        let guard = match unsafe { (&*bf).latch.optimistic_or_restart() } {
-            Ok(guard) => guard,
-            Err(Restart) => return None,
-        };
-        if unsafe { (*bf).header.core.state.load(Ordering::Acquire) } != FrameState::Resident {
-            return None;
-        }
-
-        self.mark_referenced(bf);
-        let guard = unsafe { extend_optimistic_guard(guard) };
-        Some(ResidentOptimisticFrame { bf, guard })
-    }
-
-    /// Try to start an optimistic read on an already-resident HOT/COOL frame
-    /// without taking a pin or a shared latch.
-    ///
-    /// The returned guard must be validated before any data read through it is
-    /// used. On validation failure, callers must discard the result and fall
-    /// back to a pinned or shared-latched path.
-    ///
-    /// # Safety
-    /// `swip` must be a stable routing edge managed by this pool.
-    pub unsafe fn try_optimistic_resident_frame<'a>(
-        &'a self,
-        swip: &AtomicSwip,
-    ) -> Option<ResidentOptimisticFrame<'a>> {
-        let s = swip.load(Ordering::Acquire);
-        if !(s.is_hot() || s.is_cool()) {
-            return None;
-        }
-
-        let bf = unsafe { s.as_ptr::<BufferFrame>() };
-        debug_assert!(
-            self.contains_frame_ptr(bf),
-            "pool.try_optimistic_resident_frame: stale HOT/COOL pointer: raw={:#x} ptr={:#x}",
-            s.raw(),
-            bf as usize,
-        );
-        if !self.contains_frame_ptr(bf) {
-            return None;
-        }
-
-        if unsafe { (*bf).header.core.state.load(Ordering::Acquire) } != FrameState::Resident {
-            return None;
-        }
-
-        let guard = match unsafe { (&*bf).latch.optimistic_or_restart() } {
-            Ok(guard) => guard,
-            Err(Restart) => return None,
-        };
-
-        let current = swip.load(Ordering::Acquire);
-        if current.raw() != s.raw() {
-            return None;
-        }
-        if unsafe { (*bf).header.core.state.load(Ordering::Acquire) } != FrameState::Resident {
-            return None;
-        }
-
-        self.mark_referenced(bf);
-        let guard = unsafe { extend_optimistic_guard(guard) };
-        Some(ResidentOptimisticFrame { bf, guard })
-    }
-
-    pub fn try_optimistic_resident_stable_frame<'a>(
-        &'a self,
-        swip: StableSwipRef,
-    ) -> Option<ResidentOptimisticFrame<'a>> {
-        unsafe { self.try_optimistic_resident_frame(swip.as_ref()) }
     }
 
     /// # Safety

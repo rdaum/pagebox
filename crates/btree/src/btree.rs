@@ -2704,71 +2704,85 @@ impl BTree {
             let mut current = unsafe { pool.fix_frame(&self.meta_swip, NoLatches::new(pool)) };
 
             loop {
-                let guard = current.shared_guard();
-                let current_frame = ResidentFrame::from_pinned(&current);
+                let shared = SharedNode::<Leaf>::from_leaf_frame(current.clone_pin().shared());
+                let current_frame = shared.resident_frame();
                 if current_frame.is_leaf() {
                     if current_frame.should_chase_right(key) {
                         let right_pid = current_frame.leaf_right_pid();
                         if right_pid == 0 {
-                            let _ = guard;
                             return read.take().unwrap()(None);
                         }
                         let right = match unsafe { pool.try_fix_orphan_frame(right_pid) } {
                             Some(right) => right,
                             None => {
                                 attempts += 1;
-                                let _ = guard;
                                 unsafe { pool.fix_orphan_frame(right_pid, NoLatches::new(pool)) }
                             }
                         };
-                        let _ = guard;
+                        drop(shared);
                         current = right;
                         continue;
                     }
                     let result = read.take().unwrap()(Some(&current_frame));
-                    let _ = guard;
                     return result;
                 }
 
                 let routed_child = match current_frame.try_route_to_child(key) {
                     Some(routed) => routed,
                     None => {
-                        let _ = guard;
                         return read.take().unwrap()(None);
                     }
                 };
-                let child =
-                    match unsafe { Self::try_resolve_child_for_read(pool, routed_child.swip()) } {
-                        Some(child) => child,
-                        None => {
-                            if !(routed_child.swip().is_hot() || routed_child.swip().is_cool()) {
-                                let _ = guard;
-                                let child = unsafe {
-                                    pool.fix_orphan_frame(
-                                        routed_child.swip().as_page_id(),
-                                        NoLatches::new(pool),
-                                    )
-                                };
-                                unsafe {
-                                    self.set_parent_link_for_routed_child(
-                                        &ResidentFrame::from_pinned(&child),
-                                        &current_frame,
-                                        &routed_child,
-                                    )
-                                };
-                                current = child;
-                                continue;
+                let child = match unsafe {
+                    Self::try_resolve_child_for_read(pool, routed_child.swip())
+                } {
+                    Some(child) => child,
+                    None => {
+                        if !(routed_child.swip().is_hot() || routed_child.swip().is_cool()) {
+                            let child_pid = routed_child.swip().as_page_id();
+                            let parent_pid = current.pid();
+                            drop(shared);
+                            let child =
+                                unsafe { pool.fix_orphan_frame(child_pid, NoLatches::new(pool)) };
+                            // Re-fix the parent under a new shared guard
+                            // and re-read the routing. The shared guard was
+                            // dropped during the blocking fix, so the parent's
+                            // routing may have changed.
+                            let parent =
+                                unsafe { pool.fix_orphan_frame(parent_pid, NoLatches::new(pool)) };
+                            let parent_shared = parent.shared();
+                            let parent_frame = ResidentFrame::from_shared(&parent_shared);
+                            if let Some(re_routed) = parent_frame.try_route_to_child(key) {
+                                let re_pid =
+                                    if re_routed.swip().is_hot() || re_routed.swip().is_cool() {
+                                        unsafe { ResidentFrame::from_hot_swip(re_routed.swip()) }
+                                            .map(|f| f.pid())
+                                            .unwrap_or(0)
+                                    } else {
+                                        re_routed.swip().as_page_id()
+                                    };
+                                if re_pid == child_pid {
+                                    unsafe {
+                                        self.set_parent_link_for_routed_child(
+                                            &ResidentFrame::from_pinned(&child),
+                                            &parent_frame,
+                                            &re_routed,
+                                        )
+                                    };
+                                }
                             }
-                            attempts += 1;
-                            if attempts >= Self::LOOKUP_OPTIMISTIC_RESTART_LIMIT {
-                                let _ = guard;
-                                return read.take().unwrap()(None);
-                            }
-                            let _ = guard;
-                            std::thread::yield_now();
-                            continue 'restart;
+                            drop(parent_shared);
+                            current = child;
+                            continue;
                         }
-                    };
+                        attempts += 1;
+                        if attempts >= Self::LOOKUP_OPTIMISTIC_RESTART_LIMIT {
+                            return read.take().unwrap()(None);
+                        }
+                        std::thread::yield_now();
+                        continue 'restart;
+                    }
+                };
                 unsafe {
                     self.set_parent_link_for_routed_child(
                         &ResidentFrame::from_pinned(&child),
@@ -2776,7 +2790,7 @@ impl BTree {
                         &routed_child,
                     )
                 };
-                let _ = guard;
+                drop(shared);
                 current = child;
             }
         }
