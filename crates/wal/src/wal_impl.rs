@@ -883,7 +883,11 @@ fn wal_shard_count() -> usize {
     std::env::var("PAGEBOX_WAL_SHARDS")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(1)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        })
         .clamp(1, 256)
 }
 
