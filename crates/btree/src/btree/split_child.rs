@@ -39,6 +39,12 @@ impl<'frame, 'guard> SplitChild<'frame, 'guard> {
 /// exclusive latches on both children before publishing the separator to
 /// the parent — the B-link sibling pointers ensure the tree remains
 /// traversable during the window between split and parent publication.
+///
+/// Currently unused — kept for a future refactor that drops child latches
+/// before parent publication. The current approach removes `split_lock`
+/// while keeping child latches during publication, relying on the
+/// non-blocking eviction path (`try_lock_exclusive`) to avoid deadlocks.
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub(crate) struct SplitChildIdentity {
     bf: BufferFrameRef,
@@ -46,6 +52,7 @@ pub(crate) struct SplitChildIdentity {
     swip: Swip,
 }
 
+#[allow(dead_code)]
 impl SplitChildIdentity {
     pub(crate) fn from_exclusive(frame: &ExclusiveFrame<'_>) -> Self {
         let rf = ResidentFrame::from_exclusive(frame);

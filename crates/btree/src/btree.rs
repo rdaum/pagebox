@@ -6,7 +6,6 @@ use crate::metrics_stub::MetricVisitor;
 #[cfg(feature = "metrics")]
 use fast_telemetry::MetricVisitor;
 use pagebox_hybrid_latch::Restart;
-use parking_lot::Mutex;
 
 use pagebox_storage::buffer_frame::PAGE_SIZE;
 use pagebox_storage::buffer_frame::{BufferFrameRef, ParentFinder, StableSwipRef};
@@ -55,7 +54,6 @@ pub struct BTree {
     meta_swip: AtomicSwip,
     height: AtomicU32,
     stats: BTreeStats,
-    split_lock: Mutex<()>,
     /// Data structure ID for the DTRegistry parent-finder callback.
     dt_id: u16,
 }
@@ -274,7 +272,6 @@ impl BTree {
                     .map(|n| n.get())
                     .unwrap_or(1),
             ),
-            split_lock: Mutex::new(()),
             dt_id,
         }
     }
@@ -296,7 +293,6 @@ impl BTree {
                     .map(|n| n.get())
                     .unwrap_or(1),
             ),
-            split_lock: Mutex::new(()),
             dt_id,
         }
     }
@@ -2470,7 +2466,6 @@ impl BTree {
                 drop(leaf);
             }
 
-            let _split_guard = self.split_lock.lock();
             let (mut parent_path, leaf) = if attempts >= WRITE_BLOCKING_FALLBACK_THRESHOLD {
                 match unsafe { self.find_leaf_exclusive_with_path_fallback(key) } {
                     Ok(r) => r,
@@ -2549,7 +2544,6 @@ impl BTree {
                 drop(leaf);
             }
 
-            let _split_guard = self.split_lock.lock();
             let (mut parent_path, leaf) = if attempts >= WRITE_BLOCKING_FALLBACK_THRESHOLD {
                 match unsafe { self.find_leaf_exclusive_with_path_fallback(key) } {
                     Ok(r) => r,
@@ -3032,7 +3026,6 @@ impl BTree {
             };
 
             let leaf = leaf.into_pinned();
-            let _structural_guard = should_merge.then(|| self.split_lock.lock());
 
             unsafe {
                 self.rebalance_delete_path(

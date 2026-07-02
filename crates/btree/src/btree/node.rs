@@ -510,6 +510,7 @@ impl<'g> ChildRef<'g> {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn from_id(id: crate::btree::split_child::SplitChildIdentity) -> Self {
         Self {
             frame: ResidentFrame::new(id.bf()),
