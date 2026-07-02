@@ -389,7 +389,10 @@ impl Drop for AlignedPageCopy {
 }
 
 /// A reusable thread-local page-level scratch buffer.
-/// Avoids alloc/free on every mark_dirty_raw call.
+/// Avoids alloc/free on every mark_dirty_raw call. The scratch is
+/// filled and prepared OUTSIDE the WAL mutex to avoid holding the WAL
+/// lock during prepare_page_copy_for_writeback (which acquires another
+/// mutex internally).
 struct PageScratch {
     buf: Box<[u8; PAGE_SIZE]>,
 }

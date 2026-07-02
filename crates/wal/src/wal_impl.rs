@@ -2574,7 +2574,14 @@ impl WalInner {
         let file_offset = state.file_offset;
         let write_end = file_offset + len as u64;
         if write_end > state.allocated_size {
-            let new_size = round_up_u64(write_end, SEGMENT_SIZE);
+            // Pre-extend by multiple segments to amortize the ftruncate
+            // syscall across seals. ftruncate creates a sparse file so
+            // the extra space costs no disk — it just extends the inode
+            // size, avoiding frequent inode RWSEM contention under
+            // concurrent writes.
+            const WAL_PREALLOCATE_SEGMENTS: u64 = 8;
+            let new_size = round_up_u64(write_end, SEGMENT_SIZE)
+                + SEGMENT_SIZE * (WAL_PREALLOCATE_SEGMENTS - 1);
             extend_file(state.fd, new_size)?;
             if self.sync_backend == WalSyncBackend::Pwritev2Dsync {
                 fdatasync_file(state.fd)?;
