@@ -1111,6 +1111,7 @@ impl BTree {
         node: ExclusiveFrame<'_>,
         parent_path: &mut Vec<PinnedFrame<'_>>,
         pending_key: Option<&[u8]>,
+        pre_sibling: Option<(u64, PinnedFrame<'_>)>,
     ) {
         let pool = self.pool();
         let node_frame = ResidentFrame::from_exclusive(&node);
@@ -1145,7 +1146,13 @@ impl BTree {
                 (existing_key.to_vec(), false)
             };
             unsafe {
-                self.split_single_entry_leaf(node, parent_path, &sep_key, move_existing_to_right);
+                self.split_single_entry_leaf(
+                    node,
+                    parent_path,
+                    &sep_key,
+                    move_existing_to_right,
+                    pre_sibling,
+                );
             }
             return;
         }
@@ -1153,9 +1160,13 @@ impl BTree {
         let split_pos = count / 2;
         let sep_key = sp.get_key(split_pos).to_vec();
 
-        // Allocate new sibling. Use allocate_and_fix to avoid setting
-        // parent_swip to a stack-local swip reference.
-        let (_new_sibling_pid, new_sibling) = pool.allocate_and_fix_frame(NoLatches::new(pool));
+        // Use pre-allocated sibling frame if available (allocated before
+        // the exclusive latch was acquired). Otherwise allocate under
+        // latch — safe but can block on eviction under contention.
+        let (_new_sibling_pid, new_sibling) = match pre_sibling {
+            Some(pre) => pre,
+            None => pool.allocate_and_fix_frame(NoLatches::new(pool)),
+        };
         let new_sibling = new_sibling.exclusive();
         let new_sibling_frame = ResidentFrame::from_exclusive(&new_sibling);
         new_sibling_frame.init(is_leaf);
@@ -1328,12 +1339,16 @@ impl BTree {
         parent_path: &mut Vec<PinnedFrame<'_>>,
         sep_key: &[u8],
         move_existing_to_right: bool,
+        pre_sibling: Option<(u64, PinnedFrame<'_>)>,
     ) {
         let pool = self.pool();
         self.stats.inc(BTreeEvent::LeafSplits);
         let node_frame = ResidentFrame::from_exclusive(&node);
 
-        let (_new_sibling_pid, new_sibling) = pool.allocate_and_fix_frame(NoLatches::new(pool));
+        let (_new_sibling_pid, new_sibling) = match pre_sibling {
+            Some(pre) => pre,
+            None => pool.allocate_and_fix_frame(NoLatches::new(pool)),
+        };
         let new_sibling = new_sibling.exclusive();
         let new_sibling_frame = ResidentFrame::from_exclusive(&new_sibling);
         new_sibling_frame.init(true);
@@ -1515,7 +1530,7 @@ impl BTree {
         };
 
         if !parent.can_insert_separator(sep_key.len()) {
-            unsafe { self.split_node(parent.into_frame(), parent_path, None) };
+            unsafe { self.split_node(parent.into_frame(), parent_path, None, None) };
             return false;
         }
 
@@ -1574,7 +1589,7 @@ impl BTree {
 
         if !root_inner.can_insert_separator(sep_key.len()) {
             let mut empty_path = Vec::new();
-            unsafe { self.split_node(root_inner.into_frame(), &mut empty_path, None) };
+            unsafe { self.split_node(root_inner.into_frame(), &mut empty_path, None, None) };
             return false;
         }
 
@@ -1604,7 +1619,7 @@ impl BTree {
             {
                 if !current.can_insert_separator(sep_key.len()) {
                     let mut empty_path = Vec::new();
-                    unsafe { self.split_node(current.into_frame(), &mut empty_path, None) };
+                    unsafe { self.split_node(current.into_frame(), &mut empty_path, None, None) };
                     return false;
                 }
 
@@ -2466,6 +2481,12 @@ impl BTree {
                 drop(leaf);
             }
 
+            // Pre-allocate sibling frame while no latches are held, so
+            // the allocation (which may block on eviction) does not hold
+            // the exclusive latch on the node being split.
+            let pool = self.pool();
+            let pre_sibling = pool.allocate_and_fix_frame(NoLatches::new(pool));
+
             let (mut parent_path, leaf) = if attempts >= WRITE_BLOCKING_FALLBACK_THRESHOLD {
                 match unsafe { self.find_leaf_exclusive_with_path_fallback(key) } {
                     Ok(r) => r,
@@ -2491,7 +2512,12 @@ impl BTree {
                 UpsertLeafAction::UpdatedExisting => return false,
                 UpsertLeafAction::Inserted => return true,
                 UpsertLeafAction::SplitRequired => unsafe {
-                    self.split_node(leaf.into_frame(), &mut parent_path, Some(key));
+                    self.split_node(
+                        leaf.into_frame(),
+                        &mut parent_path,
+                        Some(key),
+                        Some(pre_sibling),
+                    );
                 },
             }
         }
@@ -2544,6 +2570,10 @@ impl BTree {
                 drop(leaf);
             }
 
+            // Pre-allocate sibling frame while no latches are held.
+            let pool = self.pool();
+            let pre_sibling = pool.allocate_and_fix_frame(NoLatches::new(pool));
+
             let (mut parent_path, leaf) = if attempts >= WRITE_BLOCKING_FALLBACK_THRESHOLD {
                 match unsafe { self.find_leaf_exclusive_with_path_fallback(key) } {
                     Ok(r) => r,
@@ -2569,7 +2599,12 @@ impl BTree {
                 InsertLeafAction::ReturnFalse => return false,
                 InsertLeafAction::Inserted => return true,
                 InsertLeafAction::SplitRequired => unsafe {
-                    self.split_node(leaf.into_frame(), &mut parent_path, Some(key));
+                    self.split_node(
+                        leaf.into_frame(),
+                        &mut parent_path,
+                        Some(key),
+                        Some(pre_sibling),
+                    );
                 },
             }
         }
