@@ -510,6 +510,13 @@ impl<'g> ChildRef<'g> {
         }
     }
 
+    pub(crate) fn from_id(id: crate::btree::split_child::SplitChildIdentity) -> Self {
+        Self {
+            frame: ResidentFrame::new(id.bf()),
+            pid: id.pid(),
+        }
+    }
+
     /// Construct a ChildRef from identity only (no page-byte access needed).
     /// Used when the child's guard has already been dropped and only the
     /// frame identity is needed for parent-edge matching.
