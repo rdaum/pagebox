@@ -32,6 +32,11 @@ pub struct EngineOpts {
     /// Buffer-pool / cache frame budget (kvstore maps this to pool_frames).
     #[serde(default = "default_buffer_budget")]
     pub buffer_budget_frames: usize,
+    /// WAL sync backend for kvstore ("fdatasync", "pwritev2_dsync", "io_uring").
+    /// Other engines ignore this. Sets the `PAGEBOX_WAL_SYNC_BACKEND` env var
+    /// before opening.
+    #[serde(default)]
+    pub wal_backend: Option<String>,
     /// Engine-specific key=value overrides (opaque to the driver).
     #[serde(default)]
     pub engine_specific: HashMap<String, String>,
@@ -43,6 +48,7 @@ impl Default for EngineOpts {
             value_size: 100,
             sync_mode: SyncMode::default(),
             buffer_budget_frames: default_buffer_budget(),
+            wal_backend: None,
             engine_specific: HashMap::new(),
         }
     }

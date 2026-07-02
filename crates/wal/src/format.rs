@@ -64,7 +64,6 @@
 //! lifetime. The defaults are summarised in the [crate-level docs](crate)
 //! alongside the sync-backend semantics.
 
-use std::collections::HashMap;
 use std::io;
 use std::sync::OnceLock;
 
@@ -165,6 +164,11 @@ pub(crate) const WAL_FDATASYNC_GROUP_COMMIT_TARGET_RECORDS: u64 = 256;
 pub(crate) const WAL_PWRITEV2_DSYNC_GROUP_COMMIT_DELAY_MAX_US: u64 = 250;
 /// Durable-write backends use a smaller target to avoid delaying every write.
 pub(crate) const WAL_PWRITEV2_DSYNC_GROUP_COMMIT_TARGET_RECORDS: u64 = 32;
+/// io_uring benefits from kernel batching, so its group-commit defaults mirror
+/// the durable-write backends (pwritev2_dsync).
+pub(crate) const WAL_IO_URING_GROUP_COMMIT_DELAY_MAX_US: u64 = 250;
+/// io_uring group-commit follower-record target.
+pub(crate) const WAL_IO_URING_GROUP_COMMIT_TARGET_RECORDS: u64 = 32;
 /// Relaxed mode background sync interval.
 pub(crate) const WAL_RELAXED_SYNC_INTERVAL_US: u64 = 50_000;
 /// Relaxed mode background sync threshold in records.
@@ -174,57 +178,79 @@ pub(crate) const WAL_RELAXED_WRITE_INTERVAL_US: u64 = 50_000;
 /// Relaxed mode background write threshold in records.
 pub(crate) const WAL_RELAXED_WRITE_RECORDS: usize = 4_096;
 
-pub(crate) fn env_u64_us(name: &'static str, default: u64) -> u64 {
-    static OVERRIDES: OnceLock<HashMap<&'static str, u64>> = OnceLock::new();
-    let overrides = OVERRIDES.get_or_init(|| {
-        let mut values = HashMap::new();
-        for (key, fallback) in [
-            (
-                "PAGEBOX_WAL_RELAXED_SYNC_INTERVAL_US",
-                WAL_RELAXED_SYNC_INTERVAL_US,
-            ),
-            (
-                "PAGEBOX_WAL_RELAXED_WRITE_INTERVAL_US",
-                WAL_RELAXED_WRITE_INTERVAL_US,
-            ),
-            (
-                "PAGEBOX_WAL_GROUP_COMMIT_DELAY_MIN_US",
-                WAL_GROUP_COMMIT_DELAY_MIN_US,
-            ),
-            (
-                "PAGEBOX_WAL_GROUP_COMMIT_DELAY_MAX_US",
-                WAL_GROUP_COMMIT_DELAY_MAX_US,
-            ),
-            (
-                "PAGEBOX_WAL_GROUP_COMMIT_TARGET_RECORDS",
-                WAL_GROUP_COMMIT_TARGET_RECORDS,
-            ),
-            (
-                "PAGEBOX_WAL_FDATASYNC_DELAY_MAX_US",
-                WAL_FDATASYNC_GROUP_COMMIT_DELAY_MAX_US,
-            ),
-            (
-                "PAGEBOX_WAL_FDATASYNC_TARGET_RECORDS",
-                WAL_FDATASYNC_GROUP_COMMIT_TARGET_RECORDS,
-            ),
-            (
-                "PAGEBOX_WAL_PWRITEV2_DSYNC_DELAY_MAX_US",
-                WAL_PWRITEV2_DSYNC_GROUP_COMMIT_DELAY_MAX_US,
-            ),
-            (
-                "PAGEBOX_WAL_PWRITEV2_DSYNC_TARGET_RECORDS",
-                WAL_PWRITEV2_DSYNC_GROUP_COMMIT_TARGET_RECORDS,
-            ),
-        ] {
-            let value = std::env::var(key)
+macro_rules! env_u64_knob {
+    ($name:literal, $default:expr) => {{
+        static CELL: OnceLock<u64> = OnceLock::new();
+        *CELL.get_or_init(|| {
+            std::env::var($name)
                 .ok()
                 .and_then(|raw| raw.parse::<u64>().ok())
-                .unwrap_or(fallback);
-            values.insert(key, value);
+                .unwrap_or($default)
+        })
+    }};
+}
+
+pub(crate) fn env_u64_us(name: &'static str, default: u64) -> u64 {
+    // Fast paths: the call sites pass literal keys known at compile time.
+    // Each maps to its own OnceLock<u64>, so repeated calls are a single
+    // atomic load after first initialization — no HashMap lookup.
+    match name {
+        "PAGEBOX_WAL_RELAXED_SYNC_INTERVAL_US" => {
+            env_u64_knob!(
+                "PAGEBOX_WAL_RELAXED_SYNC_INTERVAL_US",
+                WAL_RELAXED_SYNC_INTERVAL_US
+            )
         }
-        values
-    });
-    overrides.get(name).copied().unwrap_or(default)
+        "PAGEBOX_WAL_RELAXED_WRITE_INTERVAL_US" => {
+            env_u64_knob!(
+                "PAGEBOX_WAL_RELAXED_WRITE_INTERVAL_US",
+                WAL_RELAXED_WRITE_INTERVAL_US
+            )
+        }
+        "PAGEBOX_WAL_GROUP_COMMIT_DELAY_MIN_US" => {
+            env_u64_knob!(
+                "PAGEBOX_WAL_GROUP_COMMIT_DELAY_MIN_US",
+                WAL_GROUP_COMMIT_DELAY_MIN_US
+            )
+        }
+        "PAGEBOX_WAL_GROUP_COMMIT_DELAY_MAX_US" => {
+            env_u64_knob!(
+                "PAGEBOX_WAL_GROUP_COMMIT_DELAY_MAX_US",
+                WAL_GROUP_COMMIT_DELAY_MAX_US
+            )
+        }
+        "PAGEBOX_WAL_GROUP_COMMIT_TARGET_RECORDS" => env_u64_knob!(
+            "PAGEBOX_WAL_GROUP_COMMIT_TARGET_RECORDS",
+            WAL_GROUP_COMMIT_TARGET_RECORDS
+        ),
+        "PAGEBOX_WAL_FDATASYNC_DELAY_MAX_US" => {
+            env_u64_knob!(
+                "PAGEBOX_WAL_FDATASYNC_DELAY_MAX_US",
+                WAL_FDATASYNC_GROUP_COMMIT_DELAY_MAX_US
+            )
+        }
+        "PAGEBOX_WAL_FDATASYNC_TARGET_RECORDS" => env_u64_knob!(
+            "PAGEBOX_WAL_FDATASYNC_TARGET_RECORDS",
+            WAL_FDATASYNC_GROUP_COMMIT_TARGET_RECORDS
+        ),
+        "PAGEBOX_WAL_PWRITEV2_DSYNC_DELAY_MAX_US" => env_u64_knob!(
+            "PAGEBOX_WAL_PWRITEV2_DSYNC_DELAY_MAX_US",
+            WAL_PWRITEV2_DSYNC_GROUP_COMMIT_DELAY_MAX_US
+        ),
+        "PAGEBOX_WAL_PWRITEV2_DSYNC_TARGET_RECORDS" => env_u64_knob!(
+            "PAGEBOX_WAL_PWRITEV2_DSYNC_TARGET_RECORDS",
+            WAL_PWRITEV2_DSYNC_GROUP_COMMIT_TARGET_RECORDS
+        ),
+        "PAGEBOX_WAL_IO_URING_DELAY_MAX_US" => env_u64_knob!(
+            "PAGEBOX_WAL_IO_URING_DELAY_MAX_US",
+            WAL_IO_URING_GROUP_COMMIT_DELAY_MAX_US
+        ),
+        "PAGEBOX_WAL_IO_URING_TARGET_RECORDS" => env_u64_knob!(
+            "PAGEBOX_WAL_IO_URING_TARGET_RECORDS",
+            WAL_IO_URING_GROUP_COMMIT_TARGET_RECORDS
+        ),
+        _ => default,
+    }
 }
 
 pub(crate) fn payload_crc(payload: &[u8]) -> u32 {

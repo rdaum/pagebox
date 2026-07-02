@@ -16,6 +16,12 @@ benchmarking support for the runtime and lower storage layers.
   replay iteration, and telemetry.
 - `src/io.rs` and `src/aligned_buf.rs` contain file IO and aligned-buffer
   support.
+- `src/backend.rs` defines the `WalIoBackend` trait (the completion-based seam
+  between the driver loop and the I/O path) and the synchronous backends
+  (`fdatasync`, `pwritev2_dsync`).
+- `src/io_uring.rs` (Linux) implements the io_uring backend: hand-defined
+  kernel uapi structs, `IORING_SETUP_NO_MMAP` ring creation, linked
+  WRITE→FSYNC SQE chains, and CQE-driven completion reaping.
 - `src/bin/profile_wal.rs` profiles WAL throughput and latency.
 - `benches/` contains WAL benchmarks.
 

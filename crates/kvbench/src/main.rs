@@ -62,6 +62,10 @@ enum Command {
         /// Override thread count from spec. Useful for scaling sweeps.
         #[arg(long)]
         threads: Option<usize>,
+        /// Override WAL backend from spec ("fdatasync", "pwritev2_dsync",
+        /// "io_uring"). kvstore only.
+        #[arg(long)]
+        wal_backend: Option<String>,
     },
     /// Compare two JSON reports.
     Compare {
@@ -99,7 +103,16 @@ fn main() -> std::io::Result<()> {
             tmpdir,
             verify,
             threads,
-        } => run_spec_file(&spec, &output, &engine, &tmpdir, verify, threads),
+            wal_backend,
+        } => run_spec_file(
+            &spec,
+            &output,
+            &engine,
+            &tmpdir,
+            verify,
+            threads,
+            wal_backend,
+        ),
         Command::Compare { a, b } => {
             let report_a: Report = read_report(&a)?;
             let report_b: Report = read_report(&b)?;
@@ -158,6 +171,7 @@ fn run_spec_file(
     tmpdir: &std::path::Path,
     verify: bool,
     threads_override: Option<usize>,
+    wal_backend_override: Option<String>,
 ) -> std::io::Result<()> {
     let spec_contents = std::fs::read_to_string(spec_path)?;
     let spec_file: SpecFile = toml::from_str(&spec_contents).map_err(|e| {
@@ -171,7 +185,11 @@ fn run_spec_file(
     if let Some(t) = threads_override {
         spec.threads = t.max(1);
     }
-    let opts = spec_file.engine_opts.clone();
+    let mut opts = spec_file.engine_opts.clone();
+    if let Some(ref b) = wal_backend_override {
+        opts.wal_backend = Some(b.clone());
+    }
+
     eprintln!(
         "Running {} / {} (records={}, ops={}, threads={})",
         engine_name,

@@ -14,6 +14,15 @@ impl KvEngine for KvstoreAdapter {
     const NAME: &'static str = "kvstore";
 
     fn open(dir: &Path, opts: &EngineOpts) -> std::io::Result<Self> {
+        // The WAL backend is selected via env var (read by Wal::open_opts).
+        // Set it before opening so the spec / CLI override takes effect.
+        if let Some(ref backend) = opts.wal_backend {
+            // SAFETY: setting an env var is process-global; the benchmark
+            // runs one engine per process so there is no interference.
+            unsafe { std::env::set_var("PAGEBOX_WAL_SYNC_BACKEND", backend) };
+            eprintln!("  WAL backend: {backend}");
+        }
+
         let _ = opts.engine_specific.get("tree_backend");
         let tree_backend = TreeBackend::BPlusTree;
         let kv_opts = KvStoreOptions::default()
@@ -48,7 +57,11 @@ impl KvEngine for KvstoreAdapter {
     }
 
     fn stats(&self) -> EngineStats {
-        EngineStats::default()
+        let mut extra = std::collections::HashMap::new();
+        if let Ok(backend) = std::env::var("PAGEBOX_WAL_SYNC_BACKEND") {
+            extra.insert("wal_backend".to_string(), backend);
+        }
+        EngineStats { extra }
     }
 }
 
@@ -62,6 +75,7 @@ mod tests {
             value_size: 100,
             sync_mode: SyncMode::Relaxed,
             buffer_budget_frames: 1024,
+            wal_backend: None,
             engine_specific: Default::default(),
         }
     }

@@ -354,10 +354,6 @@ struct AlignedPageCopy {
     len: usize,
 }
 
-thread_local! {
-    static SPARE_PAGE_BUF: std::cell::RefCell<Option<Box<[u8; PAGE_SIZE]>>> = const { std::cell::RefCell::new(None) };
-}
-
 impl AlignedPageCopy {
     fn copy_from(page: &[u8]) -> Self {
         let layout = std::alloc::Layout::from_size_align(page.len(), PAGE_SIZE).unwrap();
@@ -388,11 +384,17 @@ impl Drop for AlignedPageCopy {
     }
 }
 
+thread_local! {
+    static SPARE_PAGE_BUF: std::cell::RefCell<Option<Box<[u8; PAGE_SIZE]>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// A reusable thread-local page-level scratch buffer.
 /// Avoids alloc/free on every mark_dirty_raw call. The scratch is
 /// filled and prepared OUTSIDE the WAL mutex to avoid holding the WAL
-/// lock during prepare_page_copy_for_writeback (which acquires another
-/// mutex internally).
+/// lock during the copy and prepare_page_copy_for_writeback (which
+/// walks the page to convert swizzled pointers). Holding the mutex for
+/// that extra work increases contention and degrades throughput under
+/// concurrent writers.
 struct PageScratch {
     buf: Box<[u8; PAGE_SIZE]>,
 }

@@ -7,6 +7,8 @@
 #   ./bench.sh ycsb_c_small           # one scenario, all thread counts
 #   ./bench.sh ycsb_c_small 8         # one scenario, one thread count
 #   ./bench.sh --keep                 # don't clear old results first
+#   ./bench.sh --wal-backend io_uring  # override WAL backend (kvstore only)
+#   ./bench.sh --wal-backend io_uring fillrandom 8
 #
 # Reports are written to ./bench-results/ as JSON.
 # Output files are named: ${engine}_${spec}_${threads}t.json
@@ -19,16 +21,19 @@ RESULTS_DIR="$SCRIPT_DIR/bench-results"
 ENGINES=(kvstore fjall redb rocksdb lmdb)
 THREAD_COUNTS=(2 4 8 16)
 
-# Parse args: separate --keep, scenario names, and thread counts.
+# Parse args: separate --keep, --wal-backend, scenario names, and thread counts.
 KEEP_RESULTS=false
+WAL_BACKEND=""
 SCENARIO_FILTER=()
 THREAD_FILTER=()
 
-for arg in "$@"; do
-    case "$arg" in
-        --keep) KEEP_RESULTS=true ;;
-        *[0-9]*) THREAD_FILTER+=("$arg") ;;
-        *) SCENARIO_FILTER+=("$arg") ;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --keep) KEEP_RESULTS=true; shift ;;
+        --wal-backend) WAL_BACKEND="$2"; shift 2 ;;
+        --wal-backend=*) WAL_BACKEND="${1#--wal-backend=}"; shift ;;
+        *[0-9]*) THREAD_FILTER+=("$1"); shift ;;
+        *) SCENARIO_FILTER+=("$1"); shift ;;
     esac
 done
 
@@ -58,6 +63,10 @@ fi
 echo "=== Building kvbench (release, --all-features) ==="
 cargo build -p kvbench --release --all-features
 echo
+if [[ -n "$WAL_BACKEND" ]]; then
+    echo "=== WAL backend: $WAL_BACKEND ==="
+    echo
+fi
 
 BIN="target/release/kvbench"
 
@@ -73,13 +82,19 @@ run_one() {
         return 1
     fi
 
+    local wal_arg=()
+    if [[ -n "$WAL_BACKEND" ]]; then
+        wal_arg=(--wal-backend "$WAL_BACKEND")
+    fi
+
     echo "  [$engine] $spec @ ${threads}t ..."
     timeout 300 "$BIN" run \
         --spec "$spec_path" \
         --output "$report" \
         --engine "$engine" \
         --tmpdir "$RESULTS_DIR/tmp" \
-        --threads "$threads" 2>&1 | sed 's/^/    /'
+        --threads "$threads" \
+        "${wal_arg[@]}" 2>&1 | sed 's/^/    /'
     local rc=$?
     if [[ $rc -ne 0 ]]; then
         echo "    (run failed or timed out, rc=$rc)"

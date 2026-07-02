@@ -56,6 +56,13 @@
 //! - `pwritev2_dsync` — Linux `pwritev2` with `RWF_DSYNC`; one syscall does
 //!   the durable write, so no separate syncer thread is spawned. Falls back
 //!   to `fdatasync` on non-Linux.
+//! - `io_uring` — Linux io_uring (kernel ≥5.18 with `IORING_SETUP_NO_MMAP`);
+//!   writes submitted as `IORING_OP_WRITE` SQEs with a linked
+//!   `IORING_OP_FSYNC` SQE so durability arrives as a CQE. One ring-driver
+//!   thread per shard drains completions to advance `written_lsn` /
+//!   `durable_lsn` and reclaim buffers. v1 uses plain kernel polling (no
+//!   `SQPOLL`, no registered buffers/files). Falls back to `fdatasync` on
+//!   non-Linux.
 //!
 //! ### Group commit
 //!
@@ -127,8 +134,11 @@
 //! (`pagebox-frame-kernel`, `pagebox-threading`) are Miri-clean.
 
 mod aligned_buf;
+mod backend;
 mod format;
 mod io;
+#[cfg(target_os = "linux")]
+mod io_uring;
 #[cfg(not(feature = "metrics"))]
 mod metrics_stub;
 mod wal_impl;

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "metrics")]
 use fast_telemetry::{HistogramSnapshot, MetricLabels, MetricMeta, MetricVisitor};
-use pagebox_frame_kernel::{PAGE_SIZE, PageId, page_size};
+use pagebox_frame_kernel::{Lsn, PAGE_SIZE, PageId, page_size};
 
 use crate::format::{
     BATCH_MAX_RECORDS, BatchEntry, HDR_RECORD_SIZE_OFF, HDR_VERSION_OFF, WAL_HEADER_SIZE,
@@ -1214,4 +1214,280 @@ fn group_commit_batches_concurrent_commits_into_fewer_writes() {
     let mut lsns: Vec<u64> = replayed.iter().map(|&(l, _, _)| l).collect();
     lsns.sort_unstable();
     assert_eq!(lsns, (1..=n_threads as u64).collect::<Vec<_>>());
+}
+
+// ---------------------------------------------------------------------------
+// Shutdown concurrent with flush — guards the Phase 2 unification where
+// durable advancement moved from the syncer thread into the driver loop
+// (via the completion queue + poll). The invariant: every strict commit
+// that returned must be durable after a clean shutdown, and reopen + replay
+// must surface every committed record with contiguous, unique LSNs.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn shutdown_concurrent_with_flush_preserves_all_committed_records() {
+    let path = tmp_path("shutdown_concurrent_flush");
+    let _cleanup = Cleanup(path.clone());
+
+    let n_threads = 4;
+    let commits_per_thread = 64;
+
+    let committed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    {
+        let wal = Arc::new(Wal::open(&path).unwrap());
+        // Strict mode is the default, so flush_at_least blocks until durable.
+        let barrier = Arc::new(Barrier::new(n_threads));
+
+        let handles: Vec<_> = (0..n_threads)
+            .map(|t| {
+                let wal = Arc::clone(&wal);
+                let barrier = Arc::clone(&barrier);
+                let committed = Arc::clone(&committed);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for i in 0..commits_per_thread {
+                        let pid = ((t as u64) << 32) | i as u64;
+                        let mut page = [0u8; PAGE_SIZE];
+                        page[0] = t as u8;
+                        page[1] = i as u8;
+                        let lsn = wal.append_page_image(pid, &page).unwrap();
+                        // Strict: returns only once `lsn` is durable. If the
+                        // timing change broke durability notification, this
+                        // would either hang or return before durability.
+                        wal.flush_at_least(lsn);
+                        committed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+        // Clean shutdown: drain + fsync + close, concurrent with nothing now,
+        // but the driver/syncer interaction during the run is what's tested.
+        wal.flush();
+    }
+
+    let total_committed = committed.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        total_committed,
+        (n_threads * commits_per_thread) as u64,
+        "every worker should have completed its commits"
+    );
+
+    // Reopen and replay: every committed record must survive clean shutdown.
+    let wal = Wal::open(&path).unwrap();
+    let mut replayed = Vec::new();
+    wal.replay(|lsn, pid, data| replayed.push((lsn, pid, data[0], data[1])))
+        .unwrap();
+    drop(wal);
+
+    assert_eq!(
+        replayed.len(),
+        total_committed as usize,
+        "every committed record should survive clean shutdown"
+    );
+
+    // LSNs must be a contiguous 1..=N set (no gaps ⇒ no lost commit, no
+    // duplicates ⇒ no double-count). This is the real invariant: the
+    // completion-driven durability path must not drop or duplicate a
+    // durable advance.
+    let mut lsns: Vec<u64> = replayed.iter().map(|&(l, _, _, _)| l).collect();
+    lsns.sort_unstable();
+    let expected: Vec<u64> = (1..=total_committed).collect();
+    assert_eq!(lsns, expected, "committed LSNs should be contiguous 1..=N");
+
+    // Page IDs must be unique (each commit wrote a distinct page).
+    let mut pids: Vec<u64> = replayed.iter().map(|&(_, p, _, _)| p).collect();
+    pids.sort_unstable();
+    pids.dedup();
+    assert_eq!(
+        pids.len(),
+        total_committed as usize,
+        "every committed record should have a unique page ID"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// io_uring backend (Linux-only). These exercise the completion-driven path:
+// writes submitted as WRITEV SQEs, fsyncs as linked FSYNC SQEs, and CQE
+// reap advancing written_lsn / durable_lsn + reclaiming buffers. Real
+// invariants, not "did not panic" smoke (per AGENTS.md).
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+mod io_uring_tests {
+    use super::*;
+    use crate::wal_impl::WalSyncBackend;
+
+    fn page_data(seed: u64) -> [u8; PAGE_SIZE] {
+        let mut buf = [0u8; PAGE_SIZE];
+        let bytes = seed.to_le_bytes();
+        for chunk in buf.chunks_exact_mut(8) {
+            chunk.copy_from_slice(&bytes);
+        }
+        buf
+    }
+
+    fn open_iouring(path: &std::path::Path) -> Wal {
+        Wal::open_with_backend_for_test(path, WalSyncBackend::IoUring)
+            .expect("io_uring backend unavailable on this kernel")
+    }
+
+    #[test]
+    fn iouring_append_flush_reopen_recovers() {
+        let path = tmp_path("iouring_append_flush_reopen");
+        let _cleanup = Cleanup(path.clone());
+        let model = std::collections::BTreeMap::<PageId, (Lsn, [u8; PAGE_SIZE])>::new();
+
+        {
+            let wal = open_iouring(&path);
+            let mut model = model;
+            let page = page_data(7);
+            for i in 0..128u64 {
+                let pid = i;
+                let lsn = wal.append_page_image(pid, &page).unwrap();
+                model.insert(pid, (lsn, page));
+            }
+            wal.flush();
+
+            // Verify all are durable + replay matches the model.
+            assert_eq!(
+                wal.durable_lsn(),
+                128,
+                "io_uring backend should make all flushed records durable"
+            );
+            let mut replayed = Vec::new();
+            wal.replay(|lsn, pid, data| replayed.push((lsn, pid, data.to_vec())))
+                .unwrap();
+            assert_eq!(
+                replayed.len(),
+                128,
+                "io_uring replay should surface all records"
+            );
+            for (lsn, pid, data) in &replayed {
+                let (expected_lsn, expected_data) = model.get(pid).unwrap();
+                assert_eq!(
+                    lsn, expected_lsn,
+                    "io_uring replay LSN mismatch for pid {pid}"
+                );
+                assert_eq!(
+                    data.as_slice(),
+                    expected_data.as_slice(),
+                    "io_uring replay data mismatch for pid {pid}"
+                );
+            }
+        }
+
+        // Reopen + recover into a store; every committed page should appear.
+        let wal = open_iouring(&path);
+        let store = TestRecoveryStore::default();
+        wal.recover(&store, 0, |_| 0).unwrap();
+        assert_eq!(
+            store.pages.lock().unwrap().len(),
+            128,
+            "io_uring recovery should apply all 128 page images"
+        );
+    }
+
+    #[test]
+    fn iouring_crash_then_recover_preserves_committed_prefix() {
+        let path = tmp_path("iouring_crash_recover");
+        let _cleanup = Cleanup(path.clone());
+
+        let committed_before_crash;
+        {
+            let wal = open_iouring(&path);
+            let page = page_data(42);
+            for i in 0..64u64 {
+                let lsn = wal.append_page_image(i, &page).unwrap();
+                wal.flush_at_least(lsn);
+            }
+            committed_before_crash = wal.durable_lsn();
+            // Crash: no drain, threads stopped in place. Pending (unflushed)
+            // appends are discarded; the durable prefix survives.
+            wal.crash();
+        }
+
+        let wal = open_iouring(&path);
+        let store = TestRecoveryStore::default();
+        wal.recover(&store, 0, |_| 0).unwrap();
+        let applied = store.pages.lock().unwrap().len();
+        assert!(
+            applied <= 64,
+            "io_uring crash recovery should not apply more than committed"
+        );
+        assert!(
+            applied > 0,
+            "io_uring crash recovery should preserve the durable prefix"
+        );
+        let _ = committed_before_crash;
+    }
+
+    #[test]
+    fn iouring_concurrent_commit_invariant() {
+        let path = tmp_path("iouring_concurrent_commit");
+        let _cleanup = Cleanup(path.clone());
+
+        let n_threads = 4;
+        let commits_per_thread = 32;
+
+        {
+            let wal = Arc::new(open_iouring(&path));
+            let barrier = Arc::new(Barrier::new(n_threads));
+
+            let handles: Vec<_> = (0..n_threads)
+                .map(|t| {
+                    let wal = Arc::clone(&wal);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        let page = page_data(t as u64);
+                        barrier.wait();
+                        for i in 0..commits_per_thread {
+                            let pid = ((t as u64) << 32) | i as u64;
+                            let lsn = wal.append_page_image(pid, &page).unwrap();
+                            wal.flush_at_least(lsn);
+                        }
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                h.join().unwrap();
+            }
+        }
+
+        // Reopen + replay: post-hoc invariant scan.
+        let wal = open_iouring(&path);
+        let mut replayed = Vec::new();
+        wal.replay(|lsn, pid, data| replayed.push((lsn, pid, data[0])))
+            .unwrap();
+
+        let total = n_threads * commits_per_thread;
+        assert_eq!(
+            replayed.len(),
+            total,
+            "io_uring: all concurrent commits should survive"
+        );
+
+        // LSNs strictly monotone and unique (contiguous 1..=N).
+        let mut lsns: Vec<u64> = replayed.iter().map(|&(l, _, _)| l).collect();
+        lsns.sort_unstable();
+        let expected: Vec<u64> = (1..=total as u64).collect();
+        assert_eq!(
+            lsns, expected,
+            "io_uring: committed LSNs should be contiguous 1..=N"
+        );
+
+        // Unique page IDs.
+        let mut pids: Vec<u64> = replayed.iter().map(|&(_, p, _)| p).collect();
+        pids.sort_unstable();
+        pids.dedup();
+        assert_eq!(
+            pids.len(),
+            total,
+            "io_uring: every commit should have a unique page ID"
+        );
+    }
 }

@@ -75,7 +75,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "metrics")]
@@ -88,24 +88,20 @@ use crate::metrics_stub::{LabeledCounter, LabeledHistogram, MetricVisitor};
 use parking_lot::{Condvar, Mutex};
 
 use crate::aligned_buf::AlignedBuf;
+use crate::backend::WalIoBackend;
 use crate::format::SEGMENT_SIZE;
 use crate::format::{
     BATCH_MAX_RECORDS, BatchEntry, LOGICAL_CHUNK_MAX_LEN, LOGICAL_FLAG_FIRST, LOGICAL_FLAG_LAST,
     PACKED_LOGICAL_ENTRY_HEADER_LEN, PACKED_LOGICAL_MAX_PAYLOAD_LEN, RECORD_KIND_LOGICAL,
     RECORD_KIND_LOGICAL_PACKED, RECORD_KIND_PAGE_IMAGE, WAL_BUF_CAPACITY,
-    WAL_FDATASYNC_GROUP_COMMIT_DELAY_MAX_US, WAL_FDATASYNC_GROUP_COMMIT_TARGET_RECORDS,
-    WAL_GROUP_COMMIT_DELAY_MIN_US, WAL_HEADER_SIZE, WAL_PWRITEV2_DSYNC_GROUP_COMMIT_DELAY_MAX_US,
-    WAL_PWRITEV2_DSYNC_GROUP_COMMIT_TARGET_RECORDS, WAL_RECORD_SIZE, WAL_RELAXED_SYNC_INTERVAL_US,
+    WAL_GROUP_COMMIT_DELAY_MIN_US, WAL_HEADER_SIZE, WAL_RECORD_SIZE, WAL_RELAXED_SYNC_INTERVAL_US,
     WAL_RELAXED_SYNC_RECORDS, WAL_RELAXED_WRITE_INTERVAL_US, WAL_RELAXED_WRITE_RECORDS,
     batch_meta_count, batch_meta_count_unchecked, build_wal_header, env_u64_us,
     finalize_batch_meta, init_batch_meta, overwrite_batch_entry_crc, overwrite_batch_entry_lsn,
     page_crc, payload_crc, read_batch_entry, set_batch_meta_count, validate_wal_header,
     write_batch_entry,
 };
-use crate::io::{
-    extend_file, fdatasync_file, fstat_size, pread_all, pwrite_all, pwritev2_dsync_all,
-    round_up_u64, sync_wal_fd,
-};
+use crate::io::{extend_file, fdatasync_file, fstat_size, pread_all, pwrite_all, round_up_u64};
 
 /// Statistics from WAL recovery.
 #[derive(Debug, Default, Clone)]
@@ -295,42 +291,29 @@ pub enum CommitMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WalSyncBackend {
+pub(crate) enum WalSyncBackend {
     Fdatasync,
     Pwritev2Dsync,
+    /// Linux io_uring write/sync backend. Falls back to `Fdatasync` on
+    /// non-Linux (see `wal_sync_backend`).
+    IoUring,
 }
 
 impl WalSyncBackend {
-    fn group_commit_delay_max_us(self) -> u64 {
-        match self {
-            Self::Fdatasync => env_u64_us(
-                "PAGEBOX_WAL_FDATASYNC_DELAY_MAX_US",
-                env_u64_us(
-                    "PAGEBOX_WAL_GROUP_COMMIT_DELAY_MAX_US",
-                    WAL_FDATASYNC_GROUP_COMMIT_DELAY_MAX_US,
-                ),
-            ),
-            Self::Pwritev2Dsync => env_u64_us(
-                "PAGEBOX_WAL_PWRITEV2_DSYNC_DELAY_MAX_US",
-                WAL_PWRITEV2_DSYNC_GROUP_COMMIT_DELAY_MAX_US,
-            ),
-        }
+    /// Whether the backend needs the file metadata (size from `ftruncate`)
+    /// to be durable before a durable write can land. Only `pwritev2_dsync`
+    /// performs durable writes inline, so only it must `fdatasync` the
+    /// pre-extend so a later `RWF_DSYNC` write does not hit an unmapped
+    /// region. Mirrors [`WalIoBackend::pre_extend_needs_fsync`].
+    fn pre_extend_needs_fsync(self) -> bool {
+        matches!(self, Self::Pwritev2Dsync)
     }
 
-    fn group_commit_target_records(self) -> u64 {
-        match self {
-            Self::Fdatasync => env_u64_us(
-                "PAGEBOX_WAL_FDATASYNC_TARGET_RECORDS",
-                env_u64_us(
-                    "PAGEBOX_WAL_GROUP_COMMIT_TARGET_RECORDS",
-                    WAL_FDATASYNC_GROUP_COMMIT_TARGET_RECORDS,
-                ),
-            ),
-            Self::Pwritev2Dsync => env_u64_us(
-                "PAGEBOX_WAL_PWRITEV2_DSYNC_TARGET_RECORDS",
-                WAL_PWRITEV2_DSYNC_GROUP_COMMIT_TARGET_RECORDS,
-            ),
-        }
+    /// io_uring is only constructable on Linux; on other platforms the env
+    /// selector falls back to `Fdatasync`, so this is just a cfg convenience.
+    #[allow(dead_code)]
+    fn is_io_uring(self) -> bool {
+        matches!(self, Self::IoUring)
     }
 }
 
@@ -354,19 +337,23 @@ const PAGE_IMAGE_BYTES_HEADER_LEN: usize = 16;
 const PAGE_PATCH_HEADER_LEN: usize = 16;
 const PAGE_PATCH_RANGE_HEADER_LEN: usize = 8;
 
-struct WalInner {
-    state: Mutex<WalState>,
-    sync_backend: WalSyncBackend,
-    next_lsn: Arc<AtomicU64>,
-    appended_lsn: AtomicU64,
-    written_lsn: AtomicU64,
-    durable_lsn: AtomicU64,
-    requested_write_lsn: AtomicU64,
-    requested_durable_lsn: AtomicU64,
-    commit_mode: AtomicU64,
-    flush_done: Condvar,
-    flush_requested: Condvar,
-    stats: WalStats,
+pub(crate) struct WalInner {
+    pub(crate) state: Mutex<WalState>,
+    pub(crate) backend: Box<dyn WalIoBackend>,
+    pub(crate) next_lsn: Arc<AtomicU64>,
+    pub(crate) appended_lsn: AtomicU64,
+    pub(crate) written_lsn: AtomicU64,
+    pub(crate) durable_lsn: AtomicU64,
+    pub(crate) requested_write_lsn: AtomicU64,
+    pub(crate) requested_durable_lsn: AtomicU64,
+    pub(crate) commit_mode: AtomicU64,
+    pub(crate) flush_done: Condvar,
+    pub(crate) flush_requested: Condvar,
+    pub(crate) stats: WalStats,
+    pub(crate) writer: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Fast-path check for lazy thread spawning. Set to true once threads
+    /// are started; subsequent appends skip the mutex lock entirely.
+    pub(crate) threads_started: AtomicBool,
 }
 
 /// Handle to a write-ahead log. Owns the primary shard plus zero or more
@@ -383,16 +370,8 @@ struct WalInner {
 /// exercise recovery on the next reopen.
 pub struct Wal {
     inner: Arc<WalInner>,
-    writer: Option<std::thread::JoinHandle<()>>,
-    syncer: Option<std::thread::JoinHandle<()>>,
-    extra_shards: Vec<WalShard>,
+    extra_shards: Vec<Arc<WalInner>>,
     next_thread_shard: AtomicUsize,
-}
-
-struct WalShard {
-    inner: Arc<WalInner>,
-    writer: Option<std::thread::JoinHandle<()>>,
-    syncer: Option<std::thread::JoinHandle<()>>,
 }
 
 struct OpenWalFile {
@@ -423,35 +402,35 @@ impl std::fmt::Debug for Wal {
     }
 }
 
-struct WalState {
-    fd: std::os::fd::RawFd,
+pub(crate) struct WalState {
+    pub(crate) fd: std::os::fd::RawFd,
     #[allow(dead_code)]
-    direct_io: bool,
-    active: WalBuffer,
-    spare_buffers: Vec<WalBuffer>,
-    pending_writes: VecDeque<PendingWalWrite>,
-    writes_in_progress: usize,
-    file_offset: u64,
-    allocated_size: u64,
-    flush_waiters: usize,
-    next_buffer_epoch: u64,
-    crash_shutdown: bool,
-    shutdown: bool,
+    pub(crate) direct_io: bool,
+    pub(crate) active: WalBuffer,
+    pub(crate) spare_buffers: Vec<WalBuffer>,
+    pub(crate) pending_writes: VecDeque<PendingWalWrite>,
+    pub(crate) writes_in_progress: usize,
+    pub(crate) file_offset: u64,
+    pub(crate) allocated_size: u64,
+    pub(crate) flush_waiters: usize,
+    pub(crate) next_buffer_epoch: u64,
+    pub(crate) crash_shutdown: bool,
+    pub(crate) shutdown: bool,
 }
 
-struct WalBuffer {
-    buffer: AlignedBuf,
-    used: usize,
-    records: usize,
-    epoch: u64,
-    max_lsn: Lsn,
-    open_batch_meta_offset: Option<usize>,
-    open_batch_count: usize,
-    packed_logical: Option<PackedLogicalSlot>,
+pub(crate) struct WalBuffer {
+    pub(crate) buffer: AlignedBuf,
+    pub(crate) used: usize,
+    pub(crate) records: usize,
+    pub(crate) epoch: u64,
+    pub(crate) max_lsn: Lsn,
+    pub(crate) open_batch_meta_offset: Option<usize>,
+    pub(crate) open_batch_count: usize,
+    pub(crate) packed_logical: Option<PackedLogicalSlot>,
 }
 
 #[derive(Clone, Copy)]
-struct PackedLogicalSlot {
+pub(crate) struct PackedLogicalSlot {
     meta_start: usize,
     slot_idx: usize,
     data_start: usize,
@@ -459,16 +438,16 @@ struct PackedLogicalSlot {
     max_lsn: Lsn,
 }
 
-struct PendingWalWrite {
-    buffer: WalBuffer,
-    fd: std::os::fd::RawFd,
-    file_offset: u64,
-    len: usize,
-    max_lsn: Lsn,
+pub(crate) struct PendingWalWrite {
+    pub(crate) buffer: WalBuffer,
+    pub(crate) fd: std::os::fd::RawFd,
+    pub(crate) file_offset: u64,
+    pub(crate) len: usize,
+    pub(crate) max_lsn: Lsn,
 }
 
 impl WalBuffer {
-    fn new(epoch: u64) -> Self {
+    pub(crate) fn new(epoch: u64) -> Self {
         Self {
             buffer: AlignedBuf::new(WAL_BUF_CAPACITY),
             used: 0,
@@ -481,7 +460,7 @@ impl WalBuffer {
         }
     }
 
-    fn reset(&mut self, epoch: u64) {
+    pub(crate) fn reset(&mut self, epoch: u64) {
         self.used = 0;
         self.records = 0;
         self.epoch = epoch;
@@ -855,6 +834,8 @@ fn wal_sync_backend() -> WalSyncBackend {
         Some("pwritev2_dsync") | Some("pwritev2-dsync") | Some("rwf_dsync") => {
             WalSyncBackend::Pwritev2Dsync
         }
+        #[cfg(target_os = "linux")]
+        Some("io_uring") | Some("iouring") => WalSyncBackend::IoUring,
         _ => WalSyncBackend::Fdatasync,
     }
 }
@@ -883,7 +864,15 @@ fn wal_shard_count() -> usize {
     std::env::var("PAGEBOX_WAL_SHARDS")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(1)
+        .unwrap_or_else(|| {
+            if cfg!(test) {
+                1
+            } else {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+            }
+        })
         .clamp(1, 256)
 }
 
@@ -929,12 +918,7 @@ fn saturating_duration_nanos(elapsed: Duration) -> u64 {
 impl Wal {
     fn spawn_writer(inner: &Arc<WalInner>) -> io::Result<std::thread::JoinHandle<()>> {
         let inner = inner.clone();
-        threading::spawn_efficient("wal-writer", move || inner.writer_loop())
-    }
-
-    fn spawn_syncer(inner: &Arc<WalInner>) -> io::Result<std::thread::JoinHandle<()>> {
-        let inner = inner.clone();
-        threading::spawn_efficient("wal-syncer", move || inner.syncer_loop())
+        threading::spawn_efficient("wal-writer", move || inner.driver_loop())
     }
 
     /// Open or create a WAL at `path` with the process-default sync backend
@@ -958,12 +942,29 @@ impl Wal {
         Self::open_opts_with_shards(path, WalSyncBackend::Fdatasync, shard_count)
     }
 
+    #[cfg(test)]
+    pub(crate) fn open_with_backend_for_test(
+        path: &Path,
+        backend: WalSyncBackend,
+    ) -> io::Result<Self> {
+        Self::open_opts_with_shards(path, backend, 1)
+    }
+
     fn open_opts_with_shards(
         path: &Path,
         sync_backend: WalSyncBackend,
         shard_count: usize,
     ) -> io::Result<Self> {
-        let shard_count = shard_count.clamp(1, 256);
+        // io_uring v1 is limited to a single ring per process; multiple
+        // rings (one per shard) corrupt shared kernel resources. Force 1
+        // shard for the io_uring backend regardless of the env-configured
+        // shard count. This will be lifted when registered-resources support
+        // lands.
+        let shard_count = if sync_backend.is_io_uring() {
+            1
+        } else {
+            shard_count.clamp(1, 256)
+        };
 
         let mut opened = Vec::with_capacity(shard_count);
         for shard_idx in 0..shard_count {
@@ -973,23 +974,28 @@ impl Wal {
 
         let max_lsn = opened.iter().map(|file| file.max_lsn).max().unwrap_or(0);
         let next_lsn = Arc::new(AtomicU64::new(max_lsn + 1));
-        let mut shards = Vec::with_capacity(shard_count);
+        let mut inners = Vec::with_capacity(shard_count);
         for file in opened {
-            shards.push(Self::start_shard(
-                file,
-                sync_backend,
+            let backend = crate::backend::make_backend(sync_backend, file.fd)?;
+            let inner = Arc::new(WalInner::new(
+                file.fd,
+                file.direct_io,
+                backend,
+                file.file_offset,
+                file.allocated_size,
+                file.max_lsn,
                 Arc::clone(&next_lsn),
-            )?);
+            ));
+            inners.push(inner);
         }
 
-        let mut shards = shards.into_iter();
-        let primary = shards.next().expect("at least one WAL shard");
+        let mut inners = inners.into_iter();
+        let primary = inners.next().expect("at least one WAL shard");
+        Self::start_threads(&primary)?;
 
         Ok(Self {
-            inner: primary.inner,
-            writer: primary.writer,
-            syncer: primary.syncer,
-            extra_shards: shards.collect(),
+            inner: primary,
+            extra_shards: inners.collect(),
             next_thread_shard: AtomicUsize::new(0),
         })
     }
@@ -1009,7 +1015,7 @@ impl Wal {
             hdr_buf.as_mut_slice().copy_from_slice(&hdr);
             pwrite_all(fd, hdr_buf.as_slice(), 0).map_err(close_on_err)?;
             extend_file(fd, SEGMENT_SIZE).map_err(close_on_err)?;
-            if sync_backend == WalSyncBackend::Pwritev2Dsync {
+            if sync_backend.pre_extend_needs_fsync() {
                 fdatasync_file(fd).map_err(close_on_err)?;
             }
             return Ok(OpenWalFile {
@@ -1036,7 +1042,7 @@ impl Wal {
             let target = round_up_u64(valid_end, SEGMENT_SIZE).max(SEGMENT_SIZE);
             if target > valid_end {
                 extend_file(fd, target).map_err(close_on_err)?;
-                if sync_backend == WalSyncBackend::Pwritev2Dsync {
+                if sync_backend.pre_extend_needs_fsync() {
                     fdatasync_file(fd).map_err(close_on_err)?;
                 }
             }
@@ -1052,49 +1058,38 @@ impl Wal {
         })
     }
 
-    fn start_shard(
-        file: OpenWalFile,
-        sync_backend: WalSyncBackend,
-        next_lsn: Arc<AtomicU64>,
-    ) -> io::Result<WalShard> {
-        let inner = Arc::new(WalInner::new(
-            file.fd,
-            file.direct_io,
-            sync_backend,
-            file.file_offset,
-            file.allocated_size,
-            file.max_lsn,
-            next_lsn,
-        ));
-
-        let writer = Self::spawn_writer(&inner).inspect_err(|_| {
+    fn start_threads(inner: &Arc<WalInner>) -> io::Result<()> {
+        // Fast path: atomic load, no mutex.
+        if inner.threads_started.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // Slow path: check under lock, spawn if not yet started.
+        let mut writer_guard = inner.writer.lock();
+        if writer_guard.is_some() {
+            inner.threads_started.store(true, Ordering::Release);
+            return Ok(());
+        }
+        let writer = Self::spawn_writer(inner).inspect_err(|_| {
             let state = inner.state.lock();
             unsafe { libc::close(state.fd) };
         })?;
-        let syncer = if sync_backend == WalSyncBackend::Fdatasync {
-            match Self::spawn_syncer(&inner) {
-                Ok(syncer) => Some(syncer),
-                Err(err) => {
-                    {
-                        let mut state = inner.state.lock();
-                        state.shutdown = true;
-                    }
-                    inner.flush_requested.notify_all();
-                    let _ = writer.join();
-                    let state = inner.state.lock();
-                    unsafe { libc::close(state.fd) };
-                    return Err(err);
-                }
+        *writer_guard = Some(writer);
+        drop(writer_guard);
+        // Spawn any backend-specific threads (fdatasync syncer). The io_uring
+        // and pwritev2_dsync backends have no extra thread.
+        if let Err(err) = inner.backend.start(inner) {
+            {
+                let mut state = inner.state.lock();
+                state.shutdown = true;
             }
-        } else {
-            None
-        };
-
-        Ok(WalShard {
-            inner,
-            writer: Some(writer),
-            syncer,
-        })
+            inner.flush_requested.notify_all();
+            let _ = inner.writer.lock().take().unwrap().join();
+            let state = inner.state.lock();
+            unsafe { libc::close(state.fd) };
+            return Err(err);
+        }
+        inner.threads_started.store(true, Ordering::Release);
+        Ok(())
     }
 
     fn open_fd(path: &Path) -> io::Result<(std::os::fd::RawFd, bool)> {
@@ -1120,11 +1115,8 @@ impl Wal {
         self.inner.commit_mode.store(mode as u64, Ordering::Release);
         self.inner.flush_requested.notify_all();
         for shard in &self.extra_shards {
-            shard
-                .inner
-                .commit_mode
-                .store(mode as u64, Ordering::Release);
-            shard.inner.flush_requested.notify_all();
+            shard.commit_mode.store(mode as u64, Ordering::Release);
+            shard.flush_requested.notify_all();
         }
     }
 
@@ -1172,15 +1164,17 @@ impl Wal {
 
     fn set_current_thread_last_lsn(&self, lsn: Lsn) {
         let wal_key = Arc::as_ptr(&self.inner) as usize;
-        let shard_count = self.shard_count();
-        let shard_idx = self.shard_idx_for_lsn(lsn);
         WAL_THREAD_STATES.with(|states| {
             let mut states = states.borrow_mut();
             let state = states.entry(wal_key).or_insert_with(|| ThreadWalState {
-                shard_idx: if shard_count == 1 { 0 } else { shard_idx },
+                shard_idx: self.shard_idx_for_lsn(lsn),
                 last_lsn: 0,
             });
-            state.shard_idx = shard_idx;
+            // Only update last_lsn — do NOT overwrite shard_idx.
+            // The shard is assigned once per thread via current_thread_shard()
+            // and must stay stable so all writes from one thread go to the
+            // same WAL shard. Overwriting it here causes threads to bounce
+            // across shards, fragmenting I/O.
             state.last_lsn = state.last_lsn.max(lsn);
         });
     }
@@ -1198,20 +1192,20 @@ impl Wal {
         if shard_idx == 0 {
             return &self.inner;
         }
-        &self.extra_shards[shard_idx - 1].inner
+        &self.extra_shards[shard_idx - 1]
     }
 
     fn for_each_inner(&self, mut f: impl FnMut(&Arc<WalInner>)) {
         f(&self.inner);
         for shard in &self.extra_shards {
-            f(&shard.inner);
+            f(shard);
         }
     }
 
     fn for_each_inner_with_index(&self, mut f: impl FnMut(usize, &WalInner)) {
         f(0, &self.inner);
         for (idx, shard) in self.extra_shards.iter().enumerate() {
-            f(idx + 1, &shard.inner);
+            f(idx + 1, shard);
         }
     }
 
@@ -1405,6 +1399,7 @@ impl Wal {
     {
         let lsn = self.claim_lsn();
         let inner = self.inner_for_lsn(lsn);
+        let _ = Self::start_threads(inner);
         let record = if let Some(prev_record) = prev_record {
             inner.stats.events.inc(WalEvent::PageImageOverwriteAttempts);
             if self.can_overwrite_buffered_page_image(prev_record, lsn, page_id)? {
@@ -1435,6 +1430,7 @@ impl Wal {
         fill_page: impl FnOnce(Lsn, &mut [u8; PAGE_SIZE]),
     ) -> io::Result<BufferedWalRecord> {
         let inner = self.inner_for_lsn(lsn);
+        let _ = Self::start_threads(inner);
         inner.stats.events.inc(WalEvent::PageImageRecords);
         inner
             .stats
@@ -1479,6 +1475,7 @@ impl Wal {
         fill_page: impl FnOnce(Lsn, &mut [u8; PAGE_SIZE]),
     ) -> io::Result<bool> {
         let inner = self.inner_for_lsn(lsn);
+        let _ = Self::start_threads(inner);
         inner.stats.events.inc(WalEvent::PageImageOverwriteAttempts);
         if !self.overwrite_buffered_page_image_with_lsn(record, lsn, page_id, fill_page)? {
             return Ok(false);
@@ -1544,6 +1541,7 @@ impl Wal {
 
         let chunks = chunk_count(payload.len());
         let inner = self.inner_for_lsn(lsn);
+        let _ = Self::start_threads(inner);
         let mut state = inner.state.lock();
         for chunk_idx in 0..chunks {
             let start = chunk_idx * LOGICAL_CHUNK_MAX_LEN;
@@ -1601,6 +1599,7 @@ impl Wal {
         }
 
         let inner = self.inner_for_lsn(lsn);
+        let _ = Self::start_threads(inner);
         let mut state = inner.state.lock();
         if Self::try_append_packed_logical_locked(&mut state, lsn, kind, payload, entry_len) {
             inner.appended_lsn.fetch_max(lsn, Ordering::Release);
@@ -1832,18 +1831,13 @@ impl Wal {
     pub fn crash(self) {
         let mut this = std::mem::ManuallyDrop::new(self);
         let this: &mut Wal = &mut this;
-        Self::stop_shard(&mut this.inner, &mut this.writer, &mut this.syncer, true);
+        Self::stop_shard(&mut this.inner, true);
         for shard in &mut this.extra_shards {
-            Self::stop_shard(&mut shard.inner, &mut shard.writer, &mut shard.syncer, true);
+            Self::stop_shard(shard, true);
         }
     }
 
-    fn stop_shard(
-        inner: &mut Arc<WalInner>,
-        writer: &mut Option<std::thread::JoinHandle<()>>,
-        syncer: &mut Option<std::thread::JoinHandle<()>>,
-        crash_shutdown: bool,
-    ) {
+    fn stop_shard(inner: &mut Arc<WalInner>, crash_shutdown: bool) {
         {
             let mut state = inner.state.lock();
             state.crash_shutdown = crash_shutdown;
@@ -1859,12 +1853,12 @@ impl Wal {
             }
         }
         inner.flush_requested.notify_all();
-        if let Some(writer) = writer.take() {
+        if let Some(writer) = inner.writer.lock().take() {
             let _ = writer.join();
         }
-        if let Some(syncer) = syncer.take() {
-            let _ = syncer.join();
-        }
+        // Drain / join any backend-specific threads (fdatasync syncer) and
+        // reap outstanding io_uring completions on clean shutdown.
+        inner.backend.drain_for_shutdown();
         let inner = Arc::get_mut(inner).expect("WAL inner still shared at close");
         let state = inner.state.get_mut();
         unsafe {
@@ -1895,7 +1889,7 @@ impl Wal {
     pub fn visit_metrics<V: MetricVisitor + ?Sized>(&self, visitor: &mut V) {
         self.inner.stats.visit_metrics(visitor);
         for shard in &self.extra_shards {
-            shard.inner.stats.visit_metrics(visitor);
+            shard.stats.visit_metrics(visitor);
         }
     }
 
@@ -1905,7 +1899,7 @@ impl Wal {
     pub fn advance_lsn_past(&self, min_lsn: Lsn) {
         self.inner.advance_lsn_past(min_lsn);
         for shard in &self.extra_shards {
-            shard.inner.advance_lsn_past(min_lsn);
+            shard.advance_lsn_past(min_lsn);
         }
     }
 
@@ -2099,7 +2093,7 @@ impl Wal {
         self.flush();
         self.inner.reset()?;
         for shard in &self.extra_shards {
-            shard.inner.reset()?;
+            shard.reset()?;
         }
         Ok(())
     }
@@ -2107,14 +2101,9 @@ impl Wal {
 
 impl Drop for Wal {
     fn drop(&mut self) {
-        Self::stop_shard(&mut self.inner, &mut self.writer, &mut self.syncer, false);
+        Self::stop_shard(&mut self.inner, false);
         for shard in &mut self.extra_shards {
-            Self::stop_shard(
-                &mut shard.inner,
-                &mut shard.writer,
-                &mut shard.syncer,
-                false,
-            );
+            Self::stop_shard(shard, false);
         }
     }
 }
@@ -2187,7 +2176,7 @@ impl WalInner {
     fn new(
         fd: std::os::fd::RawFd,
         direct_io: bool,
-        sync_backend: WalSyncBackend,
+        backend: Box<dyn WalIoBackend>,
         file_offset: u64,
         allocated_size: u64,
         max_lsn: Lsn,
@@ -2208,7 +2197,7 @@ impl WalInner {
                 crash_shutdown: false,
                 shutdown: false,
             }),
-            sync_backend,
+            backend,
             next_lsn,
             appended_lsn: AtomicU64::new(max_lsn),
             written_lsn: AtomicU64::new(max_lsn),
@@ -2219,16 +2208,18 @@ impl WalInner {
             flush_done: Condvar::new(),
             flush_requested: Condvar::new(),
             stats: WalStats::default(),
+            writer: Mutex::new(None),
+            threads_started: AtomicBool::new(false),
         }
     }
 
-    fn maybe_group_commit_delay(&self, leader_target_lsn: Lsn) {
-        let max_delay_us = self.sync_backend.group_commit_delay_max_us();
+    pub(crate) fn maybe_group_commit_delay(&self, leader_target_lsn: Lsn) {
+        let max_delay_us = self.backend.group_commit_delay_max_us();
         if max_delay_us == 0 {
             return;
         }
 
-        let target_records = self.sync_backend.group_commit_target_records();
+        let target_records = self.backend.group_commit_target_records();
 
         let initial_delay_us = {
             let state = self.state.lock();
@@ -2337,7 +2328,7 @@ impl WalInner {
         (max_lsn, valid_data_bytes)
     }
 
-    fn should_sync_relaxed(&self, written_lsn: Lsn, last_sync: Instant) -> bool {
+    pub(crate) fn should_sync_relaxed(&self, written_lsn: Lsn, last_sync: Instant) -> bool {
         let durable = self.durable_lsn.load(Ordering::Acquire);
         if written_lsn <= durable {
             return false;
@@ -2352,7 +2343,7 @@ impl WalInner {
             ))
     }
 
-    fn should_write_relaxed(&self, state: &WalState, last_write: Instant) -> bool {
+    pub(crate) fn should_write_relaxed(&self, state: &WalState, last_write: Instant) -> bool {
         if state.active.records == 0 {
             return false;
         }
@@ -2366,42 +2357,120 @@ impl WalInner {
             ))
     }
 
-    fn writer_loop(&self) {
+    /// The unified per-shard driver loop. One code path serves every backend:
+    /// it polls backend completions (fdatasync `Durable` from the syncer queue,
+    /// io_uring CQEs in Phase 3, nothing for `pwritev2_dsync`), then seals and
+    /// submits writes, then requests durability. The wait predicate is the
+    /// disjunction of the old writer and syncer predicates so a single loop
+    /// replaces both; durable advancement and condvar wake-ups happen only in
+    /// [`WalInner::handle_completion`], keeping the invariants uniform.
+    fn driver_loop(&self) {
         let mut last_write = Instant::now();
+        let mut last_sync = Instant::now();
         loop {
+            // Drain any ready completions first so a durable advance that
+            // landed while we were asleep is observed before re-checking the
+            // wait / shutdown predicates.
+            self.backend
+                .poll_completions(&mut |c| self.handle_completion(c));
+
             let mut state = self.state.lock();
+            let driver_handles_sync = !self.backend.needs_syncer_thread();
             loop {
                 let relaxed_mode =
                     self.commit_mode.load(Ordering::Acquire) == CommitMode::Relaxed as u64;
                 let written = self.written_lsn.load(Ordering::Acquire);
                 let requested_write = self.requested_write_lsn.load(Ordering::Acquire);
+
                 let pending_write = !state.pending_writes.is_empty()
                     || requested_write > written
                     || (relaxed_mode && self.should_write_relaxed(&state, last_write))
                     || (state.shutdown && state.active.used > 0);
+
                 if state.crash_shutdown {
                     return;
                 }
-                if state.shutdown
-                    && !pending_write
-                    && state.active.used == 0
-                    && state.writes_in_progress == 0
-                {
-                    return;
-                }
-                if pending_write {
-                    break;
-                }
-                if relaxed_mode && state.active.used > 0 {
-                    self.flush_requested.wait_for(
-                        &mut state,
-                        Duration::from_micros(env_u64_us(
-                            "PAGEBOX_WAL_RELAXED_WRITE_INTERVAL_US",
-                            WAL_RELAXED_WRITE_INTERVAL_US,
-                        )),
-                    );
+
+                if driver_handles_sync {
+                    // io_uring / pwritev2_dsync: the driver is also the syncer.
+                    let durable = self.durable_lsn.load(Ordering::Acquire);
+                    let requested_durable = self.requested_durable_lsn.load(Ordering::Acquire);
+                    if requested_durable > written {
+                        self.requested_write_lsn
+                            .fetch_max(requested_durable, Ordering::Release);
+                        self.flush_requested.notify_all();
+                    }
+                    let pending_sync = written > durable
+                        && (requested_durable > durable
+                            || (relaxed_mode && self.should_sync_relaxed(written, last_sync)));
+                    if state.shutdown
+                        && !pending_write
+                        && state.active.used == 0
+                        && state.writes_in_progress == 0
+                        && requested_durable <= durable
+                        && !pending_sync
+                    {
+                        return;
+                    }
+                    // Only break on pending_write. Breaking on pending_sync
+                    // with no pending_write would spin (nothing to submit,
+                    // submit_sync is a no-op); instead fall through to the
+                    // timed wait which re-polls CQEs periodically.
+                    if pending_write {
+                        break;
+                    }
+                    // No pending writes but in-flight io_uring work: drop
+                    // the state lock, poll for CQEs (blocking up to 1 CQE),
+                    // then re-acquire and re-check. This is critical: if all
+                    // appender threads are blocked on wait_for_durable, no
+                    // one will set pending_write, so the inner loop would
+                    // never break to reach the outer-loop poll. Polling here
+                    // ensures CQEs are reaped and durable_lsn advances.
+                    if self.backend.has_in_flight() {
+                        drop(state);
+                        self.backend
+                            .poll_completions(&mut |c| self.handle_completion(c));
+                        state = self.state.lock();
+                        continue;
+                    }
+                    // No in-flight work: wait for new appends or a sync
+                    // request.
+                    if relaxed_mode && state.active.used > 0 {
+                        self.flush_requested.wait_for(
+                            &mut state,
+                            Duration::from_micros(env_u64_us(
+                                "PAGEBOX_WAL_RELAXED_WRITE_INTERVAL_US",
+                                WAL_RELAXED_WRITE_INTERVAL_US,
+                            )),
+                        );
+                    } else {
+                        self.flush_requested.wait(&mut state);
+                    }
                 } else {
-                    self.flush_requested.wait(&mut state);
+                    // fdatasync: the driver only handles writes. The syncer
+                    // thread handles durability independently. This path is
+                    // the verbatim old writer_loop.
+                    if state.shutdown
+                        && !pending_write
+                        && state.active.used == 0
+                        && state.writes_in_progress == 0
+                    {
+                        return;
+                    }
+                    if pending_write {
+                        break;
+                    }
+                    if relaxed_mode && state.active.used > 0 {
+                        self.flush_requested.wait_for(
+                            &mut state,
+                            Duration::from_micros(env_u64_us(
+                                "PAGEBOX_WAL_RELAXED_WRITE_INTERVAL_US",
+                                WAL_RELAXED_WRITE_INTERVAL_US,
+                            )),
+                        );
+                    } else {
+                        self.flush_requested.wait(&mut state);
+                    }
                 }
             }
             let relaxed_mode =
@@ -2433,101 +2502,21 @@ impl WalInner {
                 drop(state);
                 self.write_sealed_buffer(write).expect("WAL write failed");
                 last_write = Instant::now();
-            }
-        }
-    }
-
-    fn syncer_loop(&self) {
-        let mut last_sync = Instant::now();
-        loop {
-            let mut state = self.state.lock();
-            loop {
-                let relaxed_mode =
-                    self.commit_mode.load(Ordering::Acquire) == CommitMode::Relaxed as u64;
-                let durable = self.durable_lsn.load(Ordering::Acquire);
-                let written = self.written_lsn.load(Ordering::Acquire);
+                // A write landed; request durability for whatever is now
+                // written so the syncer / io_uring fsync path makes it durable.
                 let requested_durable = self.requested_durable_lsn.load(Ordering::Acquire);
-                if requested_durable > written {
-                    self.requested_write_lsn
-                        .fetch_max(requested_durable, Ordering::Release);
-                    self.flush_requested.notify_all();
-                }
-
-                let pending_sync = written > durable
-                    && (requested_durable > durable
-                        || (relaxed_mode && self.should_sync_relaxed(written, last_sync)));
-                if state.crash_shutdown {
-                    return;
-                }
-                if state.shutdown && requested_durable <= durable && !pending_sync {
-                    return;
-                }
-                if pending_sync {
-                    break;
-                }
-                if relaxed_mode && written > durable {
-                    self.flush_requested.wait_for(
-                        &mut state,
-                        Duration::from_micros(env_u64_us(
-                            "PAGEBOX_WAL_RELAXED_SYNC_INTERVAL_US",
-                            WAL_RELAXED_SYNC_INTERVAL_US,
-                        )),
-                    );
-                } else {
-                    self.flush_requested.wait(&mut state);
+                let written_now = self.written_lsn.load(Ordering::Acquire);
+                if requested_durable > 0 || written_now > self.durable_lsn.load(Ordering::Acquire) {
+                    self.backend.submit_sync(requested_durable.max(written_now));
                 }
             }
-
-            let leader_target_lsn = self.requested_durable_lsn.load(Ordering::Acquire);
-            drop(state);
-            self.maybe_group_commit_delay(leader_target_lsn);
-
-            let state = self.state.lock();
-            let durable = self.durable_lsn.load(Ordering::Acquire);
-            let written = self.written_lsn.load(Ordering::Acquire);
-            let requested_durable = self.requested_durable_lsn.load(Ordering::Acquire);
-            if requested_durable > written {
-                self.requested_write_lsn
-                    .fetch_max(requested_durable, Ordering::Release);
-                self.flush_requested.notify_all();
-                continue;
+            // Update last_sync when a sync completion was observed this
+            // iteration (durable advanced) so the relaxed sync cadence resets.
+            let durable_now = self.durable_lsn.load(Ordering::Acquire);
+            if durable_now > 0 && durable_now >= self.requested_durable_lsn.load(Ordering::Acquire)
+            {
+                last_sync = Instant::now();
             }
-            let relaxed_mode =
-                self.commit_mode.load(Ordering::Acquire) == CommitMode::Relaxed as u64;
-            let need_sync = written > durable
-                && (requested_durable > durable
-                    || (relaxed_mode && self.should_sync_relaxed(written, last_sync)));
-            if !need_sync {
-                continue;
-            }
-            // Writes can continue while fdatasync is in flight. Only the LSNs
-            // written before this sync starts are reported durable here.
-            let synced_lsn = written;
-            let fd = state.fd;
-            drop(state);
-
-            self.sync_fd(fd);
-            last_sync = Instant::now();
-            self.advance_durable_lsn(synced_lsn);
-            self.flush_done.notify_all();
-            self.flush_requested.notify_all();
-        }
-    }
-
-    fn sync_fd(&self, fd: std::os::fd::RawFd) {
-        self.sync_fd_blocking(fd);
-    }
-
-    fn sync_fd_blocking(&self, fd: std::os::fd::RawFd) {
-        self.stats.events.inc(WalEvent::SyncCall);
-        let sync_start = Instant::now();
-        let ret = sync_wal_fd(fd);
-        self.stats
-            .latencies
-            .get(WalLatency::Sync)
-            .record(saturating_duration_nanos(sync_start.elapsed()));
-        if let Err(err) = ret {
-            panic!("WAL sync failed — durability compromised: {err}");
         }
     }
 
@@ -2542,14 +2531,61 @@ impl WalInner {
             .fetch_max(min_lsn, Ordering::Relaxed);
     }
 
-    fn advance_durable_lsn(&self, lsn: Lsn) {
+    pub(crate) fn advance_durable_lsn(&self, lsn: Lsn) {
         let previous = self.durable_lsn.fetch_max(lsn, Ordering::Release);
         if lsn > previous {
             self.stats.events.inc(WalEvent::DurableAdvance);
         }
     }
 
-    fn next_buffer_epoch_locked(state: &mut WalState) -> u64 {
+    /// Apply one IO completion: advance the relevant LSN, reclaim the buffer
+    /// (for `Written`), record telemetry, and wake any flush waiters. This is
+    /// the single place the driver loop consumes backend completions, so the
+    /// spare-buffer / `writes_in_progress` / condvar-notify invariants are
+    /// preserved identically across backends.
+    pub(crate) fn handle_completion(&self, completion: crate::backend::Completion) {
+        use crate::backend::CompletionKind;
+        match completion.kind {
+            CompletionKind::Written {
+                buffer,
+                max_lsn,
+                durable_lsn,
+                write_latency_ns,
+            } => {
+                self.written_lsn.fetch_max(max_lsn, Ordering::Release);
+                if let Some(durable) = durable_lsn {
+                    self.advance_durable_lsn(durable);
+                }
+                self.stats
+                    .latencies
+                    .get(WalLatency::Write)
+                    .record(write_latency_ns);
+                let mut state = self.state.lock();
+                let epoch = Self::next_buffer_epoch_locked(&mut state);
+                let mut buffer = buffer;
+                buffer.reset(epoch);
+                state.spare_buffers.push(buffer);
+                state.writes_in_progress -= 1;
+                self.flush_done.notify_all();
+                self.flush_requested.notify_all();
+            }
+            CompletionKind::Durable {
+                lsn,
+                sync_latency_ns,
+            } => {
+                self.stats.events.inc(WalEvent::SyncCall);
+                self.stats
+                    .latencies
+                    .get(WalLatency::Sync)
+                    .record(sync_latency_ns);
+                self.advance_durable_lsn(lsn);
+                self.flush_done.notify_all();
+                self.flush_requested.notify_all();
+            }
+        }
+    }
+
+    pub(crate) fn next_buffer_epoch_locked(state: &mut WalState) -> u64 {
         let epoch = state.next_buffer_epoch;
         state.next_buffer_epoch = state.next_buffer_epoch.wrapping_add(1).max(1);
         epoch
@@ -2583,7 +2619,7 @@ impl WalInner {
             let new_size = round_up_u64(write_end, SEGMENT_SIZE)
                 + SEGMENT_SIZE * (WAL_PREALLOCATE_SEGMENTS - 1);
             extend_file(state.fd, new_size)?;
-            if self.sync_backend == WalSyncBackend::Pwritev2Dsync {
+            if self.backend.pre_extend_needs_fsync() {
                 fdatasync_file(state.fd)?;
             }
             state.allocated_size = new_size;
@@ -2608,41 +2644,48 @@ impl WalInner {
         Some(write)
     }
 
-    fn write_sealed_buffer(&self, mut write: PendingWalWrite) -> io::Result<()> {
-        finalize_buffer_records(&mut write.buffer, write.len);
+    fn write_sealed_buffer(&self, write: PendingWalWrite) -> io::Result<()> {
+        use crate::backend::SubmitResult;
 
-        self.stats.events.inc(WalEvent::WriteCall);
-        self.stats.events.add(
-            WalEvent::WriteBytes,
-            write.len.min(isize::MAX as usize) as isize,
-        );
-        let write_start = Instant::now();
-        let data = &write.buffer.buffer.as_slice()[..write.len];
-        match self.sync_backend {
-            WalSyncBackend::Fdatasync => pwrite_all(write.fd, data, write.file_offset as i64)?,
-            WalSyncBackend::Pwritev2Dsync => {
-                pwritev2_dsync_all(write.fd, data, write.file_offset as i64)?;
+        // Telemetry for the write attempt is recorded by the backend inside
+        // `submit_write` (WriteCall / WriteBytes), mirroring the pre-write
+        // counting the old direct path performed. The per-write latency and
+        // buffer reclamation happen in `handle_completion`, driven off the
+        // completion the backend returns (inline for sync backends, reaped
+        // from the ring for io_uring).
+        let completion = match self.backend.submit_write(write, &self.stats)? {
+            SubmitResult::WrittenPendingSync {
+                buffer,
+                max_lsn,
+                write_latency_ns,
+            } => crate::backend::Completion {
+                kind: crate::backend::CompletionKind::Written {
+                    buffer,
+                    max_lsn,
+                    durable_lsn: None,
+                    write_latency_ns,
+                },
+            },
+            SubmitResult::WrittenAndDurable {
+                buffer,
+                max_lsn,
+                write_latency_ns,
+            } => crate::backend::Completion {
+                kind: crate::backend::CompletionKind::Written {
+                    buffer,
+                    max_lsn,
+                    durable_lsn: Some(max_lsn),
+                    write_latency_ns,
+                },
+            },
+            SubmitResult::Submitted => {
+                // io_uring: buffer ownership transferred to the backend; the
+                // Written completion (and any linked fsync Durable
+                // completion) arrives via `poll_completions`.
+                return Ok(());
             }
-        }
-        self.stats
-            .latencies
-            .get(WalLatency::Write)
-            .record(saturating_duration_nanos(write_start.elapsed()));
-
-        self.written_lsn.fetch_max(write.max_lsn, Ordering::Release);
-        if self.sync_backend == WalSyncBackend::Pwritev2Dsync {
-            self.advance_durable_lsn(write.max_lsn);
-        }
-
-        let mut state = self.state.lock();
-        write
-            .buffer
-            .reset(Self::next_buffer_epoch_locked(&mut state));
-        state.spare_buffers.push(write.buffer);
-        state.writes_in_progress -= 1;
-        self.flush_done.notify_all();
-        self.flush_requested.notify_all();
-
+        };
+        self.handle_completion(completion);
         Ok(())
     }
 
@@ -2932,7 +2975,7 @@ impl WalInner {
     }
 }
 
-fn finalize_buffer_records(buffer: &mut WalBuffer, len: usize) {
+pub(crate) fn finalize_buffer_records(buffer: &mut WalBuffer, len: usize) {
     let mut offset = 0usize;
     while offset < len {
         let meta_end = offset + WAL_RECORD_SIZE;
