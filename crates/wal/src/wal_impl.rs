@@ -966,13 +966,12 @@ impl Wal {
     ) -> io::Result<Self> {
         let shard_count = shard_count.clamp(1, 256);
 
-        // io_uring: force a single shard. The io_uring driver loop blocks
-        // in `io_uring_enter(GETEVENTS)` when `has_in_flight()` is true. With
-        // N shards, all N driver threads block in the kernel simultaneously,
-        // causing a thundering herd when a CQE arrives. Single-shard keeps
-        // one driver that batches appends via group commit, avoiding
-        // multi-driver contention. The shared ring still enables a future
-        // multi-shard design with a dedicated reaper thread.
+        // io_uring: force a single shard. Multi-shard generates N independent
+        // write+fsync chains (one per shard), causing N× more fsyncs. With
+        // 1 shard, group commit batches all threads' appends into one
+        // write+fsync per cycle — the optimal pattern for io_uring's
+        // linked SQE model. The reaper thread handles CQE reaping so the
+        // driver never blocks in io_uring_enter.
         let shard_count = if sync_backend.is_io_uring() {
             1
         } else {
@@ -2467,15 +2466,13 @@ impl WalInner {
                     if pending_write {
                         break;
                     }
-                    if self.backend.has_in_flight() {
-                        drop(state);
-                        self.backend
-                            .poll_completions_blocking(&mut |c| self.handle_completion(c));
-                        state = self.state.lock();
-                        continue;
-                    }
-                    // No in-flight work: wait for new appends or a sync
-                    // request.
+                    // io_uring: the dedicated reaper thread handles blocking
+                    // in io_uring_enter and dispatching CQEs. The driver
+                    // just waits on the condvar — the reaper wakes it via
+                    // handle_completion → flush_requested.notify_all() when a
+                    // CQE arrives. Use a 10ms timeout as a safety net in
+                    // case the reaper is delayed.
+                    // pwritev2_dsync: no async completions, same wait.
                     if relaxed_mode && state.active.used > 0 {
                         self.flush_requested.wait_for(
                             &mut state,
@@ -2485,7 +2482,11 @@ impl WalInner {
                             )),
                         );
                     } else {
-                        self.flush_requested.wait(&mut state);
+                        // io_uring: timed wait (10ms safety net) — the
+                        // reaper wakes us via handle_completion → notify.
+                        // pwritev2_dsync / relaxed idle: same wait.
+                        self.flush_requested
+                            .wait_for(&mut state, Duration::from_millis(10));
                     }
                 } else {
                     // fdatasync: the driver only handles writes. The syncer

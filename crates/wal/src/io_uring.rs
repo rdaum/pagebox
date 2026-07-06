@@ -58,6 +58,10 @@ const IOSQE_IO_LINK: u8 = 1 << 2;
 
 const IORING_FSYNC_DATASYNC: u32 = 1 << 0;
 
+/// Sentinel `user_data` for NOP SQEs used to wake the reaper thread from
+/// `io_uring_enter(GETEVENTS)` during shutdown.
+const NOP_USER_DATA: u64 = u64::MAX;
+
 /// `struct io_uring_sqe` (64 bytes). Matches the kernel layout exactly.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -453,7 +457,29 @@ impl IoUring {
         Ok(true)
     }
 
-    /// Flush pending SQEs to the kernel and optionally wait for `min_complete`
+    /// Submit a `NOP` SQE. Generates a CQE immediately (no I/O), used to
+    /// wake the reaper thread from `io_uring_enter(GETEVENTS)` during
+    /// shutdown.
+    pub(crate) fn submit_nop(&mut self, user_data: u64) -> io::Result<bool> {
+        let tail = unsafe { (*self.sq_tail).load(Ordering::Relaxed) };
+        let head = unsafe { (*self.sq_head).load(Ordering::Acquire) };
+        if tail.wrapping_sub(head) >= self.sq_entries {
+            return Ok(false);
+        }
+        let idx = (tail & self.sq_mask) as usize;
+        let sqe = unsafe { &mut *self.sqes_ptr.add(idx) };
+        *sqe = IoUringSqe::zero();
+        sqe.opcode = IORING_OP_NOP;
+        sqe.user_data = user_data;
+        unsafe {
+            (*self.sq_array.add(idx)).store(idx as u32, Ordering::Release);
+        }
+        unsafe {
+            (*self.sq_tail).store(tail.wrapping_add(1), Ordering::Release);
+        }
+        self.pending_submissions = self.pending_submissions.wrapping_add(1);
+        Ok(true)
+    }
     /// completions. Returns the number of CQEs that became ready (best-effort;
     /// the caller reaps via [`IoUring::reap_one`]).
     pub(crate) fn flush_and_enter(&mut self, min_complete: u32) -> io::Result<()> {
@@ -547,6 +573,7 @@ use crate::format::{
 };
 use crate::wal_impl::{WalEvent, WalInner, WalStats, finalize_buffer_records};
 use pagebox_frame_kernel::Lsn;
+use pagebox_threading as threading;
 
 /// Shared ring state: one io_uring ring + slab + fd→WalInner registry.
 ///
@@ -569,6 +596,13 @@ pub(crate) struct IoUringShared {
     /// Maps each shard's WAL file fd → `Weak<WalInner>`. Used to dispatch
     /// CQE completions to the correct shard. Registered in `start`.
     fd_to_inner: Mutex<HashMap<RawFd, Weak<WalInner>>>,
+    /// The dedicated reaper thread handle. One reaper serves all shards,
+    /// blocking in `io_uring_enter(GETEVENTS)` and dispatching CQEs to the
+    /// correct `WalInner`. This avoids N driver threads each blocking in
+    /// `io_uring_enter` (thundering herd).
+    reaper: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Shutdown signal for the reaper thread.
+    shutdown: std::sync::atomic::AtomicBool,
 }
 
 impl IoUringShared {
@@ -581,6 +615,8 @@ impl IoUringShared {
             in_flight: Mutex::new(Vec::with_capacity(64)),
             free_slots: Mutex::new(Vec::new()),
             fd_to_inner: Mutex::new(HashMap::new()),
+            reaper: Mutex::new(None),
+            shutdown: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -610,6 +646,58 @@ impl IoUringShared {
 
     fn lookup_inner(&self, fd: RawFd) -> Option<Arc<WalInner>> {
         self.fd_to_inner.lock().get(&fd).and_then(|w| w.upgrade())
+    }
+
+    /// The dedicated reaper thread. Blocks in `io_uring_enter(GETEVENTS)` and
+    /// dispatches CQEs to the correct `WalInner` via `fd_to_inner`. One reaper
+    /// serves all shards, avoiding the thundering herd of N driver threads
+    /// each blocking in `io_uring_enter`.
+    fn run_reaper(self: Arc<Self>) {
+        use std::sync::atomic::Ordering;
+        loop {
+            if self.shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            // Take pending submissions (flushes SQEs to kernel) and block for
+            // ≥1 CQE. The ring mutex is released during the blocking syscall
+            // so submit_write on any driver thread can enqueue SQEs
+            // concurrently.
+            let to_submit = {
+                let mut ring = self.ring.lock();
+                ring.take_pending_submissions()
+            };
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_io_uring_enter,
+                    self.ring_fd,
+                    to_submit,
+                    1u32,
+                    IORING_ENTER_GETEVENTS,
+                    std::ptr::null::<libc::sigset_t>(),
+                    0usize,
+                )
+            };
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if self.shutdown.load(Ordering::Acquire) {
+                    return;
+                }
+                eprintln!("WAL io_uring reaper error: {err}");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            // Reap and dispatch all ready CQEs.
+            let mut ring = self.ring.lock();
+            ring.drain_cqes(&mut |user_data, res| {
+                if user_data == NOP_USER_DATA {
+                    return;
+                }
+                self.dispatch_cqe(user_data, res);
+            });
+        }
     }
 
     /// Dispatch a CQE to the correct `WalInner`, looked up by fd.
@@ -790,10 +878,38 @@ impl WalIoBackend for IoUringBackend {
             .fd_to_inner
             .lock()
             .insert(fd, Arc::downgrade(inner));
+        // Spawn the reaper thread if not already running. Only the first
+        // shard to call start() spawns it; subsequent shards just register
+        // their fd.
+        let mut reaper_guard = self.shared.reaper.lock();
+        if reaper_guard.is_none() {
+            let shared = Arc::clone(&self.shared);
+            let handle = threading::spawn_efficient("wal-iouring-reaper", move || {
+                shared.run_reaper();
+            })?;
+            *reaper_guard = Some(handle);
+        }
+        drop(reaper_guard);
         Ok(())
     }
 
     fn drain_for_shutdown(&self) {
+        // Signal the reaper to shut down, then wake it with a NOP SQE
+        // (it's blocked in io_uring_enter(GETEVENTS) and needs a CQE to
+        // return).
+        self.shared
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        {
+            let mut ring = self.shared.ring.lock();
+            let _ = ring.submit_nop(NOP_USER_DATA);
+            let _ = ring.flush_and_enter(0);
+        }
+        // Join the reaper. Only one shard will successfully take the handle.
+        if let Some(reaper) = self.shared.reaper.lock().take() {
+            let _ = reaper.join();
+        }
+        // Reap any remaining CQEs.
         let mut ring = self.shared.ring.lock();
         let _ = ring.flush_and_enter(0);
         ring.drain_cqes(&mut |user_data, _res| {
