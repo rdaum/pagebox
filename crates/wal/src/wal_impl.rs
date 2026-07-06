@@ -964,18 +964,35 @@ impl Wal {
         sync_backend: WalSyncBackend,
         shard_count: usize,
     ) -> io::Result<Self> {
-        // io_uring uses linked write+fsync SQEs, so each ring generates one
-        // fsync per group-commit cycle. With N rings, N concurrent fsyncs
-        // compete for the disk → severe tail latency (measured: 73ms p99.9
-        // at 16t with 2+ shards vs 484us with 1 shard). Forcing a single
-        // shard is architecturally correct here: one ring, one driver
-        // thread, one fsync in flight at a time. Group commit batches
-        // appends from all threads into that single write+fsync chain.
+        let shard_count = shard_count.clamp(1, 256);
+
+        // io_uring: force a single shard. The io_uring driver loop blocks
+        // in `io_uring_enter(GETEVENTS)` when `has_in_flight()` is true. With
+        // N shards, all N driver threads block in the kernel simultaneously,
+        // causing a thundering herd when a CQE arrives. Single-shard keeps
+        // one driver that batches appends via group commit, avoiding
+        // multi-driver contention. The shared ring still enables a future
+        // multi-shard design with a dedicated reaper thread.
         let shard_count = if sync_backend.is_io_uring() {
             1
         } else {
-            shard_count.clamp(1, 256)
+            shard_count
         };
+
+        // For io_uring, create one shared ring for all shards. Multiple
+        // shards with independent rings generate N concurrent fsyncs (one
+        // per ring), causing severe tail latency from disk contention. A
+        // shared ring ensures only one fsync is in flight at a time, while
+        // still allowing parallel write buffering across shards.
+        #[cfg(target_os = "linux")]
+        let shared_ring: Option<Arc<crate::io_uring::IoUringShared>> = if sync_backend.is_io_uring()
+        {
+            Some(Arc::new(crate::io_uring::IoUringShared::new()?))
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let shared_ring: Option<Arc<crate::io_uring::IoUringShared>> = None;
 
         let mut opened = Vec::with_capacity(shard_count);
         for shard_idx in 0..shard_count {
@@ -987,7 +1004,8 @@ impl Wal {
         let next_lsn = Arc::new(AtomicU64::new(max_lsn + 1));
         let mut inners = Vec::with_capacity(shard_count);
         for file in opened {
-            let backend = crate::backend::make_backend(sync_backend, file.fd)?;
+            let backend =
+                crate::backend::make_backend(sync_backend, file.fd, shared_ring.as_ref())?;
             let inner = Arc::new(WalInner::new(
                 file.fd,
                 file.direct_io,

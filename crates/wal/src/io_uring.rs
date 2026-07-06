@@ -26,9 +26,11 @@
 
 #![cfg(target_os = "linux")]
 
+use std::collections::HashMap;
 use std::io;
 use std::os::fd::RawFd;
 use std::sync::Arc;
+use std::sync::Weak;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use parking_lot::Mutex;
@@ -536,7 +538,7 @@ impl Drop for IoUring {
 }
 
 // ---------------------------------------------------------------------------
-// IoUringBackend (WalIoBackend impl)
+// IoUringShared — ring state shared across all WAL shards
 // ---------------------------------------------------------------------------
 
 use crate::backend::{Completion, CompletionKind, SubmitResult, WalIoBackend};
@@ -546,52 +548,39 @@ use crate::format::{
 use crate::wal_impl::{WalEvent, WalInner, WalStats, finalize_buffer_records};
 use pagebox_frame_kernel::Lsn;
 
-/// io_uring backend. One ring per shard. Writes are submitted as `WRITEV`
-/// SQEs with a linked `FSYNC` SQE so durability arrives as a separate CQE.
-/// In-flight `WalBuffer`s live in a slab keyed by SQE `user_data` until their
-/// write CQE reaps; the slab reuses slots once reaped.
-pub(crate) struct IoUringBackend {
-    #[allow(dead_code)]
-    fd: RawFd,
-    /// The io_uring ring fd, stored separately from the `Mutex<IoUring>` so
-    /// [`poll_completions_blocking`] can call `io_uring_enter` without
-    /// holding the ring mutex. This allows `wait_for_durable` to reap CQEs
-    /// concurrently while the driver is blocked in the kernel.
+/// Shared ring state: one io_uring ring + slab + fd→WalInner registry.
+///
+/// All shards in a multi-shard WAL share one `IoUringShared` so that only one
+/// fsync is in flight at a time (no disk I/O contention). Each shard's
+/// `IoUringBackend` holds an `Arc<IoUringShared>` and submits SQEs to the
+/// shared ring. CQE completions are dispatched to the correct `WalInner` via
+/// the `fd_to_inner` registry (keyed by `RawFd`, registered in `start`).
+pub(crate) struct IoUringShared {
+    /// The io_uring ring fd, stored separately from `ring` so
+    /// `poll_completions_blocking` can call `io_uring_enter` without holding
+    /// the ring mutex.
     ring_fd: RawFd,
-    /// The ring is guarded by a mutex because the driver loop calls
-    /// `submit_write` / `submit_sync` / `poll_completions` sequentially but
-    /// `drain_for_shutdown` runs on the shutdown path; a single producer
-    /// (the driver) is the steady-state case.
     ring: Mutex<IoUring>,
     /// Slab of in-flight writes keyed by slot index (== SQE user_data low
-    /// bits). `None` slots are free. Guarded by its own mutex so reaping
-    /// (which releases a slot) need not take the ring mutex.
+    /// bits). Shared across all shards so any driver thread can reap CQEs
+    /// for any shard.
     in_flight: Mutex<Vec<Option<InFlightWrite>>>,
-    /// Free slot indices for reuse.
     free_slots: Mutex<Vec<u32>>,
+    /// Maps each shard's WAL file fd → `Weak<WalInner>`. Used to dispatch
+    /// CQE completions to the correct shard. Registered in `start`.
+    fd_to_inner: Mutex<HashMap<RawFd, Weak<WalInner>>>,
 }
 
-struct InFlightWrite {
-    buffer: WalBuffer,
-    max_lsn: Lsn,
-    write_start: std::time::Instant,
-}
-
-impl IoUringBackend {
-    pub(crate) fn new(fd: RawFd) -> io::Result<Self> {
-        // 1024 SQ entries: generous enough that the SQ ring never fills
-        // under normal load (the driver reaps CQEs every iteration). Each
-        // write+fsync chain uses 2 SQEs; 512 in-flight chains would be
-        // needed to fill the ring, which is far beyond the WAL's
-        // single-buffer-at-a-time drain model.
+impl IoUringShared {
+    pub(crate) fn new() -> io::Result<Self> {
         let ring = IoUring::new(1024)?;
         let ring_fd = ring.ring_fd;
         Ok(Self {
-            fd,
             ring_fd,
             ring: Mutex::new(ring),
             in_flight: Mutex::new(Vec::with_capacity(64)),
             free_slots: Mutex::new(Vec::new()),
+            fd_to_inner: Mutex::new(HashMap::new()),
         })
     }
 
@@ -618,6 +607,75 @@ impl IoUringBackend {
             None
         }
     }
+
+    fn lookup_inner(&self, fd: RawFd) -> Option<Arc<WalInner>> {
+        self.fd_to_inner.lock().get(&fd).and_then(|w| w.upgrade())
+    }
+
+    /// Dispatch a CQE to the correct `WalInner`, looked up by fd.
+    fn dispatch_cqe(&self, user_data: u64, res: i32) {
+        if res < 0 {
+            let err = io::Error::from_raw_os_error(-res);
+            panic!("WAL io_uring op failed — durability compromised: {err}");
+        }
+        if is_fsync(user_data)
+            && let Some(write) = self.take_slot(slot_of(user_data))
+        {
+            let write_latency_ns =
+                write.write_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            let completion = Completion {
+                kind: CompletionKind::Written {
+                    buffer: write.buffer,
+                    max_lsn: write.max_lsn,
+                    durable_lsn: Some(write.max_lsn),
+                    write_latency_ns,
+                },
+            };
+            match self.lookup_inner(write.fd) {
+                Some(inner) => inner.handle_completion(completion),
+                None => {
+                    // The WalInner has been dropped (shutdown). The buffer
+                    // is dropped with the completion — no leak.
+                }
+            }
+        }
+    }
+}
+
+struct InFlightWrite {
+    buffer: WalBuffer,
+    max_lsn: Lsn,
+    write_start: std::time::Instant,
+    /// The WAL file fd this write targets. Used to dispatch the CQE
+    /// completion to the correct `WalInner` via `fd_to_inner`.
+    fd: RawFd,
+}
+
+/// io_uring backend. One `IoUringShared` is shared across all WAL shards so
+/// only one fsync is in flight at a time. Writes are submitted as `WRITE` SQEs
+/// with a linked `FSYNC` SQE so durability arrives as a separate CQE. CQE
+/// completions are dispatched to the correct `WalInner` via the `fd_to_inner`
+/// registry.
+pub(crate) struct IoUringBackend {
+    shared: Arc<IoUringShared>,
+    #[allow(dead_code)]
+    fd: RawFd,
+}
+
+impl IoUringBackend {
+    /// Create a standalone backend with its own ring (single-shard or test
+    /// path).
+    pub(crate) fn new(fd: RawFd) -> io::Result<Self> {
+        Ok(Self {
+            shared: Arc::new(IoUringShared::new()?),
+            fd,
+        })
+    }
+
+    /// Create a backend from a pre-existing shared ring (multi-shard path).
+    pub(crate) fn from_shared(shared: Arc<IoUringShared>, fd: RawFd) -> Self {
+        Self { shared, fd }
+    }
 }
 
 impl WalIoBackend for IoUringBackend {
@@ -637,29 +695,22 @@ impl WalIoBackend for IoUringBackend {
         let fd = write.fd;
         let offset = write.file_offset;
         let len = write.len;
-        // The SQE reads from the buffer asynchronously; ownership of the
-        // `WalBuffer` (and its `AlignedBuf`) transfers to the slab until the
-        // write CQE reaps. Extract the raw iovec from the buffer before moving
-        // it into the slab.
         let buffer = write.buffer;
         let buf_ptr = buffer.buffer.as_slice().as_ptr();
         let len_u32 = len as u32;
-        let slot = self.alloc_slot(InFlightWrite {
+        let slot = self.shared.alloc_slot(InFlightWrite {
             buffer,
             max_lsn,
             write_start,
+            fd,
         });
         let user_data = pack_write(slot);
-        let mut ring = self.ring.lock();
-        // Link the write SQE so a following fsync SQE only fires after it.
+        let mut ring = self.shared.ring.lock();
         let enqueued = ring.submit_write(fd, buf_ptr, len_u32, offset, user_data, true)?;
         if !enqueued {
             ring.flush_and_enter(0)?;
             ring.submit_write(fd, buf_ptr, len_u32, offset, user_data, true)?;
         }
-        // Submit a linked fsync SQE so durability arrives as a CQE. If the
-        // SQ ring is full, flush and retry — the FSYNC must be enqueued or
-        // the slab slot would leak (the FSYNC CQE is what reclaims it).
         let fsync_user_data = pack_fsync(slot);
         let fsync_enqueued = ring.submit_fsync(fd, fsync_user_data, true)?;
         if !fsync_enqueued {
@@ -670,63 +721,26 @@ impl WalIoBackend for IoUringBackend {
     }
 
     fn submit_sync(&self, barrier_lsn: Lsn) {
-        // Durability is driven by the linked fsync SQE submitted with each
-        // write; the barrier LSN is tracked via `requested_durable_lsn` which
-        // the driver checks against `durable_lsn`. Flushing the ring is the
-        // driver's responsibility (it calls poll_completions, which flushes).
         let _ = barrier_lsn;
     }
 
-    fn poll_completions(&self, sink: &mut dyn FnMut(Completion)) {
-        let mut ring = self.ring.lock();
-        // Non-blocking: flush pending SQEs (if any) and reap whatever CQEs
-        // are ready. No io_uring_enter call when there are no pending
-        // submissions — the CQ ring is plain memory, readable without a
-        // syscall.
+    fn poll_completions(&self, _sink: &mut dyn FnMut(Completion)) {
+        let mut ring = self.shared.ring.lock();
         if ring.pending_submissions() > 0 {
             let _ = ring.flush_and_enter(0);
         }
-        ring.drain_cqes(&mut |user_data, res| {
-            if res < 0 {
-                let err = io::Error::from_raw_os_error(-res);
-                panic!("WAL io_uring op failed — durability compromised: {err}");
-            }
-            if is_fsync(user_data)
-                && let Some(write) = self.take_slot(slot_of(user_data))
-            {
-                let write_latency_ns =
-                    write.write_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-                sink(Completion {
-                    kind: CompletionKind::Written {
-                        buffer: write.buffer,
-                        max_lsn: write.max_lsn,
-                        durable_lsn: Some(write.max_lsn),
-                        write_latency_ns,
-                    },
-                });
-            }
-        });
+        ring.drain_cqes(&mut |user_data, res| self.shared.dispatch_cqe(user_data, res));
     }
 
-    fn poll_completions_blocking(&self, sink: &mut dyn FnMut(Completion)) {
-        // Flush pending SQEs (if any) and block in io_uring_enter until ≥1
-        // CQE is ready. Critical: the ring mutex is released during the
-        // blocking syscall so wait_for_durable on another thread can reap
-        // CQEs concurrently. Without this, the driver would hold the mutex
-        // for the entire I/O latency (10–1000 µs), serializing all
-        // wait_for_durable callers.
+    fn poll_completions_blocking(&self, _sink: &mut dyn FnMut(Completion)) {
         let to_submit = {
-            let mut ring = self.ring.lock();
+            let mut ring = self.shared.ring.lock();
             ring.take_pending_submissions()
         };
-        // io_uring_enter(fd, to_submit, 1, GETEVENTS): flushes pending SQEs
-        // and blocks until at least 1 CQE arrives. to_submit=0 with
-        // min_complete=1 is valid — it just waits for a CQE without
-        // submitting anything (SQEs were already flushed by submit_write).
         let ret = unsafe {
             libc::syscall(
                 libc::SYS_io_uring_enter,
-                self.ring_fd,
+                self.shared.ring_fd,
                 to_submit,
                 1u32,
                 IORING_ENTER_GETEVENTS,
@@ -740,32 +754,12 @@ impl WalIoBackend for IoUringBackend {
                 eprintln!("WAL io_uring_enter warning: {err}");
             }
         }
-        // Reap all available CQEs under the ring lock.
-        let mut ring = self.ring.lock();
-        ring.drain_cqes(&mut |user_data, res| {
-            if res < 0 {
-                let err = io::Error::from_raw_os_error(-res);
-                panic!("WAL io_uring op failed — durability compromised: {err}");
-            }
-            if is_fsync(user_data)
-                && let Some(write) = self.take_slot(slot_of(user_data))
-            {
-                let write_latency_ns =
-                    write.write_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-                sink(Completion {
-                    kind: CompletionKind::Written {
-                        buffer: write.buffer,
-                        max_lsn: write.max_lsn,
-                        durable_lsn: Some(write.max_lsn),
-                        write_latency_ns,
-                    },
-                });
-            }
-        });
+        let mut ring = self.shared.ring.lock();
+        ring.drain_cqes(&mut |user_data, res| self.shared.dispatch_cqe(user_data, res));
     }
 
     fn has_in_flight(&self) -> bool {
-        self.in_flight.lock().iter().any(|s| s.is_some())
+        self.shared.in_flight.lock().iter().any(|s| s.is_some())
     }
 
     fn needs_syncer_thread(&self) -> bool {
@@ -790,21 +784,25 @@ impl WalIoBackend for IoUringBackend {
         )
     }
 
-    fn start(&self, _inner: &Arc<WalInner>) -> io::Result<()> {
+    fn start(&self, inner: &Arc<WalInner>) -> io::Result<()> {
+        let fd = inner.state.lock().fd;
+        self.shared
+            .fd_to_inner
+            .lock()
+            .insert(fd, Arc::downgrade(inner));
         Ok(())
     }
 
     fn drain_for_shutdown(&self) {
-        // Reap any outstanding CQEs so in-flight buffers are reclaimed. On
-        // crash shutdown the driver returns without polling further, so
-        // outstanding buffers leak with the (dropped) slab — matching the
-        // crash contract that pending appends are not flushed.
-        let mut ring = self.ring.lock();
+        let mut ring = self.shared.ring.lock();
         let _ = ring.flush_and_enter(0);
-        ring.drain_cqes(&mut |_user_data, _res| {
-            // Discard completions during shutdown drain; the slab slots will
-            // be dropped with the backend.
+        ring.drain_cqes(&mut |user_data, _res| {
+            if is_fsync(user_data) {
+                let _ = self.shared.take_slot(slot_of(user_data));
+            }
         });
+        drop(ring);
+        self.shared.fd_to_inner.lock().remove(&self.fd);
     }
 }
 

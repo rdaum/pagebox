@@ -155,19 +155,25 @@ pub(crate) trait WalIoBackend: Send + Sync {
 }
 
 /// Construct the backend for a given selector. The file descriptor is passed
-/// so a future io_uring backend can register it up front.
+/// so a future io_uring backend can register it up front. For io_uring, the
+/// `shared_ring` parameter allows multiple shards to share one ring; when
+/// `None`, a standalone ring is created.
 pub(crate) fn make_backend(
     selector: WalSyncBackend,
     fd: std::os::fd::RawFd,
+    #[allow(unused_variables)] shared_ring: Option<&std::sync::Arc<crate::io_uring::IoUringShared>>,
 ) -> io::Result<Box<dyn WalIoBackend>> {
     match selector {
         WalSyncBackend::Fdatasync => Ok(Box::new(FdatasyncBackend::new(fd))),
         WalSyncBackend::Pwritev2Dsync => Ok(Box::new(Pwritev2DsyncBackend)),
         #[cfg(target_os = "linux")]
         WalSyncBackend::IoUring => {
-            let backend = crate::io_uring::IoUringBackend::new(fd).map_err(|e| {
-                io::Error::new(e.kind(), format!("io_uring backend unavailable: {e}"))
-            })?;
+            let backend = match shared_ring {
+                Some(ring) => crate::io_uring::IoUringBackend::from_shared(ring.clone(), fd),
+                None => crate::io_uring::IoUringBackend::new(fd).map_err(|e| {
+                    io::Error::new(e.kind(), format!("io_uring backend unavailable: {e}"))
+                })?,
+            };
             Ok(Box::new(backend))
         }
         #[cfg(not(target_os = "linux"))]
