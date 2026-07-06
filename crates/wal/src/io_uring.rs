@@ -508,6 +508,15 @@ impl IoUring {
     pub(crate) fn pending_submissions(&self) -> u32 {
         self.pending_submissions
     }
+
+    /// Atomically take and reset the pending-submission count. Used by
+    /// [`IoUringBackend::poll_completions_blocking`] to flush SQEs without
+    /// holding the ring mutex during the blocking `io_uring_enter` syscall.
+    pub(crate) fn take_pending_submissions(&mut self) -> u32 {
+        let pending = self.pending_submissions;
+        self.pending_submissions = 0;
+        pending
+    }
 }
 
 impl Drop for IoUring {
@@ -544,6 +553,11 @@ use pagebox_frame_kernel::Lsn;
 pub(crate) struct IoUringBackend {
     #[allow(dead_code)]
     fd: RawFd,
+    /// The io_uring ring fd, stored separately from the `Mutex<IoUring>` so
+    /// [`poll_completions_blocking`] can call `io_uring_enter` without
+    /// holding the ring mutex. This allows `wait_for_durable` to reap CQEs
+    /// concurrently while the driver is blocked in the kernel.
+    ring_fd: RawFd,
     /// The ring is guarded by a mutex because the driver loop calls
     /// `submit_write` / `submit_sync` / `poll_completions` sequentially but
     /// `drain_for_shutdown` runs on the shutdown path; a single producer
@@ -571,8 +585,10 @@ impl IoUringBackend {
         // needed to fill the ring, which is far beyond the WAL's
         // single-buffer-at-a-time drain model.
         let ring = IoUring::new(1024)?;
+        let ring_fd = ring.ring_fd;
         Ok(Self {
             fd,
+            ring_fd,
             ring: Mutex::new(ring),
             in_flight: Mutex::new(Vec::with_capacity(64)),
             free_slots: Mutex::new(Vec::new()),
@@ -663,9 +679,69 @@ impl WalIoBackend for IoUringBackend {
 
     fn poll_completions(&self, sink: &mut dyn FnMut(Completion)) {
         let mut ring = self.ring.lock();
+        // Non-blocking: flush pending SQEs (if any) and reap whatever CQEs
+        // are ready. No io_uring_enter call when there are no pending
+        // submissions — the CQ ring is plain memory, readable without a
+        // syscall.
         if ring.pending_submissions() > 0 {
             let _ = ring.flush_and_enter(0);
         }
+        ring.drain_cqes(&mut |user_data, res| {
+            if res < 0 {
+                let err = io::Error::from_raw_os_error(-res);
+                panic!("WAL io_uring op failed — durability compromised: {err}");
+            }
+            if is_fsync(user_data)
+                && let Some(write) = self.take_slot(slot_of(user_data))
+            {
+                let write_latency_ns =
+                    write.write_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                sink(Completion {
+                    kind: CompletionKind::Written {
+                        buffer: write.buffer,
+                        max_lsn: write.max_lsn,
+                        durable_lsn: Some(write.max_lsn),
+                        write_latency_ns,
+                    },
+                });
+            }
+        });
+    }
+
+    fn poll_completions_blocking(&self, sink: &mut dyn FnMut(Completion)) {
+        // Flush pending SQEs (if any) and block in io_uring_enter until ≥1
+        // CQE is ready. Critical: the ring mutex is released during the
+        // blocking syscall so wait_for_durable on another thread can reap
+        // CQEs concurrently. Without this, the driver would hold the mutex
+        // for the entire I/O latency (10–1000 µs), serializing all
+        // wait_for_durable callers.
+        let to_submit = {
+            let mut ring = self.ring.lock();
+            ring.take_pending_submissions()
+        };
+        // io_uring_enter(fd, to_submit, 1, GETEVENTS): flushes pending SQEs
+        // and blocks until at least 1 CQE arrives. to_submit=0 with
+        // min_complete=1 is valid — it just waits for a CQE without
+        // submitting anything (SQEs were already flushed by submit_write).
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_io_uring_enter,
+                self.ring_fd,
+                to_submit,
+                1u32,
+                IORING_ENTER_GETEVENTS,
+                std::ptr::null::<libc::sigset_t>(),
+                0usize,
+            )
+        };
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                eprintln!("WAL io_uring_enter warning: {err}");
+            }
+        }
+        // Reap all available CQEs under the ring lock.
+        let mut ring = self.ring.lock();
         ring.drain_cqes(&mut |user_data, res| {
             if res < 0 {
                 let err = io::Error::from_raw_os_error(-res);

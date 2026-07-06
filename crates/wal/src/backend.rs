@@ -117,6 +117,14 @@ pub(crate) trait WalIoBackend: Send + Sync {
     /// waiting when no CQEs are ready (via [`WalIoBackend::has_in_flight`]).
     fn poll_completions(&self, sink: &mut dyn FnMut(Completion));
 
+    /// Block until at least one completion is ready, then drain it. Called
+    /// by the driver loop when it has in-flight work but no pending writes.
+    /// Non-io_uring backends have no async completions, so the default is a
+    /// no-op. The io_uring implementation releases the ring mutex during
+    /// `io_uring_enter` so other threads (wait_for_durable) can reap CQEs
+    /// concurrently.
+    fn poll_completions_blocking(&self, _sink: &mut dyn FnMut(Completion)) {}
+
     /// Whether the backend has in-flight writes whose completions haven't
     /// been reaped. The driver loop uses this to decide whether to use a
     /// timed wait (to poll again soon) or an indefinite wait.

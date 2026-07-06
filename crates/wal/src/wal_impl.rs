@@ -964,7 +964,18 @@ impl Wal {
         sync_backend: WalSyncBackend,
         shard_count: usize,
     ) -> io::Result<Self> {
-        let shard_count = shard_count.clamp(1, 256);
+        // io_uring uses linked write+fsync SQEs, so each ring generates one
+        // fsync per group-commit cycle. With N rings, N concurrent fsyncs
+        // compete for the disk → severe tail latency (measured: 73ms p99.9
+        // at 16t with 2+ shards vs 484us with 1 shard). Forcing a single
+        // shard is architecturally correct here: one ring, one driver
+        // thread, one fsync in flight at a time. Group commit batches
+        // appends from all threads into that single write+fsync chain.
+        let shard_count = if sync_backend.is_io_uring() {
+            1
+        } else {
+            shard_count.clamp(1, 256)
+        };
 
         let mut opened = Vec::with_capacity(shard_count);
         for shard_idx in 0..shard_count {
@@ -2134,6 +2145,22 @@ impl WalInner {
                 .fetch_max(target_lsn, Ordering::Release);
             self.flush_requested.notify_all();
             self.stats.events.inc(WalEvent::FlushWait);
+
+            // Try to reap CQEs before blocking on the condvar. This is the
+            // io_uring fast path: if the write+fsync CQE has already arrived,
+            // poll_completions drains it (advancing durable_lsn via
+            // handle_completion) and we return without waiting at all. Without
+            // this, a waiter would block for up to 10ms on the condvar even
+            // though the CQE was already available.
+            drop(state);
+            self.backend
+                .poll_completions(&mut |c| self.handle_completion(c));
+            let current = self.durable_lsn.load(Ordering::Acquire);
+            if current >= target_lsn {
+                return current;
+            }
+
+            state = self.state.lock();
             state.flush_waiters += 1;
             let wait_start = Instant::now();
             self.flush_done
@@ -2425,10 +2452,7 @@ impl WalInner {
                     if self.backend.has_in_flight() {
                         drop(state);
                         self.backend
-                            .poll_completions(&mut |c| self.handle_completion(c));
-                        if self.backend.has_in_flight() {
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
+                            .poll_completions_blocking(&mut |c| self.handle_completion(c));
                         state = self.state.lock();
                         continue;
                     }
