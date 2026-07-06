@@ -950,21 +950,21 @@ impl Wal {
         Self::open_opts_with_shards(path, backend, 1)
     }
 
+    #[cfg(test)]
+    pub(crate) fn started_thread_count_for_test(&self) -> usize {
+        let mut count = usize::from(self.inner.threads_started.load(Ordering::Acquire));
+        for shard in &self.extra_shards {
+            count += usize::from(shard.threads_started.load(Ordering::Acquire));
+        }
+        count
+    }
+
     fn open_opts_with_shards(
         path: &Path,
         sync_backend: WalSyncBackend,
         shard_count: usize,
     ) -> io::Result<Self> {
-        // io_uring v1 is limited to a single ring per process; multiple
-        // rings (one per shard) corrupt shared kernel resources. Force 1
-        // shard for the io_uring backend regardless of the env-configured
-        // shard count. This will be lifted when registered-resources support
-        // lands.
-        let shard_count = if sync_backend.is_io_uring() {
-            1
-        } else {
-            shard_count.clamp(1, 256)
-        };
+        let shard_count = shard_count.clamp(1, 256);
 
         let mut opened = Vec::with_capacity(shard_count);
         for shard_idx in 0..shard_count {
@@ -989,9 +989,12 @@ impl Wal {
             inners.push(inner);
         }
 
+        for inner in &inners {
+            Self::start_threads(inner)?;
+        }
+
         let mut inners = inners.into_iter();
         let primary = inners.next().expect("at least one WAL shard");
-        Self::start_threads(&primary)?;
 
         Ok(Self {
             inner: primary,
@@ -2419,17 +2422,13 @@ impl WalInner {
                     if pending_write {
                         break;
                     }
-                    // No pending writes but in-flight io_uring work: drop
-                    // the state lock, poll for CQEs (blocking up to 1 CQE),
-                    // then re-acquire and re-check. This is critical: if all
-                    // appender threads are blocked on wait_for_durable, no
-                    // one will set pending_write, so the inner loop would
-                    // never break to reach the outer-loop poll. Polling here
-                    // ensures CQEs are reaped and durable_lsn advances.
                     if self.backend.has_in_flight() {
                         drop(state);
                         self.backend
                             .poll_completions(&mut |c| self.handle_completion(c));
+                        if self.backend.has_in_flight() {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
                         state = self.state.lock();
                         continue;
                     }
@@ -2493,7 +2492,8 @@ impl WalInner {
             let written = self.written_lsn.load(Ordering::Acquire);
             let should_write = requested_write > written
                 || !state.pending_writes.is_empty()
-                || (relaxed_mode && self.should_write_relaxed(&state, last_write));
+                || (relaxed_mode && self.should_write_relaxed(&state, last_write))
+                || (state.shutdown && state.active.used > 0);
             if should_write && state.pending_writes.is_empty() && state.active.used > 0 {
                 self.seal_active_buffer_locked(&mut state)
                     .expect("WAL buffer seal failed");

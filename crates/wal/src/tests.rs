@@ -238,6 +238,19 @@ fn sharded_lsn_claims_stay_on_thread_shard() {
     );
 }
 
+#[test]
+fn sharded_open_starts_every_shard_driver() {
+    let path = tmp_path("sharded_driver_startup");
+    let _cleanup = Cleanup(path.clone());
+    let wal = Wal::open_with_shards_for_test(&path, 4).unwrap();
+
+    assert_eq!(
+        wal.started_thread_count_for_test(),
+        4,
+        "every WAL shard should start its driver thread"
+    );
+}
+
 fn record_lsn(record: WalReplayRecord<'_>) -> u64 {
     match record {
         WalReplayRecord::PageImage { lsn, .. } | WalReplayRecord::Logical { lsn, .. } => lsn,
@@ -1214,6 +1227,38 @@ fn group_commit_batches_concurrent_commits_into_fewer_writes() {
     let mut lsns: Vec<u64> = replayed.iter().map(|&(l, _, _)| l).collect();
     lsns.sort_unstable();
     assert_eq!(lsns, (1..=n_threads as u64).collect::<Vec<_>>());
+}
+
+#[test]
+fn clean_shutdown_flushes_active_buffer_even_when_written_lsn_is_higher() {
+    let path = tmp_path("shutdown_flushes_active_below_written");
+    let _cleanup = Cleanup(path.clone());
+
+    {
+        let wal = Wal::open(&path).unwrap();
+        let lsn1 = wal.claim_lsn();
+        let lsn2 = wal.claim_lsn();
+
+        wal.append_page_image_with_lsn(lsn2, 2, |lsn, page| {
+            write_test_page_lsn(page, lsn);
+            page[0] = 2;
+        })
+        .unwrap();
+        assert!(wal.flush_at_least(lsn2) >= lsn2);
+
+        wal.append_page_image_with_lsn(lsn1, 1, |lsn, page| {
+            write_test_page_lsn(page, lsn);
+            page[0] = 1;
+        })
+        .unwrap();
+    }
+
+    let wal = Wal::open(&path).unwrap();
+    let mut replayed = Vec::new();
+    wal.replay(|lsn, pid, data| replayed.push((lsn, pid, data[0])))
+        .unwrap();
+    replayed.sort_unstable();
+    assert_eq!(replayed, vec![(1, 1, 1), (2, 2, 2)]);
 }
 
 // ---------------------------------------------------------------------------

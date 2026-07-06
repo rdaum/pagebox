@@ -663,14 +663,8 @@ impl WalIoBackend for IoUringBackend {
 
     fn poll_completions(&self, sink: &mut dyn FnMut(Completion)) {
         let mut ring = self.ring.lock();
-        // Flush pending SQEs and block for ≥1 CQE. This is safe because
-        // the caller (driver loop) drops the state lock before calling
-        // poll_completions, so handle_completion's state lock acquisition
-        // won't deadlock. Blocking here prevents busy-spinning: the driver
-        // sleeps in the kernel until a CQE is ready rather than polling
-        // on a 200µs timer.
-        if ring.pending_submissions() > 0 || self.has_in_flight() {
-            let _ = ring.flush_and_enter(1);
+        if ring.pending_submissions() > 0 {
+            let _ = ring.flush_and_enter(0);
         }
         ring.drain_cqes(&mut |user_data, res| {
             if res < 0 {
