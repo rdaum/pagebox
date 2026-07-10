@@ -19,6 +19,11 @@ impl Counter {
 
     #[inline]
     pub fn inc(&self) {}
+
+    #[inline]
+    pub fn get(&self) -> u64 {
+        0
+    }
 }
 
 pub struct LabeledCounter<L>(PhantomData<L>);
@@ -30,4 +35,9 @@ impl<L> LabeledCounter<L> {
 
     #[inline]
     pub fn inc(&self, _label: L) {}
+
+    #[inline]
+    pub fn get(&self, _label: L) -> u64 {
+        0
+    }
 }

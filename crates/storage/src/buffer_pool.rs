@@ -720,6 +720,7 @@ enum BufferPoolFixOrphanEvent {
 #[cfg_attr(feature = "metrics", label_name = "eviction_event")]
 enum BufferPoolEvictionEvent {
     Evictions,
+    SecondChanceSkips,
     DirtyMarks,
     DirtyRelogs,
 }
@@ -3997,6 +3998,9 @@ impl BufferPool {
             return None;
         }
         if unsafe { (*bf).header.core.referenced.swap(false, Ordering::Relaxed) } {
+            self.metrics
+                .eviction_events
+                .inc(BufferPoolEvictionEvent::SecondChanceSkips);
             return None;
         }
 
@@ -4349,6 +4353,9 @@ impl BufferPool {
                 return None;
             }
             if unsafe { (*bf).header.core.referenced.swap(false, Ordering::Relaxed) } {
+                pool.metrics
+                    .eviction_events
+                    .inc(BufferPoolEvictionEvent::SecondChanceSkips);
                 return None;
             }
 
@@ -4889,6 +4896,24 @@ impl BufferPool {
             .saturating_sub(self.resident_base_pages_available.load(Ordering::Relaxed))
     }
 
+    /// Count resident pages without an owning parent link.
+    ///
+    /// Intended for quiescent invariant checks. A non-root B+tree page left in
+    /// this state after an operation completes is allocated but unreachable.
+    pub fn num_unlinked_resident_frames(&self) -> usize {
+        (0..self.allocated_slots())
+            .filter(|&idx| self.is_slot_initialized(idx))
+            .filter(|&idx| {
+                let bf = self.raw_frame(idx);
+                unsafe {
+                    (*bf).header.core.state.load(Ordering::Acquire) == FrameState::Resident
+                        && (*bf).header.core.pid != 0
+                        && matches!((*bf).header.parent_link, ParentLink::None)
+                }
+            })
+            .count()
+    }
+
     /// Advise the kernel to drop cached pages for the underlying store.
     pub fn drop_cache(&self) {
         self.page_store.drop_cache()
@@ -4902,6 +4927,39 @@ impl BufferPool {
         self.metrics
             .eviction_events
             .get(BufferPoolEvictionEvent::Evictions) as u64
+    }
+
+    /// Detailed cache activity for benchmark diagnostics.
+    pub fn diagnostic_stats(&self) -> BufferPoolDiagnosticStats {
+        let loaded = |kind| {
+            (self.metrics.fix_swip_sync_load_pages.get(kind)
+                + self.metrics.fix_orphan_sync_load_pages.get(kind)) as u64
+        };
+        BufferPoolDiagnosticStats {
+            inner_index_loads: loaded(BufferPoolLoadedPageKind::InnerIndex),
+            leaf_index_loads: loaded(BufferPoolLoadedPageKind::LeafIndex),
+            tuple_loads: loaded(BufferPoolLoadedPageKind::Tuple),
+            delta_loads: loaded(BufferPoolLoadedPageKind::Delta),
+            resident_meta_loads: loaded(BufferPoolLoadedPageKind::ResidentMeta),
+            unknown_loads: loaded(BufferPoolLoadedPageKind::Unknown),
+            parent_hint_hits: self
+                .metrics
+                .unswizzle_parent_events
+                .get(UnswizzleParentEvent::FastPathHits) as u64,
+            parent_dfs_fallbacks: self
+                .metrics
+                .unswizzle_parent_events
+                .get(UnswizzleParentEvent::DfsFallbacks) as u64,
+            parent_dfs_failures: self
+                .metrics
+                .unswizzle_parent_events
+                .get(UnswizzleParentEvent::DfsFailures) as u64,
+            second_chance_skips: self
+                .metrics
+                .eviction_events
+                .get(BufferPoolEvictionEvent::SecondChanceSkips)
+                as u64,
+        }
     }
 
     /// Number of pages synchronously loaded into the pool since it opened.
@@ -5022,6 +5080,21 @@ impl BufferPool {
             self.wal = None;
         }
     }
+}
+
+/// Snapshot of detailed buffer-pool activity since the pool was opened.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BufferPoolDiagnosticStats {
+    pub inner_index_loads: u64,
+    pub leaf_index_loads: u64,
+    pub tuple_loads: u64,
+    pub delta_loads: u64,
+    pub resident_meta_loads: u64,
+    pub unknown_loads: u64,
+    pub parent_hint_hits: u64,
+    pub parent_dfs_fallbacks: u64,
+    pub parent_dfs_failures: u64,
+    pub second_chance_skips: u64,
 }
 
 fn buffer_pool_latency_bounds_ns() -> [u64; 13] {

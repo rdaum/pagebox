@@ -31,6 +31,7 @@ use self::node::{
 use self::parent_edge::ParentEdge;
 use self::split_child::SplitChild;
 use self::split_publish::{split_right_parent_uses_upper, split_separator_insert_pos};
+pub use self::stats::BTreeDiagnosticStats;
 use self::stats::{BTreeEvent, BTreeStats};
 
 enum InsertLeafAction {
@@ -53,7 +54,10 @@ pub struct BTree {
     pool: BufferPoolHandle,
     meta_swip: AtomicSwip,
     height: AtomicU32,
+    reachable_pages: std::sync::atomic::AtomicU64,
+    reachable_pages_known: bool,
     stats: BTreeStats,
+    eviction_unswizzle_nodes_visited: std::sync::atomic::AtomicU64,
     /// Data structure ID for the DTRegistry parent-finder callback.
     dt_id: u16,
 }
@@ -128,6 +132,7 @@ impl BTree {
         self.meta_swip.store(child.hot_swip(), Ordering::Release);
         unsafe { self.set_root_parent_link(child) };
         self.height.fetch_sub(1, Ordering::Relaxed);
+        self.reachable_pages.fetch_sub(1, Ordering::Relaxed);
         root.set_parent_link_none();
     }
 
@@ -164,6 +169,7 @@ impl BTree {
             }
         }
         removed_leaf.set_parent_link_none();
+        self.reachable_pages.fetch_sub(1, Ordering::Relaxed);
     }
 
     unsafe fn unlink_merged_left_leaf(
@@ -197,6 +203,7 @@ impl BTree {
             };
         }
         removed_leaf.set_parent_link_none();
+        self.reachable_pages.fetch_sub(1, Ordering::Relaxed);
     }
 
     unsafe fn unlink_merged_right_inner(
@@ -211,6 +218,7 @@ impl BTree {
         parent.remove_slot(removed_slot);
         unsafe { self.set_parent_link_for_edge(merged, parent, merged_edge) };
         removed.set_parent_link_none();
+        self.reachable_pages.fetch_sub(1, Ordering::Relaxed);
     }
 
     unsafe fn unlink_merged_left_inner(
@@ -235,6 +243,7 @@ impl BTree {
         };
         unsafe { self.set_parent_link_for_edge(merged, parent, merged_edge) };
         removed.set_parent_link_none();
+        self.reachable_pages.fetch_sub(1, Ordering::Relaxed);
     }
 
     unsafe fn update_leaf_left_sibling(&self, leaf_pid: u64, left_pid: u64) {
@@ -267,11 +276,14 @@ impl BTree {
             pool,
             meta_swip: root_swip,
             height: AtomicU32::new(0),
+            reachable_pages: std::sync::atomic::AtomicU64::new(1),
+            reachable_pages_known: true,
             stats: BTreeStats::new(
                 std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(1),
             ),
+            eviction_unswizzle_nodes_visited: std::sync::atomic::AtomicU64::new(0),
             dt_id,
         }
     }
@@ -282,17 +294,36 @@ impl BTree {
     where
         P: Into<BufferPoolHandle>,
     {
+        let mut tree = Self::open_with_page_count(pool, root_page_id, height, 1, dt_id);
+        tree.reachable_pages_known = false;
+        tree
+    }
+
+    /// Reopen an existing tree with its persisted reachable-page count.
+    pub fn open_with_page_count<P>(
+        pool: P,
+        root_page_id: u64,
+        height: u32,
+        reachable_pages: u64,
+        dt_id: u16,
+    ) -> Self
+    where
+        P: Into<BufferPoolHandle>,
+    {
         let pool = pool.into();
         let root_swip = AtomicSwip::new(Swip::evicted(root_page_id));
         BTree {
             pool,
             meta_swip: root_swip,
             height: AtomicU32::new(height),
+            reachable_pages: std::sync::atomic::AtomicU64::new(reachable_pages.max(1)),
+            reachable_pages_known: true,
             stats: BTreeStats::new(
                 std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(1),
             ),
+            eviction_unswizzle_nodes_visited: std::sync::atomic::AtomicU64::new(0),
             dt_id,
         }
     }
@@ -300,6 +331,13 @@ impl BTree {
     /// The root page ID (for persistence).
     pub fn root_page_id(&self) -> u64 {
         Self::swip_page_id(self.meta_swip.load(Ordering::Acquire))
+    }
+
+    /// Exact number of pages reachable from the root, when the count was
+    /// supplied at reopen or the tree was created in this process.
+    pub fn reachable_page_count(&self) -> Option<u64> {
+        self.reachable_pages_known
+            .then(|| self.reachable_pages.load(Ordering::Relaxed))
     }
 
     /// Return every page currently reachable from the tree root.
@@ -363,6 +401,14 @@ impl BTree {
 
     pub fn visit_metrics<V: MetricVisitor + ?Sized>(&self, visitor: &mut V) {
         self.stats.visit_metrics(visitor);
+    }
+
+    pub fn diagnostic_stats(&self) -> BTreeDiagnosticStats {
+        let mut stats = self.stats.diagnostic_stats();
+        stats.eviction_unswizzle_nodes_visited = self
+            .eviction_unswizzle_nodes_visited
+            .load(Ordering::Relaxed);
+        stats
     }
 
     // -----------------------------------------------------------------------
@@ -1100,6 +1146,16 @@ impl BTree {
     // Split — works for both leaf and inner nodes
     // -----------------------------------------------------------------------
 
+    /// Return a split sibling that was allocated before reacquiring the leaf
+    /// latch but was never linked into the tree.
+    fn retire_unused_split_frame(&self, frame: (u64, PinnedFrame<'_>)) {
+        let (_, frame) = frame;
+        unsafe {
+            self.pool()
+                .retire_unlinked_exclusive_frame(frame.exclusive());
+        }
+    }
+
     /// Split a full node. The node must be exclusively latched.
     /// After return, the original node is unlatched and unpinned.
     ///
@@ -1260,6 +1316,7 @@ impl BTree {
 
         new_sibling.mark_dirty();
         node.mark_dirty();
+        self.reachable_pages.fetch_add(1, Ordering::Relaxed);
 
         // Now insert separator into parent.
         // Check if this is a root split by CAS on meta_swip.
@@ -1302,6 +1359,7 @@ impl BTree {
                         );
                     }
                     self.height.fetch_add(1, Ordering::Relaxed);
+                    self.reachable_pages.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(_) => {
                     // Another thread already changed the root.
@@ -1311,6 +1369,9 @@ impl BTree {
                     // never becomes temporarily unreachable.
                     left.resident_frame().set_parent_link_none();
                     right.resident_frame().set_parent_link_none();
+                    unsafe {
+                        pool.retire_unlinked_exclusive_frame(new_root.into_frame());
+                    }
                     unsafe {
                         self.publish_leaf_split_to_parent(&sep_key, left, right, parent_path)
                     };
@@ -1404,6 +1465,7 @@ impl BTree {
 
         new_sibling.mark_dirty();
         node.mark_dirty();
+        self.reachable_pages.fetch_add(1, Ordering::Relaxed);
 
         let left = SplitChild::from_exclusive(&node);
         let right = SplitChild::from_exclusive(&new_sibling);
@@ -1442,10 +1504,14 @@ impl BTree {
                         );
                     }
                     self.height.fetch_add(1, Ordering::Relaxed);
+                    self.reachable_pages.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(_) => {
                     left.resident_frame().set_parent_link_none();
                     right.resident_frame().set_parent_link_none();
+                    unsafe {
+                        pool.retire_unlinked_exclusive_frame(new_root.into_frame());
+                    }
                     unsafe { self.publish_leaf_split_to_parent(sep_key, left, right, parent_path) };
                 }
             }
@@ -1688,6 +1754,8 @@ impl BTree {
         let mut restarts = 0usize;
         while let Some(node) = stack.pop() {
             self.stats.eviction_unswizzle_nodes_visited.inc();
+            self.eviction_unswizzle_nodes_visited
+                .fetch_add(1, Ordering::Relaxed);
             visited += 1;
             if visited > MAX_EVICTION_UNSWIZZLE_VISITS || restarts > MAX_EVICTION_UNSWIZZLE_RESTARTS
             {
@@ -2491,6 +2559,7 @@ impl BTree {
                 match unsafe { self.find_leaf_exclusive_with_path_fallback(key) } {
                     Ok(r) => r,
                     Err(Restart) => {
+                        self.retire_unused_split_frame(pre_sibling);
                         self.stats.inc(BTreeEvent::InsertRestarts);
                         attempts += 1;
                         std::thread::yield_now();
@@ -2501,6 +2570,7 @@ impl BTree {
                 match unsafe { self.find_leaf_exclusive_with_path(key) } {
                     Ok(r) => r,
                     Err(Restart) => {
+                        self.retire_unused_split_frame(pre_sibling);
                         self.stats.inc(BTreeEvent::InsertRestarts);
                         attempts += 1;
                         continue;
@@ -2509,8 +2579,16 @@ impl BTree {
             };
 
             match self.try_upsert_leaf(&leaf, key, value) {
-                UpsertLeafAction::UpdatedExisting => return false,
-                UpsertLeafAction::Inserted => return true,
+                UpsertLeafAction::UpdatedExisting => {
+                    drop(leaf);
+                    self.retire_unused_split_frame(pre_sibling);
+                    return false;
+                }
+                UpsertLeafAction::Inserted => {
+                    drop(leaf);
+                    self.retire_unused_split_frame(pre_sibling);
+                    return true;
+                }
                 UpsertLeafAction::SplitRequired => unsafe {
                     self.split_node(
                         leaf.into_frame(),
@@ -2578,6 +2656,7 @@ impl BTree {
                 match unsafe { self.find_leaf_exclusive_with_path_fallback(key) } {
                     Ok(r) => r,
                     Err(Restart) => {
+                        self.retire_unused_split_frame(pre_sibling);
                         self.stats.inc(BTreeEvent::InsertRestarts);
                         attempts += 1;
                         std::thread::yield_now();
@@ -2588,6 +2667,7 @@ impl BTree {
                 match unsafe { self.find_leaf_exclusive_with_path(key) } {
                     Ok(r) => r,
                     Err(Restart) => {
+                        self.retire_unused_split_frame(pre_sibling);
                         self.stats.inc(BTreeEvent::InsertRestarts);
                         attempts += 1;
                         continue;
@@ -2596,8 +2676,16 @@ impl BTree {
             };
 
             match self.try_insert_leaf(&leaf, key, value) {
-                InsertLeafAction::ReturnFalse => return false,
-                InsertLeafAction::Inserted => return true,
+                InsertLeafAction::ReturnFalse => {
+                    drop(leaf);
+                    self.retire_unused_split_frame(pre_sibling);
+                    return false;
+                }
+                InsertLeafAction::Inserted => {
+                    drop(leaf);
+                    self.retire_unused_split_frame(pre_sibling);
+                    return true;
+                }
                 InsertLeafAction::SplitRequired => unsafe {
                     self.split_node(
                         leaf.into_frame(),
@@ -4023,6 +4111,26 @@ mod tests {
     }
 
     #[test]
+    fn reachable_page_count_tracks_splits_and_merges() {
+        let pool = std::sync::Arc::new(BufferPool::new(1_024));
+        let tree = BTree::new(&pool, 0);
+        let value = [0x3c; 2_048];
+
+        for i in 0..4_096u32 {
+            assert!(tree.insert(&i.to_be_bytes(), &value));
+        }
+        for i in 512..3_584u32 {
+            assert!(tree.remove(&i.to_be_bytes()));
+        }
+
+        assert_eq!(
+            tree.reachable_page_count().unwrap() as usize,
+            tree.owned_page_ids().len(),
+            "maintained page count must include splits and exclude merged pages"
+        );
+    }
+
+    #[test]
     fn remove_empty_leaf_merge_preserves_tree_correctness() {
         let pool = std::sync::Arc::new(BufferPool::new(64));
         let tree = BTree::new(&pool, 0);
@@ -4235,6 +4343,58 @@ mod tests {
             missing_lookup.is_empty() && missing_scan.is_empty() && false_dupes.is_empty(),
             "lookup missing: {missing_lookup:?}, scan missing: {missing_scan:?}, \
              scan_count: {scan_count}, false dupes: {false_dupes:?}",
+        );
+    }
+
+    #[test]
+    fn concurrent_split_retries_retire_unused_preallocations() {
+        const KEYS: u64 = 8_192;
+        const THREADS: usize = 4;
+
+        let pool = Arc::new(BufferPool::new(4_096));
+        let tree = Arc::new(BTree::new(&pool, 0));
+        let next = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let tree = tree.clone();
+                let next = next.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    let value = [0x5a; 2_048];
+                    barrier.wait();
+                    loop {
+                        let key = next.fetch_add(1, Ordering::Relaxed);
+                        if key >= KEYS {
+                            break;
+                        }
+                        let inserted = if key.is_multiple_of(2) {
+                            tree.insert(&key.to_be_bytes(), &value)
+                        } else {
+                            tree.upsert(&key.to_be_bytes(), &value)
+                        };
+                        assert!(inserted, "unique key {key} should be newly inserted");
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert!(
+            tree.diagnostic_stats().insert_restarts > 0,
+            "test must exercise a split-path traversal restart"
+        );
+        assert_eq!(
+            tree.reachable_page_count().unwrap() as usize,
+            tree.owned_page_ids().len(),
+            "maintained reachable-page count must match a quiescent tree walk"
+        );
+        assert_eq!(
+            pool.num_unlinked_resident_frames(),
+            0,
+            "split retries must not leave allocated resident frames unreachable"
         );
     }
 

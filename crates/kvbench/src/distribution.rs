@@ -206,10 +206,16 @@ impl LatestGen {
 // Hashing
 // ---------------------------------------------------------------------------
 
-/// 64-bit hash mixing function (same constants as `crates/btree/benches/ycsb.rs:13`).
-pub fn hash64(x: u64) -> u64 {
-    x.wrapping_mul(0x517cc1b727220a95)
-        .wrapping_add(0x9e3779b97f4a7c15)
+/// Deterministic 64-bit mixer based on the SplitMix64 output permutation.
+///
+/// Unlike an affine congruential step, the nonlinear mixing prevents a
+/// power-of-two key range from turning consecutive operation indexes into a
+/// no-replacement walk over the entire range.
+pub fn hash64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e3779b97f4a7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    x ^ (x >> 31)
 }
 
 /// Format a key index as an 8-byte big-endian key (for lexicographic ordering
@@ -241,6 +247,26 @@ mod tests {
                 c
             );
         }
+    }
+
+    #[test]
+    fn uniform_power_of_two_range_samples_with_replacement() {
+        let n = 65_536_u64;
+        let sampler = UniformGen::new(n, 42);
+        let mut seen = vec![false; n as usize];
+        let mut unique = 0usize;
+        for i in 0..n {
+            let key = sampler.sample(i);
+            if !seen[key as usize] {
+                seen[key as usize] = true;
+                unique += 1;
+            }
+        }
+
+        assert!(
+            (38_000..45_000).contains(&unique),
+            "uniform-with-replacement sampling should produce about 41k unique keys, got {unique}"
+        );
     }
 
     #[test]

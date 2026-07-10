@@ -101,13 +101,56 @@ impl KvEngine for KvstoreAdapter {
             extra.insert("wal_backend".to_string(), backend);
         }
         let cache_misses = self.inner.cache_misses();
+        let cache_evictions = self.inner.cache_evictions();
+        let buffer = self.inner.buffer_pool_diagnostic_stats();
+        let btree = self.inner.btree_diagnostic_stats();
+        let diagnostics = [
+            ("load_inner", buffer.inner_index_loads),
+            ("load_leaf", buffer.leaf_index_loads),
+            ("load_tuple", buffer.tuple_loads),
+            ("load_delta", buffer.delta_loads),
+            ("load_meta", buffer.resident_meta_loads),
+            ("load_unknown", buffer.unknown_loads),
+            ("parent_hint_hits", buffer.parent_hint_hits),
+            ("parent_dfs_fallbacks", buffer.parent_dfs_fallbacks),
+            ("parent_dfs_failures", buffer.parent_dfs_failures),
+            ("second_chance_skips", buffer.second_chance_skips),
+            ("insert_restarts", btree.insert_restarts),
+            ("leaf_descent_restarts", btree.leaf_descent_restarts),
+            ("leaf_upgrade_restarts", btree.leaf_upgrade_restarts),
+            ("split_path_restarts", btree.split_path_restarts),
+            ("parent_publish_restarts", btree.parent_publish_restarts),
+            ("parent_fallbacks", btree.parent_fallbacks),
+            ("resolve_cold", btree.resolve_cold),
+            ("unswizzle_calls", btree.eviction_unswizzle_calls),
+            ("unswizzle_restarts", btree.eviction_unswizzle_restarts),
+            (
+                "unswizzle_parent_hits",
+                btree.eviction_unswizzle_parent_hits,
+            ),
+            (
+                "unswizzle_upgrade_failures",
+                btree.eviction_unswizzle_upgrade_failures,
+            ),
+            (
+                "unswizzle_nodes_visited",
+                btree.eviction_unswizzle_nodes_visited,
+            ),
+        ];
+        extra.extend(
+            diagnostics
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value.to_string())),
+        );
+        let live_data_bytes = (self.inner.live_tree_pages() * PAGE_SIZE) as u64;
         EngineStats {
             direct_io: Some(self.inner.direct_io_enabled()),
             cache_capacity_bytes: Some((self.inner.cache_capacity_pages() * PAGE_SIZE) as u64),
             cache_used_bytes: Some((self.inner.cache_used_pages() * PAGE_SIZE) as u64),
             cache_misses: Some(cache_misses),
-            cache_evictions: Some(self.inner.cache_evictions()),
+            cache_evictions: Some(cache_evictions),
             cache_insert_bytes: Some(cache_misses.saturating_mul(PAGE_SIZE as u64)),
+            live_data_bytes: Some(live_data_bytes),
             persisted_data_bytes: Some((self.inner.persisted_pages() * PAGE_SIZE) as u64),
             extra,
             ..EngineStats::default()
@@ -162,5 +205,26 @@ mod tests {
         drop(engine);
         let engine2 = KvstoreAdapter::open(dir.path(), &test_opts()).unwrap();
         assert_eq!(engine2.get(b"k1"), Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn adapter_persists_live_tree_bytes_across_reopen() {
+        let dir = TempDir::new().unwrap();
+        let engine = KvstoreAdapter::open(dir.path(), &test_opts()).unwrap();
+        let value = [0x6d; 2_048];
+        for key in 0..2_000u64 {
+            engine.put(&key.to_be_bytes(), &value);
+        }
+        let before = engine.stats().live_data_bytes.unwrap();
+        assert!(before > PAGE_SIZE as u64, "test must split the root leaf");
+        engine.prepare_for_reopen().unwrap();
+        drop(engine);
+
+        let reopened = KvstoreAdapter::open(dir.path(), &test_opts()).unwrap();
+        assert_eq!(
+            reopened.stats().live_data_bytes,
+            Some(before),
+            "reachable-page accounting must survive checkpoint and reopen"
+        );
     }
 }

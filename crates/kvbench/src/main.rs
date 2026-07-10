@@ -448,14 +448,14 @@ fn validate_cache_pressure_evidence(
             opts.cache_budget_bytes
         )));
     }
-    let persisted = stats.persisted_data_bytes.ok_or_else(|| {
+    let working_set = stats.live_data_bytes.or(stats.persisted_data_bytes).ok_or_else(|| {
         invalid_input(format!(
-            "engine '{engine}' did not report persisted data size for a cache-pressure run"
+            "engine '{engine}' did not report live or persisted data size for a cache-pressure run"
         ))
     })?;
-    if persisted <= capacity {
+    if working_set <= capacity {
         return Err(invalid_input(format!(
-            "engine '{engine}' did not establish cache pressure: {persisted} persisted data bytes fit in the {capacity}-byte cache"
+            "engine '{engine}' did not establish cache pressure: {working_set} working-set bytes fit in the {capacity}-byte cache"
         )));
     }
     let misses = stats.cache_misses.ok_or_else(|| {
@@ -570,6 +570,9 @@ fn print_summary(report: &Report) {
             persisted as f64 / 1_048_576.0,
         );
     }
+    if let Some(live) = stats.live_data_bytes {
+        eprintln!("  live data:  {:.1} MiB", live as f64 / 1_048_576.0);
+    }
     if let (Some(hits), Some(misses)) = (stats.cache_hits, stats.cache_misses) {
         eprintln!("  cache h/m: {hits}/{misses}");
     } else if let Some(misses) = stats.cache_misses {
@@ -577,6 +580,11 @@ fn print_summary(report: &Report) {
     }
     if let Some(evictions) = stats.cache_evictions {
         eprintln!("  evictions:  {evictions}");
+    }
+    let mut extra: Vec<_> = stats.extra.iter().collect();
+    extra.sort_unstable_by_key(|(name, _)| *name);
+    for (name, value) in extra {
+        eprintln!("  {name}: {value}");
     }
 }
 
@@ -655,6 +663,14 @@ mod tests {
         assert!(
             validate_cache_pressure_evidence("mock", &opts, &fits).is_err(),
             "a data set that fits in cache is not cache pressure"
+        );
+        let allocated_but_not_live = EngineStats {
+            live_data_bytes: Some(32),
+            ..valid.clone()
+        };
+        assert!(
+            validate_cache_pressure_evidence("mock", &opts, &allocated_but_not_live).is_err(),
+            "allocated file high-water space must not substitute for a live working set"
         );
         let no_misses = EngineStats {
             cache_misses: Some(0),

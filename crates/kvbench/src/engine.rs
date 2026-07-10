@@ -83,6 +83,9 @@ pub struct EngineStats {
     /// Cumulative bytes inserted into or loaded through the bounded cache.
     pub cache_insert_bytes: Option<u64>,
     pub storage_read_bytes: Option<u64>,
+    /// Bytes reachable from the engine's live logical structures, when the
+    /// engine can distinguish them from allocated file high-water space.
+    pub live_data_bytes: Option<u64>,
     pub persisted_data_bytes: Option<u64>,
     pub extra: HashMap<String, String>,
 }

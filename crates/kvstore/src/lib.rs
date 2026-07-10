@@ -146,14 +146,16 @@ impl KvStore {
 
         let root = store.user_meta_0();
         let height = store.user_meta_1() as u32;
+        let reachable_pages = store.user_meta_2();
         let tree = if root == 0 {
             let t = BTree::new(pool.clone(), opts.domain_id);
             store.set_user_meta_0(t.root_page_id());
             store.set_user_meta_1(0);
+            store.set_user_meta_2(t.reachable_page_count().unwrap());
             store.sync()?;
             t
         } else {
-            BTree::open(pool.clone(), root, height, opts.domain_id)
+            BTree::open_with_page_count(pool.clone(), root, height, reachable_pages, opts.domain_id)
         };
 
         Ok(Self {
@@ -218,6 +220,8 @@ impl KvStore {
         self.pool.flush()?;
         self.store.set_user_meta_0(self.tree.root_page_id());
         self.store.set_user_meta_1(self.tree.height() as u64);
+        self.store
+            .set_user_meta_2(self.tree.reachable_page_count().unwrap());
         self.store.set_checkpoint_lsn(checkpoint_lsn);
         self.store.sync()?;
         self.wal.reset()?;
@@ -257,6 +261,21 @@ impl KvStore {
     /// Number of allocated pages in the persistent page store.
     pub fn persisted_pages(&self) -> usize {
         self.pool.num_pages_on_disk()
+    }
+
+    /// Number of pages currently reachable from the B+tree root.
+    pub fn live_tree_pages(&self) -> usize {
+        self.tree.reachable_page_count().unwrap() as usize
+    }
+
+    pub fn buffer_pool_diagnostic_stats(
+        &self,
+    ) -> pagebox_storage::buffer_pool::BufferPoolDiagnosticStats {
+        self.pool.diagnostic_stats()
+    }
+
+    pub fn btree_diagnostic_stats(&self) -> pagebox_btree::BTreeDiagnosticStats {
+        self.tree.diagnostic_stats()
     }
 
     /// Whether the page-store data file is using direct I/O.

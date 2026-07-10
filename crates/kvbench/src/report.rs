@@ -12,7 +12,7 @@ use crate::stats::PhaseSummary;
 use crate::workload::WorkloadSpec;
 
 /// JSON report schema version.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// A complete benchmark report for one run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,6 +259,7 @@ struct SummaryRow<'a> {
     load_drain_ms: Option<f64>,
     cache_capacity_mib: Option<f64>,
     cache_used_mib: Option<f64>,
+    live_data_mib: Option<f64>,
     persisted_data_mib: Option<f64>,
     cache_hit_pct: Option<f64>,
     cache_misses: Option<f64>,
@@ -359,6 +360,13 @@ fn summarize_engine<'a>(engine: &'a str, reports: &[&Report]) -> SummaryRow<'a> 
             reports
                 .iter()
                 .filter_map(|report| report.engine_stats.cache_used_bytes)
+                .map(|bytes| bytes as f64 / 1_048_576.0)
+                .collect(),
+        ),
+        live_data_mib: median_some(
+            reports
+                .iter()
+                .filter_map(|report| report.engine_stats.live_data_bytes)
                 .map(|bytes| bytes as f64 / 1_048_576.0)
                 .collect(),
         ),
@@ -565,11 +573,12 @@ pub fn print_summary_table(reports: &[Report]) {
     println!();
     println!("Cache-pressure evidence (medians):");
     println!(
-        "{:w1$}  {:w2$}  {:>13}  {:>10}  {:>8}  {:>12}  {:>12}  {:>10}  {:>10}  {:>6}",
+        "{:w1$}  {:w2$}  {:>13}  {:>10}  {:>10}  {:>8}  {:>12}  {:>12}  {:>10}  {:>10}  {:>6}",
         "scenario",
         "engine",
         "used/cap MiB",
-        "data MiB",
+        "live MiB",
+        "file MiB",
         "hit %",
         "misses",
         "evictions",
@@ -586,6 +595,8 @@ pub fn print_summary_table(reports: &[Report]) {
                 + w_engine
                 + 2
                 + 13
+                + 2
+                + 10
                 + 2
                 + 10
                 + 2
@@ -631,10 +642,11 @@ pub fn print_summary_table(reports: &[Report]) {
                 .direct_io
                 .map_or("-", |enabled| if enabled { "yes" } else { "no" });
             println!(
-                "{:w1$}  {:w2$}  {:>13}  {:>10}  {:>8}  {:>12}  {:>12}  {:>10}  {:>10}  {:>6}",
+                "{:w1$}  {:w2$}  {:>13}  {:>10}  {:>10}  {:>8}  {:>12}  {:>12}  {:>10}  {:>10}  {:>6}",
                 label,
                 engine,
                 cache,
+                optional(row.live_data_mib),
                 optional(row.persisted_data_mib),
                 optional(row.cache_hit_pct),
                 count(row.cache_misses),

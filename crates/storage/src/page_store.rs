@@ -21,6 +21,7 @@
 //!   bytes 16..24:  checkpoint_lsn     (u64 LE) — LSN of last completed checkpoint
 //!   bytes 24..32:  user_meta_0        (u64 LE) — user meta slot 0 (0 = unset)
 //!   bytes 32..40:  user_meta_1        (u64 LE) — user meta slot 1 (0 = unset)
+//!   bytes 40..48:  user_meta_2        (u64 LE) — user meta slot 2 (0 = unset)
 //! ```
 //!
 //! The `user_meta_*` slots are how reopened trees find their root: the
@@ -28,8 +29,8 @@
 //! `user_meta_1` on close, and the same is read back on reopen via
 //! `validate_header`. The constants and helpers live in this module under
 //! `pub(crate)`; the public face is on [`FilePageStore`] itself
-//! (`checkpoint_lsn` / `set_checkpoint_lsn` / `user_meta_0` / `set_user_meta_0`
-//! / `user_meta_1` / `set_user_meta_1`).
+//! (`checkpoint_lsn` / `set_checkpoint_lsn` and the three `user_meta_*`
+//! getter/setter pairs).
 //!
 //! ## Direct I/O
 //!
@@ -347,6 +348,7 @@ impl RecoveryPageStore for InMemoryPageStore {
 //   bytes 16..24:  checkpoint_lsn     (u64 LE) — LSN of last completed checkpoint
 //   bytes 24..32:  user_meta_0        (u64 LE) — user meta slot 0 (0 = unset)
 //   bytes 32..40:  user_meta_1        (u64 LE) — user meta slot 1 (0 = unset)
+//   bytes 40..48:  user_meta_2        (u64 LE) — user meta slot 2 (0 = unset)
 
 pub(crate) const HEADER_MAGIC: u32 = 0x424F5854; // "BOXT"
 pub(crate) const HEADER_VERSION: u16 = 1;
@@ -356,12 +358,14 @@ pub(crate) const HEADER_PAGE_COUNT_OFF: usize = 8;
 pub(crate) const HEADER_CHECKPOINT_LSN_OFF: usize = 16;
 pub(crate) const HEADER_USER_META_0_OFF: usize = 24;
 pub(crate) const HEADER_USER_META_1_OFF: usize = 32;
+pub(crate) const HEADER_USER_META_2_OFF: usize = 40;
 
 pub(crate) fn build_header(
     page_count: u64,
     checkpoint_lsn: u64,
     user_meta_0: u64,
     user_meta_1: u64,
+    user_meta_2: u64,
 ) -> [u8; PAGE_SIZE] {
     let mut hdr = [0u8; PAGE_SIZE];
     hdr[HEADER_MAGIC_OFF..4].copy_from_slice(&HEADER_MAGIC.to_le_bytes());
@@ -370,10 +374,11 @@ pub(crate) fn build_header(
     hdr[HEADER_CHECKPOINT_LSN_OFF..24].copy_from_slice(&checkpoint_lsn.to_le_bytes());
     hdr[HEADER_USER_META_0_OFF..32].copy_from_slice(&user_meta_0.to_le_bytes());
     hdr[HEADER_USER_META_1_OFF..40].copy_from_slice(&user_meta_1.to_le_bytes());
+    hdr[HEADER_USER_META_2_OFF..48].copy_from_slice(&user_meta_2.to_le_bytes());
     hdr
 }
 
-pub(crate) fn validate_header(hdr: &[u8; PAGE_SIZE]) -> io::Result<(u64, u64, u64, u64)> {
+pub(crate) fn validate_header(hdr: &[u8; PAGE_SIZE]) -> io::Result<(u64, u64, u64, u64, u64)> {
     let magic = u32::from_le_bytes(hdr[HEADER_MAGIC_OFF..4].try_into().unwrap());
     let version = u16::from_le_bytes(hdr[HEADER_VERSION_OFF..6].try_into().unwrap());
     if magic != HEADER_MAGIC {
@@ -392,7 +397,8 @@ pub(crate) fn validate_header(hdr: &[u8; PAGE_SIZE]) -> io::Result<(u64, u64, u6
     let cl = u64::from_le_bytes(hdr[HEADER_CHECKPOINT_LSN_OFF..24].try_into().unwrap());
     let tm = u64::from_le_bytes(hdr[HEADER_USER_META_0_OFF..32].try_into().unwrap());
     let cp = u64::from_le_bytes(hdr[HEADER_USER_META_1_OFF..40].try_into().unwrap());
-    Ok((pc, cl, tm, cp))
+    let extra = u64::from_le_bytes(hdr[HEADER_USER_META_2_OFF..48].try_into().unwrap());
+    Ok((pc, cl, tm, cp, extra))
 }
 
 pub(crate) fn page_offset(pid: PageId) -> i64 {
@@ -481,6 +487,7 @@ pub struct FilePageStore {
     checkpoint_lsn: AtomicU64,
     user_meta_0: AtomicU64,
     user_meta_1: AtomicU64,
+    user_meta_2: AtomicU64,
     alloc_lock: Mutex<()>,
 }
 
@@ -510,7 +517,7 @@ impl FilePageStore {
             stat.st_size as u64
         };
 
-        let (page_count, checkpoint_lsn, user_meta_0, user_meta_1) =
+        let (page_count, checkpoint_lsn, user_meta_0, user_meta_1, user_meta_2) =
             if file_size >= PAGE_SIZE as u64 {
                 // Read and validate header page (aligned for O_DIRECT).
                 let mut hdr_buf = AlignedPage([0u8; PAGE_SIZE]);
@@ -523,13 +530,13 @@ impl FilePageStore {
                 })?
             } else {
                 // Fresh file — write initial header (aligned for O_DIRECT).
-                let hdr_data = Self::build_header(0, 0, 0, 0);
+                let hdr_data = Self::build_header(0, 0, 0, 0, 0);
                 let mut hdr = AlignedPage([0u8; PAGE_SIZE]);
                 hdr.0.copy_from_slice(&hdr_data);
                 pwrite_exact(fd, &hdr.0, 0).inspect_err(|_| {
                     unsafe { libc::close(fd) };
                 })?;
-                (0, 0, 0, 0)
+                (0, 0, 0, 0, 0)
             };
 
         Ok(FilePageStore {
@@ -539,6 +546,7 @@ impl FilePageStore {
             checkpoint_lsn: AtomicU64::new(checkpoint_lsn),
             user_meta_0: AtomicU64::new(user_meta_0),
             user_meta_1: AtomicU64::new(user_meta_1),
+            user_meta_2: AtomicU64::new(user_meta_2),
             alloc_lock: Mutex::new(()),
         })
     }
@@ -548,8 +556,15 @@ impl FilePageStore {
         checkpoint_lsn: u64,
         user_meta_0: u64,
         user_meta_1: u64,
+        user_meta_2: u64,
     ) -> [u8; PAGE_SIZE] {
-        build_header(page_count, checkpoint_lsn, user_meta_0, user_meta_1)
+        build_header(
+            page_count,
+            checkpoint_lsn,
+            user_meta_0,
+            user_meta_1,
+            user_meta_2,
+        )
     }
 
     pub fn crash(self) {
@@ -569,7 +584,8 @@ impl FilePageStore {
         let ckpt = self.checkpoint_lsn.load(Ordering::Relaxed);
         let tmeta = self.user_meta_0.load(Ordering::Relaxed);
         let cmeta = self.user_meta_1.load(Ordering::Relaxed);
-        let hdr_data = Self::build_header(count, ckpt, tmeta, cmeta);
+        let extra = self.user_meta_2.load(Ordering::Relaxed);
+        let hdr_data = Self::build_header(count, ckpt, tmeta, cmeta, extra);
         let mut hdr = AlignedPage([0u8; PAGE_SIZE]);
         hdr.0.copy_from_slice(&hdr_data);
         pwrite_exact(self.fd, &hdr.0, 0)
@@ -603,6 +619,14 @@ impl FilePageStore {
     /// Set the catalog page ID.
     pub fn set_user_meta_1(&self, pid: u64) {
         self.user_meta_1.store(pid, Ordering::Relaxed);
+    }
+
+    pub fn user_meta_2(&self) -> u64 {
+        self.user_meta_2.load(Ordering::Relaxed)
+    }
+
+    pub fn set_user_meta_2(&self, value: u64) {
+        self.user_meta_2.store(value, Ordering::Relaxed);
     }
 }
 
@@ -838,6 +862,7 @@ mod tests {
             data[0] = 7;
             data[PAGE_SIZE - 1] = 9;
             PageStore::write_page(&store, pid, &data).unwrap();
+            store.set_user_meta_2(37);
             PageStore::sync(&store).unwrap();
 
             assert_eq!(
@@ -861,6 +886,11 @@ mod tests {
                 "page should be readable after reopen"
             );
             assert_eq!(buf[0], 7, "first byte should roundtrip");
+            assert_eq!(
+                store.user_meta_2(),
+                37,
+                "third user-meta slot should roundtrip"
+            );
             assert_eq!(
                 buf[PAGE_SIZE - 1],
                 9,
