@@ -4,10 +4,16 @@ distribution = { kind = "zipfian", params = { theta = 0.99 } }
 record_count = 50000
 value_size = 100
 operation_count = 100000
+minimum_duration_secs = 3
 seed = 42
 threads = 4
 
+[comparison]
+id = "p1-kvstore-resident-mixed"
+engines = ["kvstore"]
+memory_regime = "resident"
+operation_contract = "visible_point_mutation"
+
 [engine_opts]
-value_size = 100
 sync_mode = "relaxed"
-buffer_budget_frames = 8192
+cache_budget_bytes = 67108864

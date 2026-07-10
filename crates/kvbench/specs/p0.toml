@@ -4,10 +4,16 @@ distribution = { kind = "uniform" }
 record_count = 10000
 value_size = 100
 operation_count = 50000
+minimum_duration_secs = 2
 seed = 42
 threads = 1
 
+[comparison]
+id = "p0-kvstore-resident-read"
+engines = ["kvstore"]
+memory_regime = "resident"
+operation_contract = "point_read"
+
 [engine_opts]
-value_size = 100
 sync_mode = "relaxed"
-buffer_budget_frames = 1024
+cache_budget_bytes = 67108864

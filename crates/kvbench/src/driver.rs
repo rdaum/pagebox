@@ -18,9 +18,14 @@ use crate::workload::{WorkloadOp, scan_end_key};
 ///
 /// The `ops` slice is partitioned across `threads` worker threads; each
 /// worker atomically claims the next op index and executes it.
-pub fn run_phase<E: KvEngine + Sync>(engine: &E, ops: &[WorkloadOp], threads: usize) -> PhaseStats {
+pub fn run_phase<E: KvEngine + Sync>(
+    engine: &E,
+    ops: &[WorkloadOp],
+    threads: usize,
+    minimum_duration: Duration,
+) -> PhaseStats {
     let shadow = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    run_phase_inner(engine, ops, threads, false, &shadow)
+    run_phase_inner(engine, ops, threads, minimum_duration, false, &shadow)
 }
 
 /// Run a phase with verification against a shadow HashMap.
@@ -33,25 +38,29 @@ pub fn run_phase_verify<E: KvEngine + Sync>(
     engine: &E,
     ops: &[WorkloadOp],
     threads: usize,
+    minimum_duration: Duration,
     shadow: &Arc<std::sync::Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
 ) -> PhaseStats {
-    run_phase_inner(engine, ops, threads, true, shadow)
+    run_phase_inner(engine, ops, threads, minimum_duration, true, shadow)
 }
 
 fn run_phase_inner<E: KvEngine + Sync>(
     engine: &E,
     ops: &[WorkloadOp],
     threads: usize,
+    minimum_duration: Duration,
     verify: bool,
     shadow: &Arc<std::sync::Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
 ) -> PhaseStats {
     let threads = threads.max(1);
     let next_idx = Arc::new(AtomicU64::new(0));
     let total = ops.len() as u64;
+    assert!(total > 0, "benchmark phase requires at least one operation");
 
     let errors = Arc::new(AtomicU64::new(0));
 
     let start = Instant::now();
+    let deadline = start + minimum_duration;
     let mut combined = PhaseStats::new();
 
     std::thread::scope(|s| {
@@ -62,12 +71,23 @@ fn run_phase_inner<E: KvEngine + Sync>(
             let errors = Arc::clone(&errors);
             handles.push(s.spawn(move || {
                 let mut local = PhaseStats::new();
+                let mut deadline_check_countdown = 0_u16;
                 loop {
                     let idx = next_idx.fetch_add(1, Ordering::Relaxed);
                     if idx >= total {
-                        break;
+                        if minimum_duration.is_zero() {
+                            break;
+                        }
+                        if deadline_check_countdown == 0 {
+                            if Instant::now() >= deadline {
+                                break;
+                            }
+                            deadline_check_countdown = 255;
+                        } else {
+                            deadline_check_countdown -= 1;
+                        }
                     }
-                    let op = &ops[idx as usize];
+                    let op = &ops[(idx % total) as usize];
                     let op_start = Instant::now();
                     let kind = execute_op(engine, op, verify, &shadow, &errors, idx);
                     let elapsed = op_start.elapsed().as_nanos() as u64;
@@ -130,7 +150,7 @@ fn execute_op<E: KvEngine>(
             OpKind::Get
         }
         WorkloadOp::Del { key } => {
-            let _ = engine.del(key);
+            engine.del(key);
             if verify {
                 shadow.lock().unwrap().remove(key);
             }
@@ -198,7 +218,7 @@ pub fn time_single_op<E: KvEngine>(engine: &E, op: &WorkloadOp) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::EngineOpts;
+    use crate::engine::{CacheControl, EngineOpts};
     use std::collections::BTreeMap;
     use std::path::Path;
 
@@ -218,24 +238,23 @@ mod tests {
 
     impl KvEngine for MockEngine {
         const NAME: &'static str = "mock";
+        const CACHE_CONTROL: CacheControl = CacheControl::Application;
 
         fn open(_dir: &Path, _opts: &EngineOpts) -> std::io::Result<Self> {
             Ok(Self::new())
         }
 
-        fn put(&self, key: &[u8], value: &[u8]) -> bool {
+        fn put(&self, key: &[u8], value: &[u8]) {
             let mut data = self.data.lock().unwrap();
-            let inserted = !data.contains_key(key);
             data.insert(key.to_vec(), value.to_vec());
-            inserted
         }
 
         fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
             self.data.lock().unwrap().get(key).cloned()
         }
 
-        fn del(&self, key: &[u8]) -> bool {
-            self.data.lock().unwrap().remove(key).is_some()
+        fn del(&self, key: &[u8]) {
+            self.data.lock().unwrap().remove(key);
         }
 
         fn scan_range(&self, start: &[u8], end: &[u8], f: &mut dyn FnMut(&[u8], &[u8])) {
@@ -262,11 +281,11 @@ mod tests {
     #[test]
     fn mock_engine_adapter_contract() {
         let engine = MockEngine::new();
-        assert!(engine.put(b"A", b"val_a"));
-        assert!(!engine.put(b"A", b"val_a2"));
-        assert!(engine.put(b"B", b"val_b"));
+        engine.put(b"A", b"val_a");
+        engine.put(b"A", b"val_a2");
+        engine.put(b"B", b"val_b");
         assert_eq!(engine.get(b"A"), Some(b"val_a2".to_vec()));
-        assert!(engine.del(b"A"));
+        engine.del(b"A");
         assert_eq!(engine.get(b"A"), None);
 
         let mut results = Vec::new();
@@ -295,7 +314,7 @@ mod tests {
                 key: b"k3".to_vec(),
             },
         ];
-        let stats = run_phase(&engine, &ops, 2);
+        let stats = run_phase(&engine, &ops, 2, Duration::ZERO);
         assert_eq!(stats.operations, 4);
         assert_eq!(stats.puts, 2);
         assert_eq!(stats.gets, 2);
@@ -314,7 +333,7 @@ mod tests {
                 key: b"k1".to_vec(),
             },
         ];
-        let stats = run_phase(&engine, &ops, 1);
+        let stats = run_phase(&engine, &ops, 1, Duration::ZERO);
         assert_eq!(stats.operations, 2);
         assert!((stats.ops_per_sec() - 2.0 / stats.duration.as_secs_f64()).abs() < 1.0);
     }
@@ -329,7 +348,7 @@ mod tests {
             start: b"k1".to_vec(),
             count: 2,
         }];
-        let stats = run_phase(&engine, &ops, 1);
+        let stats = run_phase(&engine, &ops, 1, Duration::ZERO);
         assert_eq!(stats.scans, 1);
     }
 
@@ -341,8 +360,22 @@ mod tests {
             key: b"k1".to_vec(),
             value: b"v2".to_vec(),
         }];
-        let stats = run_phase(&engine, &ops, 1);
+        let stats = run_phase(&engine, &ops, 1, Duration::ZERO);
         assert_eq!(stats.rmws, 1);
         assert_eq!(engine.get(b"k1"), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn minimum_duration_repeats_the_trace() {
+        let engine = MockEngine::new();
+        let ops = vec![WorkloadOp::Get {
+            key: b"missing".to_vec(),
+        }];
+        let stats = run_phase(&engine, &ops, 2, Duration::from_millis(5));
+        assert!(
+            stats.operations > 1,
+            "duration-bound phase should repeat its operation trace"
+        );
+        assert!(stats.duration >= Duration::from_millis(5));
     }
 }

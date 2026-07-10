@@ -4,101 +4,33 @@
 //! `SyncMode::Strict` maps to `Durability::Immediate`; relaxed maps to
 //! `Durability::None`.
 //!
-//! ## Write batching
-//!
-//! Like LMDB, redb is a single-writer B+tree that commits per transaction:
-//! each `commit()` writes the COW dirty set for that transaction. A
-//! one-transaction-per-`put` adapter pays the full dirty-path cost on every
-//! op — p99.9 latency of 22+ ms on fillrandom is commit stall, not engine
-//! throughput. redb is also single-writer, so concurrent `put`s serialize on
-//! the writer lock regardless.
-//!
-//! We buffer pending writes in a shared [`Mutex`]`<`[`Batch`]`>` and flush
-//! them as one write transaction when [`BATCH_FLUSH_THRESHOLD`] distinct keys
-//! accumulate, on `sync`, and on drop. Reads (`get`) do **not** flush;
-//! instead they overlay the pending map on the committed snapshot via a
-//! re-check protocol, so a write that lands between the pending lookup and
-//! the committed read is still observed. This keeps read-heavy mixed
-//! workloads fast (no commit-per-read) while staying correct under
-//! `--verify`: a get always returns the newest pending-or-committed value.
-//!
-//! `del` and `scan_range` do flush first — deletes need an accurate
-//! presence check and scans need a consistent ordered snapshot, which the
-//! overlay can't provide cheaply. Both are rare in the benchmark suite.
+//! Each measured mutation is one transaction. The adapter does not acknowledge
+//! an operation into an unmeasured batch.
 //!
 //! ## Memory budget equity
 //!
 //! redb's default cache is 1 GiB. This adapter sets the cache to match
-//! kvstore's buffer-pool byte budget (`buffer_budget_frames * PAGE_SIZE`)
+//! kvstore's configured application-cache byte budget
 //! unless overridden via `engine_specific["cache_size_bytes"]`.
 
-use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
 
-use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, Durability, ReadableDatabase, TableDefinition};
 
-use crate::engine::{EngineOpts, EngineStats, KvEngine, SyncMode};
-
-/// Page size used by the pagebox substrate (64 KiB).
-const PAGE_SIZE: usize = 65536;
+use crate::engine::{CacheControl, EngineOpts, EngineStats, KvEngine, SyncMode};
 
 /// redb table definition: `&[u8]` keys, `&[u8]` values.
 const TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("kv");
-
-/// Flush once this many distinct keys are pending.
-const BATCH_FLUSH_THRESHOLD: usize = 4096;
 
 /// Adapter wrapping `redb::Database`.
 pub struct RedbAdapter {
     db: Database,
     sync_mode: SyncMode,
-    batch: Mutex<Batch>,
-}
-
-/// Pending writes awaiting the next commit.
-struct Batch {
-    puts: HashMap<Vec<u8>, Vec<u8>>,
-}
-
-impl Batch {
-    fn new() -> Self {
-        Self {
-            puts: HashMap::new(),
-        }
-    }
+    path: std::path::PathBuf,
+    cache_budget_bytes: usize,
 }
 
 impl RedbAdapter {
-    fn flush_locked(&self, mut guard: std::sync::MutexGuard<'_, Batch>) {
-        if guard.puts.is_empty() {
-            return;
-        }
-        let puts = std::mem::take(&mut guard.puts);
-        drop(guard);
-
-        let mut txn = self.db.begin_write().expect("redb begin_write failed");
-        {
-            let mut table = txn.open_table(TABLE).expect("redb open_table failed");
-            for (k, v) in &puts {
-                table
-                    .insert(k.as_slice(), v.as_slice())
-                    .expect("redb insert failed");
-            }
-        }
-        let _ = txn.set_durability(self.durability());
-        txn.commit().expect("redb commit failed");
-    }
-
-    fn flush(&self) {
-        let guard = self.batch.lock().unwrap();
-        self.flush_locked(guard);
-    }
-
-    fn pending_get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.batch.lock().unwrap().puts.get(key).cloned()
-    }
-
     fn read_committed(&self, key: &[u8]) -> Option<Vec<u8>> {
         let txn = self.db.begin_read().ok()?;
         let table = txn.open_table(TABLE).ok()?;
@@ -120,16 +52,16 @@ impl RedbAdapter {
 
 impl KvEngine for RedbAdapter {
     const NAME: &'static str = "redb";
+    const CACHE_CONTROL: CacheControl = CacheControl::Application;
 
     fn open(dir: &Path, opts: &EngineOpts) -> std::io::Result<Self> {
         let path = dir.join("redb.data");
 
-        let default_cache_bytes = opts.buffer_budget_frames * PAGE_SIZE;
         let cache_bytes = opts
             .engine_specific
             .get("cache_size_bytes")
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(default_cache_bytes);
+            .unwrap_or(opts.cache_budget_bytes);
 
         let db = Database::builder()
             .set_cache_size(cache_bytes)
@@ -146,47 +78,36 @@ impl KvEngine for RedbAdapter {
         Ok(Self {
             db,
             sync_mode: opts.sync_mode,
-            batch: Mutex::new(Batch::new()),
+            path,
+            cache_budget_bytes: cache_bytes,
         })
     }
 
-    fn put(&self, key: &[u8], value: &[u8]) -> bool {
-        let mut guard = self.batch.lock().unwrap();
-        guard.puts.insert(key.to_vec(), value.to_vec());
-        let need_flush = guard.puts.len() >= BATCH_FLUSH_THRESHOLD;
-        if need_flush {
-            self.flush_locked(guard);
+    fn put(&self, key: &[u8], value: &[u8]) {
+        let mut txn = self.db.begin_write().expect("redb begin_write failed");
+        {
+            let mut table = txn.open_table(TABLE).expect("redb open_table failed");
+            table.insert(key, value).expect("redb insert failed");
         }
-        true
+        let _ = txn.set_durability(self.durability());
+        txn.commit().expect("redb commit failed");
     }
 
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        if let Some(v) = self.pending_get(key) {
-            return Some(v);
-        }
-        let committed = self.read_committed(key);
-        if let Some(v) = self.pending_get(key) {
-            return Some(v);
-        }
-        committed
+        self.read_committed(key)
     }
 
-    fn del(&self, key: &[u8]) -> bool {
-        self.flush();
+    fn del(&self, key: &[u8]) {
         let mut txn = self.db.begin_write().map_err(map_redb_err).unwrap();
-        let was_present;
         {
             let mut table = txn.open_table(TABLE).map_err(map_redb_err).unwrap();
-            was_present = table.get(key).map_err(map_redb_err).unwrap().is_some();
             let _ = table.remove(key);
         }
         let _ = txn.set_durability(self.durability());
         txn.commit().map_err(map_redb_err).unwrap();
-        was_present
     }
 
     fn scan_range(&self, start: &[u8], end: &[u8], f: &mut dyn FnMut(&[u8], &[u8])) {
-        self.flush();
         let Ok(txn) = self.db.begin_read() else {
             return;
         };
@@ -205,7 +126,6 @@ impl KvEngine for RedbAdapter {
     }
 
     fn sync(&self) -> std::io::Result<()> {
-        self.flush();
         let mut txn = self.db.begin_write().map_err(map_redb_err)?;
         let _ = txn.set_durability(Durability::Immediate);
         txn.commit().map_err(map_redb_err)?;
@@ -213,16 +133,17 @@ impl KvEngine for RedbAdapter {
     }
 
     fn stats(&self) -> EngineStats {
-        EngineStats::default()
-    }
-}
-
-impl Drop for RedbAdapter {
-    fn drop(&mut self) {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let guard = self.batch.lock().unwrap();
-            self.flush_locked(guard);
-        }));
+        let stats = self.db.cache_stats();
+        EngineStats {
+            direct_io: Some(false),
+            cache_capacity_bytes: Some(self.cache_budget_bytes as u64),
+            cache_used_bytes: Some(stats.used_bytes() as u64),
+            cache_hits: Some(stats.read_hits() + stats.write_hits()),
+            cache_misses: Some(stats.read_misses() + stats.write_misses()),
+            cache_evictions: Some(stats.evictions()),
+            persisted_data_bytes: std::fs::metadata(&self.path).ok().map(|meta| meta.len()),
+            ..EngineStats::default()
+        }
     }
 }
 
@@ -237,9 +158,10 @@ mod tests {
 
     fn test_opts() -> EngineOpts {
         EngineOpts {
-            value_size: 100,
             sync_mode: SyncMode::Relaxed,
-            buffer_budget_frames: 1024,
+            cache_budget_bytes: 64 * 1024 * 1024,
+            direct_io: false,
+            wal_backend: None,
             engine_specific: Default::default(),
         }
     }
@@ -249,13 +171,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let engine = RedbAdapter::open(dir.path(), &test_opts()).unwrap();
 
-        // Batched puts: `was_absent` return is not tracked. Verify
-        // correctness through get/del/scan instead.
         engine.put(b"A", b"val_a");
         engine.put(b"A", b"val_a2");
         engine.put(b"B", b"val_b");
         assert_eq!(engine.get(b"A"), Some(b"val_a2".to_vec()));
-        assert!(engine.del(b"A"));
+        engine.del(b"A");
         assert_eq!(engine.get(b"A"), None);
 
         let mut results = Vec::new();

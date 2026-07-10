@@ -4,16 +4,28 @@ use std::path::Path;
 
 use kvstore::{KvStore, KvStoreOptions, SyncMode as KvSyncMode, TreeBackend};
 
-use crate::engine::{EngineOpts, EngineStats, KvEngine, SyncMode};
+use crate::engine::{CacheControl, EngineOpts, EngineStats, KvEngine, SyncMode};
+
+const PAGE_SIZE: usize = 65_536;
 
 pub struct KvstoreAdapter {
     inner: KvStore,
+    sync_mode: SyncMode,
 }
 
 impl KvEngine for KvstoreAdapter {
     const NAME: &'static str = "kvstore";
+    const CACHE_CONTROL: CacheControl = CacheControl::Application;
+    const SUPPORTS_DIRECT_IO: bool = true;
 
     fn open(dir: &Path, opts: &EngineOpts) -> std::io::Result<Self> {
+        // SAFETY: kvbench runs one engine per process.
+        unsafe {
+            std::env::set_var(
+                "PAGEBOX_PAGE_STORE_DIRECT_IO",
+                if opts.direct_io { "1" } else { "0" },
+            )
+        };
         // The WAL backend is selected via env var (read by Wal::open_opts).
         // Set it before opening so the spec / CLI override takes effect.
         if let Some(ref backend) = opts.wal_backend {
@@ -25,27 +37,49 @@ impl KvEngine for KvstoreAdapter {
 
         let _ = opts.engine_specific.get("tree_backend");
         let tree_backend = TreeBackend::BPlusTree;
+        if !opts.cache_budget_bytes.is_multiple_of(PAGE_SIZE) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "kvstore cache budget {} must be a multiple of its {}-byte page size",
+                    opts.cache_budget_bytes, PAGE_SIZE
+                ),
+            ));
+        }
+        let pool_frames = opts.cache_budget_bytes / PAGE_SIZE;
+        if pool_frames == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "kvstore cache budget must hold at least one page",
+            ));
+        }
         let kv_opts = KvStoreOptions::default()
-            .pool_frames(opts.buffer_budget_frames)
+            .pool_frames(pool_frames)
             .sync_mode(match opts.sync_mode {
                 SyncMode::Relaxed => KvSyncMode::Relaxed,
                 SyncMode::Strict => KvSyncMode::Strict,
             })
             .tree_backend(tree_backend);
         let inner = KvStore::open_with(dir, &kv_opts)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            sync_mode: opts.sync_mode,
+        })
     }
 
-    fn put(&self, key: &[u8], value: &[u8]) -> bool {
-        self.inner.put(key, value)
+    fn put(&self, key: &[u8], value: &[u8]) {
+        let _ = self.inner.put(key, value);
     }
 
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.inner.get(key)
     }
 
-    fn del(&self, key: &[u8]) -> bool {
-        self.inner.del(key)
+    fn del(&self, key: &[u8]) {
+        let _ = self.inner.del(key);
+        if self.sync_mode == SyncMode::Strict {
+            self.inner.flush_wal();
+        }
     }
 
     fn scan_range(&self, start: &[u8], end: &[u8], f: &mut dyn FnMut(&[u8], &[u8])) {
@@ -53,7 +87,12 @@ impl KvEngine for KvstoreAdapter {
     }
 
     fn sync(&self) -> std::io::Result<()> {
-        self.inner.sync()
+        self.inner.flush_wal();
+        Ok(())
+    }
+
+    fn prepare_for_reopen(&self) -> std::io::Result<()> {
+        self.inner.checkpoint()
     }
 
     fn stats(&self) -> EngineStats {
@@ -61,7 +100,18 @@ impl KvEngine for KvstoreAdapter {
         if let Ok(backend) = std::env::var("PAGEBOX_WAL_SYNC_BACKEND") {
             extra.insert("wal_backend".to_string(), backend);
         }
-        EngineStats { extra }
+        let cache_misses = self.inner.cache_misses();
+        EngineStats {
+            direct_io: Some(self.inner.direct_io_enabled()),
+            cache_capacity_bytes: Some((self.inner.cache_capacity_pages() * PAGE_SIZE) as u64),
+            cache_used_bytes: Some((self.inner.cache_used_pages() * PAGE_SIZE) as u64),
+            cache_misses: Some(cache_misses),
+            cache_evictions: Some(self.inner.cache_evictions()),
+            cache_insert_bytes: Some(cache_misses.saturating_mul(PAGE_SIZE as u64)),
+            persisted_data_bytes: Some((self.inner.persisted_pages() * PAGE_SIZE) as u64),
+            extra,
+            ..EngineStats::default()
+        }
     }
 }
 
@@ -72,9 +122,9 @@ mod tests {
 
     fn test_opts() -> EngineOpts {
         EngineOpts {
-            value_size: 100,
             sync_mode: SyncMode::Relaxed,
-            buffer_budget_frames: 1024,
+            cache_budget_bytes: 64 * 1024 * 1024,
+            direct_io: false,
             wal_backend: None,
             engine_specific: Default::default(),
         }
@@ -85,11 +135,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let engine = KvstoreAdapter::open(dir.path(), &test_opts()).unwrap();
 
-        assert!(engine.put(b"A", b"val_a"));
-        assert!(!engine.put(b"A", b"val_a2"));
-        assert!(engine.put(b"B", b"val_b"));
+        engine.put(b"A", b"val_a");
+        engine.put(b"A", b"val_a2");
+        engine.put(b"B", b"val_b");
         assert_eq!(engine.get(b"A"), Some(b"val_a2".to_vec()));
-        assert!(engine.del(b"A"));
+        engine.del(b"A");
         assert_eq!(engine.get(b"A"), None);
 
         let mut results = Vec::new();
@@ -107,7 +157,7 @@ mod tests {
             ..test_opts()
         };
         let engine = KvstoreAdapter::open(dir.path(), &opts).unwrap();
-        assert!(engine.put(b"k1", b"v1"));
+        engine.put(b"k1", b"v1");
         // Strict mode should have flushed the WAL; reopen and verify.
         drop(engine);
         let engine2 = KvstoreAdapter::open(dir.path(), &test_opts()).unwrap();

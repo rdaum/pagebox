@@ -486,6 +486,11 @@ pub struct FilePageStore {
 
 #[cfg(not(miri))]
 impl FilePageStore {
+    /// Whether this store successfully opened its data file with `O_DIRECT`.
+    pub fn direct_io_enabled(&self) -> bool {
+        self.direct_io
+    }
+
     /// Create or open a page store file at `path`.
     ///
     /// Uses buffered I/O by default. Set `PAGEBOX_PAGE_STORE_DIRECT_IO=1`

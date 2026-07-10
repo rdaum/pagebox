@@ -1,15 +1,20 @@
 # Overwrite: in-place update churn, no growth.
-# 50k records × ~108 bytes = ~5.4 MB dataset, 4096 frames × 4K = 16 MB budget.
-# Dataset fits — measures pure update throughput and dirty page handling.
+# The 64 MiB application-cache budget comfortably contains the data set.
 workload = "overwrite"
 distribution = { kind = "uniform" }
 record_count = 50000
 value_size = 100
 operation_count = 200000
+minimum_duration_secs = 3
 seed = 42
 threads = 4
 
+[comparison]
+id = "resident-overwrite"
+engines = ["kvstore", "fjall", "redb", "rocksdb", "lmdb"]
+memory_regime = "resident"
+operation_contract = "visible_point_mutation"
+
 [engine_opts]
-value_size = 100
 sync_mode = "relaxed"
-buffer_budget_frames = 4096
+cache_budget_bytes = 67108864

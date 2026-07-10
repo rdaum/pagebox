@@ -4904,6 +4904,25 @@ impl BufferPool {
             .get(BufferPoolEvictionEvent::Evictions) as u64
     }
 
+    /// Number of pages synchronously loaded into the pool since it opened.
+    pub fn page_load_count(&self) -> u64 {
+        const KINDS: [BufferPoolLoadedPageKind; 6] = [
+            BufferPoolLoadedPageKind::InnerIndex,
+            BufferPoolLoadedPageKind::LeafIndex,
+            BufferPoolLoadedPageKind::Tuple,
+            BufferPoolLoadedPageKind::Delta,
+            BufferPoolLoadedPageKind::ResidentMeta,
+            BufferPoolLoadedPageKind::Unknown,
+        ];
+        KINDS
+            .into_iter()
+            .map(|kind| {
+                (self.metrics.fix_swip_sync_load_pages.get(kind)
+                    + self.metrics.fix_orphan_sync_load_pages.get(kind)) as u64
+            })
+            .sum()
+    }
+
     /// Write back all dirty resident pages to the page store and sync.
     ///
     /// For each dirty page, ensures its WAL record is durable before

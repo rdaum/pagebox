@@ -1,15 +1,17 @@
-# FillRandom: insert every key exactly once in deterministic shuffled order.
-# The 64 MiB application-cache budget comfortably contains the data set.
-workload = "fill_random"
+# Resident YCSB-A: 50% uniform point reads and 50% point updates over 50k
+# records. The 64 MiB application-cache budget comfortably contains the data
+# set. Every update is visible when its measured call returns.
+workload = "ycsb_a"
 distribution = { kind = "uniform" }
 record_count = 50000
 value_size = 100
-operation_count = 50000
+operation_count = 200000
+minimum_duration_secs = 3
 seed = 42
 threads = 4
 
 [comparison]
-id = "resident-fillrandom"
+id = "resident-ycsb-a"
 engines = ["kvstore", "fjall", "redb", "rocksdb", "lmdb"]
 memory_regime = "resident"
 operation_contract = "visible_point_mutation"

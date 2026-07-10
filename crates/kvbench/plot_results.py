@@ -5,6 +5,7 @@ import json
 import os
 import glob
 import sys
+import statistics
 
 try:
     import matplotlib
@@ -14,7 +15,7 @@ except ImportError:
     print("matplotlib not found. Install with: pip install matplotlib")
     sys.exit(1)
 
-RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "bench-results")
+RESULTS_DIR = os.path.join(os.path.dirname(__file__), "bench-results")
 OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 ENGINES = ["kvstore", "lmdb", "redb", "fjall", "rocksdb"]
@@ -34,10 +35,10 @@ ENGINE_MARKERS = {
 }
 THREAD_COUNTS = [2, 4, 8, 16]
 SCENARIOS = [
-    "ycsb_c_evicting",
-    "ycsb_c_small",
-    "ycsb_a_oversize",
-    "ycsb_a_evicting",
+    "cache_pressure_ycsb_c",
+    "resident_ycsb_c_small",
+    "resident_ycsb_a",
+    "cache_pressure_ycsb_a",
     "overwrite",
     "fillrandom",
 ]
@@ -45,21 +46,49 @@ SCENARIOS = [
 
 def load_data():
     data = {}
+    cohorts = {}
+    sources = set()
     for f in sorted(glob.glob(os.path.join(RESULTS_DIR, "*.json"))):
         basename = os.path.basename(f).removesuffix(".json")
         parts = basename.split("_")
         engine = parts[0]
-        threads = int(parts[-1].removesuffix("t"))
-        scenario = "_".join(parts[1:-1])
+        has_iteration = parts[-1].startswith("r")
+        thread_part = parts[-2] if has_iteration else parts[-1]
+        threads = int(thread_part.removesuffix("t"))
+        scenario_end = -2 if has_iteration else -1
+        scenario = "_".join(parts[1:scenario_end])
         with open(f) as fh:
             d = json.load(fh)
+        if d.get("schema") != 3:
+            raise RuntimeError(f"unsupported report schema in {f}")
         run = d.get("run_phase", {})
         ops_per_sec = run.get("ops_per_sec", 0)
+        source = (d.get("git_commit", "unknown"), d.get("binary_hash", "unknown"))
+        sources.add(source)
         key = (scenario, threads)
+        expected = tuple(d.get("comparison", {}).get("engines", []))
+        if key in cohorts and cohorts[key] != expected:
+            raise RuntimeError(f"conflicting cohorts for {scenario} at {threads} threads")
+        cohorts[key] = expected
         if key not in data:
             data[key] = {}
-        data[key][engine] = ops_per_sec
-    return data
+        data[key].setdefault(engine, []).append(ops_per_sec)
+    if len(sources) > 1:
+        raise RuntimeError("bench-results mixes executable builds; start with a clean result set")
+
+    for key in list(data):
+        expected = set(cohorts[key])
+        counts = [len(data[key].get(engine, [])) for engine in expected]
+        if set(data[key]) != expected or len(set(counts)) != 1:
+            del data[key]
+
+    source_label = "no reports"
+    if sources:
+        commit, binary_hash = next(iter(sources))
+        source_label = f"{commit}/{binary_hash[:8]}"
+    if not data:
+        raise RuntimeError("no complete, balanced comparison")
+    return data, source_label
 
 
 def plot_scenario(ax, data, scenario, title):
@@ -67,10 +96,10 @@ def plot_scenario(ax, data, scenario, title):
         x = []
         y = []
         for t in THREAD_COUNTS:
-            v = data.get((scenario, t), {}).get(engine)
-            if v is not None:
+            samples = data.get((scenario, t), {}).get(engine)
+            if samples:
                 x.append(t)
-                y.append(v / 1e6)
+                y.append(statistics.median(samples) / 1e6)
         if x:
             line, = ax.plot(
                 x, y,
@@ -89,13 +118,15 @@ def plot_scenario(ax, data, scenario, title):
 
 
 def main():
-    data = load_data()
+    data, source_label = load_data()
 
     titles = {
-        "ycsb_c_evicting": "YCSB-C Read (200K records, 32MB pool)",
-        "ycsb_c_small": "YCSB-C Read (10K records, in-memory)",
-        "ycsb_a_oversize": "YCSB-A Mixed R/W (50K records, 16MB pool)",
-        "ycsb_a_evicting": "YCSB-A Mixed R/W (200K records, 32MB pool)",
+        "cache_pressure_ycsb_c": "YCSB-C (65K x 2 KiB, 64 MiB app cache)",
+        "direct_io_cache_pressure_ycsb_c": "YCSB-C direct I/O (65K x 2 KiB, 64 MiB app cache)",
+        "resident_ycsb_c_small": "YCSB-C (10K records, resident)",
+        "resident_ycsb_a": "YCSB-A (50K records, resident)",
+        "cache_pressure_ycsb_a": "YCSB-A (65K x 2 KiB, 64 MiB app cache)",
+        "direct_io_cache_pressure_ycsb_a": "YCSB-A direct I/O (65K x 2 KiB, 64 MiB app cache)",
         "overwrite": "Overwrite (50K records, in-place update)",
         "fillrandom": "FillRandom (50K records, bulk insert)",
     }
@@ -107,8 +138,8 @@ def main():
         plot_scenario(axes[i], data, scenario, titles.get(scenario, scenario))
 
     fig.suptitle(
-        "Pagebox kvstore vs competitors — ops/sec by thread count\n"
-        "(uniform distribution, relaxed sync, commit aed7077)",
+        "Pagebox kvstore comparison — median point-operation throughput\n"
+        f"(relaxed sync; application-cache pressure does not control OS cache; {source_label})",
         fontsize=14,
         fontweight="bold",
         y=1.02,

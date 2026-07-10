@@ -1,0 +1,22 @@
+# Direct-I/O cache-pressure YCSB-C. This uses the same persisted working set
+# and application-cache budget as cache_pressure_ycsb_c, but data-file reads
+# bypass the OS page cache. Only Pagebox and RocksDB expose that mode.
+workload = "ycsb_c"
+distribution = { kind = "uniform" }
+record_count = 65536
+value_size = 2048
+operation_count = 200000
+minimum_duration_secs = 3
+seed = 42
+threads = 4
+
+[comparison]
+id = "direct-io-cache-pressure-ycsb-c"
+engines = ["kvstore", "rocksdb"]
+memory_regime = "direct_io_application_cache"
+operation_contract = "point_read"
+
+[engine_opts]
+sync_mode = "relaxed"
+cache_budget_bytes = 67108864
+direct_io = true

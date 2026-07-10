@@ -1,0 +1,21 @@
+# Resident YCSB-C: 100% uniform point reads over 10k records.
+# The 64 MiB application-cache budget comfortably contains the data set for
+# every engine. LMDB participates because no cache-pressure claim is made.
+workload = "ycsb_c"
+distribution = { kind = "uniform" }
+record_count = 10000
+value_size = 100
+operation_count = 100000
+minimum_duration_secs = 2
+seed = 42
+threads = 4
+
+[comparison]
+id = "resident-ycsb-c-small"
+engines = ["kvstore", "fjall", "redb", "rocksdb", "lmdb"]
+memory_regime = "resident"
+operation_contract = "point_read"
+
+[engine_opts]
+sync_mode = "relaxed"
+cache_budget_bytes = 67108864

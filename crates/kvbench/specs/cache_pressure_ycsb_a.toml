@@ -1,0 +1,23 @@
+# Application-cache-pressure YCSB-A: 50% uniform point reads and 50% point
+# updates over roughly 128 MiB of deterministic high-entropy values
+# with a 64 MiB engine-managed cache budget. The load is flushed and the engine
+# reopened before timing. The run must prove misses and cache turnover; the OS
+# page cache remains uncontrolled here.
+workload = "ycsb_a"
+distribution = { kind = "uniform" }
+record_count = 65536
+value_size = 2048
+operation_count = 200000
+minimum_duration_secs = 3
+seed = 42
+threads = 4
+
+[comparison]
+id = "application-cache-pressure-ycsb-a"
+engines = ["kvstore", "fjall", "redb", "rocksdb"]
+memory_regime = "application_cache"
+operation_contract = "visible_point_mutation"
+
+[engine_opts]
+sync_mode = "relaxed"
+cache_budget_bytes = 67108864

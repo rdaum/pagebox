@@ -1,0 +1,22 @@
+# Direct-I/O cache-pressure YCSB-A. This is a diagnostic companion to the
+# four-engine application-cache cohort, not a replacement for it. Only
+# Pagebox and RocksDB expose direct data-file reads.
+workload = "ycsb_a"
+distribution = { kind = "uniform" }
+record_count = 65536
+value_size = 2048
+operation_count = 200000
+minimum_duration_secs = 3
+seed = 42
+threads = 4
+
+[comparison]
+id = "direct-io-cache-pressure-ycsb-a"
+engines = ["kvstore", "rocksdb"]
+memory_regime = "direct_io_application_cache"
+operation_contract = "visible_point_mutation"
+
+[engine_opts]
+sync_mode = "relaxed"
+cache_budget_bytes = 67108864
+direct_io = true

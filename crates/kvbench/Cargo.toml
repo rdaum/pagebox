@@ -28,10 +28,12 @@ lmdb = ["dep:lmdb-rkv"]
 version = "3"
 optional = true
 default-features = false
+features = ["metrics"]
 
 [dependencies.redb]
 version = "4"
 optional = true
+features = ["cache_metrics"]
 
 [dependencies.rocksdb]
 version = "0.23"

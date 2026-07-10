@@ -233,4 +233,34 @@ impl KvStore {
     pub fn height(&self) -> u32 {
         self.tree.height()
     }
+
+    /// Configured buffer-pool capacity in 64 KiB pages.
+    pub fn cache_capacity_pages(&self) -> usize {
+        self.pool.num_frames()
+    }
+
+    /// Approximate number of occupied buffer-pool pages.
+    pub fn cache_used_pages(&self) -> usize {
+        self.pool.num_occupied_estimate()
+    }
+
+    /// Buffer-pool evictions since this store was opened.
+    pub fn cache_evictions(&self) -> u64 {
+        self.pool.eviction_count()
+    }
+
+    /// Page-store loads since this store was opened.
+    pub fn cache_misses(&self) -> u64 {
+        self.pool.page_load_count()
+    }
+
+    /// Number of allocated pages in the persistent page store.
+    pub fn persisted_pages(&self) -> usize {
+        self.pool.num_pages_on_disk()
+    }
+
+    /// Whether the page-store data file is using direct I/O.
+    pub fn direct_io_enabled(&self) -> bool {
+        self.store.direct_io_enabled()
+    }
 }

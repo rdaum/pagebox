@@ -10,7 +10,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::distribution::{Distribution, format_key, hash64};
-use crate::engine::EngineOpts;
 
 // ---------------------------------------------------------------------------
 // Specs
@@ -117,6 +116,14 @@ impl Workload {
             Workload::SeekRandom => 0.0, // scans, not point reads
         }
     }
+
+    /// Whether the run phase contains mutations.
+    pub fn has_mutations(self) -> bool {
+        !matches!(
+            self,
+            Workload::ReadRandom | Workload::ReadSeq | Workload::YcsbC | Workload::SeekRandom
+        )
+    }
 }
 
 impl std::fmt::Display for Workload {
@@ -150,6 +157,10 @@ pub struct WorkloadSpec {
     /// Number of worker threads.
     #[serde(default = "default_threads")]
     pub threads: usize,
+    /// Minimum run-phase duration. The deterministic operation trace is
+    /// repeated when necessary; zero executes it exactly once.
+    #[serde(default)]
+    pub minimum_duration_secs: u64,
 }
 
 impl Default for WorkloadSpec {
@@ -162,6 +173,7 @@ impl Default for WorkloadSpec {
             operation_count: 10_000,
             seed: default_seed(),
             threads: default_threads(),
+            minimum_duration_secs: 0,
         }
     }
 }
@@ -217,23 +229,23 @@ impl WorkloadOp {
 // ---------------------------------------------------------------------------
 
 /// Generate the load-phase ops (sequential puts of `record_count` keys).
-pub fn generate_load_ops(spec: &WorkloadSpec, opts: &EngineOpts) -> Vec<WorkloadOp> {
-    let value = make_value(opts.value_size, spec.seed);
+pub fn generate_load_ops(spec: &WorkloadSpec) -> Vec<WorkloadOp> {
     let mut ops = Vec::with_capacity(spec.record_count as usize);
     for i in 0..spec.record_count {
         ops.push(WorkloadOp::Put {
             key: format_key(i).to_vec(),
-            value: value.clone(),
+            value: make_operation_value(spec, i, i),
         });
     }
     ops
 }
 
 /// Generate the run-phase ops.
-pub fn generate_run_ops(spec: &WorkloadSpec, _opts: &EngineOpts) -> Vec<WorkloadOp> {
-    let value = make_value(_opts.value_size, spec.seed);
+pub fn generate_run_ops(spec: &WorkloadSpec) -> Vec<WorkloadOp> {
     let n = spec.operation_count;
     let mut sampler = spec.distribution.sampler(spec.record_count, spec.seed);
+    let fill_order = matches!(spec.workload, Workload::FillRandom)
+        .then(|| shuffled_key_order(spec.record_count, spec.seed));
 
     // For YcsbD / YcsbE which insert new keys during the run phase, we start
     // inserting at record_count and grow.
@@ -243,15 +255,15 @@ pub fn generate_run_ops(spec: &WorkloadSpec, _opts: &EngineOpts) -> Vec<Workload
     for i in 0..n {
         let op = match spec.workload {
             Workload::FillRandom => {
-                let k = sampler.sample(i);
+                let k = fill_order.as_ref().expect("fill order missing")[i as usize];
                 WorkloadOp::Put {
                     key: format_key(k).to_vec(),
-                    value: value.clone(),
+                    value: make_operation_value(spec, k, i),
                 }
             }
             Workload::FillSeq => WorkloadOp::Put {
                 key: format_key(i % spec.record_count.max(1)).to_vec(),
-                value: value.clone(),
+                value: make_operation_value(spec, i % spec.record_count.max(1), i),
             },
             Workload::ReadRandom => {
                 let k = sampler.sample(i);
@@ -266,7 +278,7 @@ pub fn generate_run_ops(spec: &WorkloadSpec, _opts: &EngineOpts) -> Vec<Workload
                 let k = sampler.sample(i);
                 WorkloadOp::Put {
                     key: format_key(k).to_vec(),
-                    value: value.clone(),
+                    value: make_operation_value(spec, k, i),
                 }
             }
             Workload::YcsbA | Workload::YcsbB | Workload::YcsbC => {
@@ -278,7 +290,7 @@ pub fn generate_run_ops(spec: &WorkloadSpec, _opts: &EngineOpts) -> Vec<Workload
                 } else {
                     WorkloadOp::Put {
                         key: format_key(k).to_vec(),
-                        value: value.clone(),
+                        value: make_operation_value(spec, k, i),
                     }
                 }
             }
@@ -295,7 +307,7 @@ pub fn generate_run_ops(spec: &WorkloadSpec, _opts: &EngineOpts) -> Vec<Workload
                     sampler.notify_insert();
                     WorkloadOp::Put {
                         key: new_key,
-                        value: value.clone(),
+                        value: make_operation_value(spec, next_insert_id - 1, i),
                     }
                 }
             }
@@ -313,7 +325,7 @@ pub fn generate_run_ops(spec: &WorkloadSpec, _opts: &EngineOpts) -> Vec<Workload
                     sampler.notify_insert();
                     WorkloadOp::Put {
                         key: new_key,
-                        value: value.clone(),
+                        value: make_operation_value(spec, next_insert_id - 1, i),
                     }
                 }
             }
@@ -321,7 +333,7 @@ pub fn generate_run_ops(spec: &WorkloadSpec, _opts: &EngineOpts) -> Vec<Workload
                 let k = sampler.sample(i);
                 WorkloadOp::Rmw {
                     key: format_key(k).to_vec(),
-                    value: value.clone(),
+                    value: make_operation_value(spec, k, i),
                 }
             }
             Workload::ReadWhileWriting => {
@@ -333,7 +345,7 @@ pub fn generate_run_ops(spec: &WorkloadSpec, _opts: &EngineOpts) -> Vec<Workload
                 } else {
                     WorkloadOp::Put {
                         key: format_key(k).to_vec(),
-                        value: value.clone(),
+                        value: make_operation_value(spec, k, i),
                     }
                 }
             }
@@ -359,6 +371,52 @@ pub fn generate_run_ops(spec: &WorkloadSpec, _opts: &EngineOpts) -> Vec<Workload
     ops
 }
 
+/// Validate relationships that cannot be expressed by TOML types alone.
+pub fn validate_spec(spec: &WorkloadSpec) -> Result<(), String> {
+    if spec.record_count == 0 {
+        return Err("record_count must be greater than zero".to_string());
+    }
+    if spec.operation_count == 0 {
+        return Err("operation_count must be greater than zero".to_string());
+    }
+    if matches!(spec.workload, Workload::FillRandom | Workload::FillSeq)
+        && spec.operation_count != spec.record_count
+    {
+        return Err(format!(
+            "{} requires operation_count == record_count so every key is inserted exactly once",
+            spec.workload
+        ));
+    }
+    if matches!(spec.workload, Workload::FillRandom | Workload::FillSeq)
+        && spec.minimum_duration_secs != 0
+    {
+        return Err(format!(
+            "{} cannot repeat its trace; minimum_duration_secs must be zero",
+            spec.workload
+        ));
+    }
+    Ok(())
+}
+
+/// Deterministic Fisher-Yates permutation used by FillRandom.
+fn shuffled_key_order(record_count: u64, seed: u64) -> Vec<u64> {
+    let mut keys: Vec<u64> = (0..record_count).collect();
+    let mut state = seed;
+    for i in (1..keys.len()).rev() {
+        let j = (splitmix64(&mut state) % (i as u64 + 1)) as usize;
+        keys.swap(i, j);
+    }
+    keys
+}
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
 /// Deterministically decide whether op `i` is a read based on `read_pct`
 /// (0.0 = 0% reads, 1.0 = 100% reads).
 fn is_read(read_pct: f64, seed: u64, i: u64) -> bool {
@@ -366,11 +424,19 @@ fn is_read(read_pct: f64, seed: u64, i: u64) -> bool {
     ((h % 1000) as f64) < read_pct * 1000.0
 }
 
-/// Generate a value of the given size, filled with a deterministic pattern.
+/// Generate a deterministic, high-entropy value for one logical mutation.
+/// Varying values by key and operation prevents block-compressing engines from
+/// turning a nominally oversized data set into repeated copies of one value.
+fn make_operation_value(spec: &WorkloadSpec, key_id: u64, operation_id: u64) -> Vec<u8> {
+    make_value(
+        spec.value_size,
+        hash64(spec.seed ^ hash64(key_id) ^ hash64(operation_id.rotate_left(29))),
+    )
+}
+
 fn make_value(size: usize, seed: u64) -> Vec<u8> {
     let mut v = vec![0u8; size];
-    // Fill with a deterministic pattern so values are compressible but not
-    // all-zero (which some engines may special-case).
+    // Fill with a deterministic pseudo-random pattern outside the timed phase.
     let mut state = seed | 0xAA_55_AA_55;
     for byte in &mut v {
         state = state
@@ -406,11 +472,45 @@ mod tests {
             operation_count: 0,
             ..WorkloadSpec::default()
         };
-        let opts = EngineOpts::default();
-        let ops = generate_load_ops(&spec, &opts);
+        let ops = generate_load_ops(&spec);
         assert_eq!(ops.len(), 100);
         // All should be puts.
         assert!(ops.iter().all(|op| op.is_write()));
+    }
+
+    #[test]
+    fn load_values_are_deterministic_but_not_repeated_across_keys() {
+        let spec = WorkloadSpec {
+            workload: Workload::YcsbC,
+            record_count: 3,
+            value_size: 512,
+            ..WorkloadSpec::default()
+        };
+        let first = generate_load_ops(&spec);
+        let second = generate_load_ops(&spec);
+        let values: Vec<&[u8]> = first
+            .iter()
+            .map(|op| match op {
+                WorkloadOp::Put { value, .. } => value.as_slice(),
+                _ => unreachable!("load phase must contain puts"),
+            })
+            .collect();
+        let second_values: Vec<&[u8]> = second
+            .iter()
+            .map(|op| match op {
+                WorkloadOp::Put { value, .. } => value.as_slice(),
+                _ => unreachable!("load phase must contain puts"),
+            })
+            .collect();
+        assert_eq!(
+            values, second_values,
+            "the seed must reproduce the same data set"
+        );
+        assert_ne!(
+            values[0], values[1],
+            "different keys must not receive a repeated compressible value"
+        );
+        assert_ne!(values[1], values[2]);
     }
 
     #[test]
@@ -421,8 +521,7 @@ mod tests {
             operation_count: 500,
             ..WorkloadSpec::default()
         };
-        let opts = EngineOpts::default();
-        let ops = generate_run_ops(&spec, &opts);
+        let ops = generate_run_ops(&spec);
         assert_eq!(ops.len(), 500);
         assert!(ops.iter().all(|op| op.is_read()));
     }
@@ -435,8 +534,7 @@ mod tests {
             operation_count: 500,
             ..WorkloadSpec::default()
         };
-        let opts = EngineOpts::default();
-        let ops = generate_run_ops(&spec, &opts);
+        let ops = generate_run_ops(&spec);
         assert_eq!(ops.len(), 500);
         assert!(ops.iter().all(|op| op.is_write()));
     }
@@ -449,8 +547,7 @@ mod tests {
             operation_count: 10_000,
             ..WorkloadSpec::default()
         };
-        let opts = EngineOpts::default();
-        let ops = generate_run_ops(&spec, &opts);
+        let ops = generate_run_ops(&spec);
         let reads = ops.iter().filter(|op| op.is_read()).count();
         let writes = ops.iter().filter(|op| op.is_write()).count();
         // Should be approximately 50/50 (within 5%).
@@ -474,8 +571,7 @@ mod tests {
             operation_count: 500,
             ..WorkloadSpec::default()
         };
-        let opts = EngineOpts::default();
-        let ops = generate_run_ops(&spec, &opts);
+        let ops = generate_run_ops(&spec);
         assert!(ops.iter().all(|op| op.is_read()));
     }
 
@@ -487,8 +583,7 @@ mod tests {
             operation_count: 50,
             ..WorkloadSpec::default()
         };
-        let opts = EngineOpts::default();
-        let ops = generate_run_ops(&spec, &opts);
+        let ops = generate_run_ops(&spec);
         assert_eq!(ops.len(), 50);
         assert!(ops.iter().all(|op| matches!(op, WorkloadOp::Del { .. })));
     }
@@ -501,8 +596,7 @@ mod tests {
             operation_count: 50,
             ..WorkloadSpec::default()
         };
-        let opts = EngineOpts::default();
-        let ops = generate_run_ops(&spec, &opts);
+        let ops = generate_run_ops(&spec);
         assert_eq!(ops.len(), 50);
         assert!(ops.iter().all(|op| matches!(op, WorkloadOp::Scan { .. })));
     }
@@ -516,9 +610,8 @@ mod tests {
             seed: 42,
             ..WorkloadSpec::default()
         };
-        let opts = EngineOpts::default();
-        let ops1 = generate_run_ops(&spec, &opts);
-        let ops2 = generate_run_ops(&spec, &opts);
+        let ops1 = generate_run_ops(&spec);
+        let ops2 = generate_run_ops(&spec);
         assert_eq!(ops1.len(), ops2.len());
         for (a, b) in ops1.iter().zip(ops2.iter()) {
             match (a, b) {
@@ -535,5 +628,38 @@ mod tests {
                 _ => panic!("op type mismatch or unexpected variant"),
             }
         }
+    }
+
+    #[test]
+    fn fillrandom_inserts_each_key_exactly_once() {
+        let spec = WorkloadSpec {
+            workload: Workload::FillRandom,
+            record_count: 10_000,
+            operation_count: 10_000,
+            seed: 42,
+            ..WorkloadSpec::default()
+        };
+        let ops = generate_run_ops(&spec);
+        let mut keys: Vec<&[u8]> = ops
+            .iter()
+            .map(|op| match op {
+                WorkloadOp::Put { key, .. } => key.as_slice(),
+                _ => panic!("fillrandom generated a non-put operation"),
+            })
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), spec.record_count as usize);
+    }
+
+    #[test]
+    fn fillrandom_rejects_repeated_or_partial_keyspace() {
+        let spec = WorkloadSpec {
+            workload: Workload::FillRandom,
+            record_count: 100,
+            operation_count: 99,
+            ..WorkloadSpec::default()
+        };
+        assert!(validate_spec(&spec).is_err());
     }
 }
