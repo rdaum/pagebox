@@ -2875,6 +2875,11 @@ impl BufferPool {
         self.dt_registry.lock().remove(&dt_id);
     }
 
+    /// Whether a data structure currently has an eviction parent finder.
+    pub fn has_registered_dt(&self, dt_id: u16) -> bool {
+        self.dt_registry.lock().contains_key(&dt_id)
+    }
+
     pub fn register_page_reclaimer(&self, page_pid: u64, reclaimer: Arc<dyn PageReclaimer>) {
         self.page_reclaimers.lock().insert(page_pid, reclaimer);
     }

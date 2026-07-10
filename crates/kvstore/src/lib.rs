@@ -103,7 +103,7 @@ impl KvStoreOptions {
 /// Durable key-value store backed by the pagebox substrate.
 pub struct KvStore {
     pool: BufferPoolHandle,
-    tree: BTree,
+    tree: std::sync::Arc<BTree>,
     wal: std::sync::Arc<Wal>,
     store: std::sync::Arc<FilePageStore>,
     sync_mode: SyncMode,
@@ -147,7 +147,7 @@ impl KvStore {
         let root = store.user_meta_0();
         let height = store.user_meta_1() as u32;
         let reachable_pages = store.user_meta_2();
-        let tree = if root == 0 {
+        let tree = std::sync::Arc::new(if root == 0 {
             let t = BTree::new(pool.clone(), opts.domain_id);
             store.set_user_meta_0(t.root_page_id());
             store.set_user_meta_1(0);
@@ -156,7 +156,8 @@ impl KvStore {
             t
         } else {
             BTree::open_with_page_count(pool.clone(), root, height, reachable_pages, opts.domain_id)
-        };
+        });
+        pool.register_dt(opts.domain_id, tree.clone());
 
         Ok(Self {
             pool,
@@ -281,5 +282,34 @@ impl KvStore {
     /// Whether the page-store data file is using direct I/O.
     pub fn direct_io_enabled(&self) -> bool {
         self.store.direct_io_enabled()
+    }
+}
+
+impl Drop for KvStore {
+    fn drop(&mut self) {
+        self.pool.unregister_dt(self.tree.domain_id());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parent_finder_registration_follows_store_lifetime() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = KvStore::open(dir.path()).unwrap();
+        let pool = store.pool.clone();
+        let domain_id = store.tree.domain_id();
+
+        assert!(
+            pool.has_registered_dt(domain_id),
+            "open store must register its B-tree for eviction parent lookup"
+        );
+        drop(store);
+        assert!(
+            !pool.has_registered_dt(domain_id),
+            "dropping the store must break the pool/tree registration cycle"
+        );
     }
 }

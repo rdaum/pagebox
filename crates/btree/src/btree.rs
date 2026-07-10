@@ -333,6 +333,11 @@ impl BTree {
         Self::swip_page_id(self.meta_swip.load(Ordering::Acquire))
     }
 
+    /// Data-structure registry identifier used for eviction parent lookup.
+    pub fn domain_id(&self) -> u16 {
+        self.dt_id
+    }
+
     /// Exact number of pages reachable from the root, when the count was
     /// supplied at reopen or the tree was created in this process.
     pub fn reachable_page_count(&self) -> Option<u64> {
@@ -4396,6 +4401,57 @@ mod tests {
             0,
             "split retries must not leave allocated resident frames unreachable"
         );
+    }
+
+    #[test]
+    #[ignore = "expensive concurrent eviction-pressure regression"]
+    fn concurrent_growth_through_eviction_reaches_height_two() {
+        const KEYS: u64 = 48_000;
+        const THREADS: usize = 8;
+
+        let pool = Arc::new(BufferPool::new(1_024));
+        let tree = Arc::new(BTree::new(&pool, 0));
+        pool.register_dt(0, tree.clone());
+        let next = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let tree = tree.clone();
+                let next = next.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    let value = [0xa5; 2_048];
+                    barrier.wait();
+                    loop {
+                        let key = next.fetch_add(1, Ordering::Relaxed);
+                        if key >= KEYS {
+                            break;
+                        }
+                        assert!(tree.insert(&key.to_be_bytes(), &value));
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert!(
+            tree.height() >= 2,
+            "workload must cross the inner-root split"
+        );
+        let mut count = 0usize;
+        tree.scan(|_, value| {
+            assert_eq!(value.len(), 2_048, "scan returned a truncated value");
+            count += 1;
+        });
+        assert_eq!(count, KEYS as usize, "concurrent growth lost keys");
+        assert_eq!(
+            tree.reachable_page_count().unwrap() as usize,
+            tree.owned_page_ids().len(),
+            "reachable-page accounting diverged under eviction pressure"
+        );
+        pool.unregister_dt(0);
     }
 
     #[test]

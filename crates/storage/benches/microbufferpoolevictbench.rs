@@ -10,9 +10,11 @@
 //!   PAGEBOX_BP_EVICT_PAGES     — total pages in the store (default 100_000)
 //!   PAGEBOX_BP_EVICT_POOL      — buffer pool frames (default 1024)
 //!   PAGEBOX_BP_EVICT_PAGES_PER_THREAD — pages touched per worker before stopping (default 10_000)
+//!   PAGEBOX_BP_EVICT_THREADS   — comma-separated thread counts (default 1,2,4,8,16)
+//!   PAGEBOX_BP_EVICT_SAMPLE_MS — duration of each sample (default 200)
 
 use std::env;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use micromeasure::{
@@ -48,6 +50,18 @@ fn env_usize(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+fn thread_counts() -> Vec<usize> {
+    env::var("PAGEBOX_BP_EVICT_THREADS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(|part| part.trim().parse().expect("invalid eviction thread count"))
+                .collect()
+        })
+        .unwrap_or_else(|| vec![1, 2, 4, 8, 16])
 }
 
 fn shuffled(n: usize) -> Vec<u64> {
@@ -93,7 +107,7 @@ struct EvictCtx {
     _dir: tempfile::TempDir,
     pool: Arc<BufferPool>,
     thread_pages: Vec<Vec<u64>>,
-    eviction_before: u64,
+    eviction_checkpoint: Mutex<u64>,
 }
 
 impl ConcurrentBenchContext for EvictCtx {
@@ -116,12 +130,12 @@ impl ConcurrentBenchContext for EvictCtx {
             })
             .collect();
 
-        let eviction_before = pool.eviction_count();
+        let eviction_checkpoint = Mutex::new(pool.eviction_count());
         Self {
             _dir: dir,
             pool,
             thread_pages,
-            eviction_before,
+            eviction_checkpoint,
         }
     }
 }
@@ -161,7 +175,12 @@ fn evict_worker_sequential(
 
     if control.role_thread_index() == 0 {
         let evictions = pool.eviction_count();
-        let delta = evictions.saturating_sub(ctx.eviction_before);
+        let mut checkpoint = ctx
+            .eviction_checkpoint
+            .lock()
+            .expect("eviction checkpoint poisoned");
+        let delta = evictions.saturating_sub(*checkpoint);
+        *checkpoint = evictions;
         result = result.with_counter("evictions", delta);
     }
 
@@ -214,7 +233,12 @@ fn evict_worker_random(ctx: &EvictCtx, control: &ConcurrentBenchControl) -> Conc
 
     if control.role_thread_index() == 0 {
         let evictions = pool.eviction_count();
-        let delta = evictions.saturating_sub(ctx.eviction_before);
+        let mut checkpoint = ctx
+            .eviction_checkpoint
+            .lock()
+            .expect("eviction checkpoint poisoned");
+        let delta = evictions.saturating_sub(*checkpoint);
+        *checkpoint = evictions;
         result = result.with_counter("evictions", delta);
     }
 
@@ -234,14 +258,16 @@ fn evict_worker_random(ctx: &EvictCtx, control: &ConcurrentBenchControl) -> Conc
 }
 
 benchmark_main!(|runner| {
-    for &n_threads in &[1usize, 2, 4, 8, 16] {
+    let sample_duration =
+        Duration::from_millis(env_usize("PAGEBOX_BP_EVICT_SAMPLE_MS", 200) as u64);
+    for n_threads in thread_counts() {
         let workers = [ConcurrentWorker {
             name: "evict_worker",
             threads: n_threads,
             run: evict_worker_sequential,
         }];
         runner.concurrent_group::<EvictCtx>("buffer_pool/evict/sequential", |g| {
-            g.sample_duration(Duration::from_millis(200))
+            g.sample_duration(sample_duration)
                 .throughput(Throughput::per_operation(1, "pages"))
                 .bench(&format!("{n_threads}t"), &workers);
         });
@@ -252,7 +278,7 @@ benchmark_main!(|runner| {
             run: evict_worker_random,
         }];
         runner.concurrent_group::<EvictCtx>("buffer_pool/evict/random", |g| {
-            g.sample_duration(Duration::from_millis(200))
+            g.sample_duration(sample_duration)
                 .throughput(Throughput::per_operation(1, "pages"))
                 .bench(&format!("{n_threads}t"), &workers);
         });

@@ -22,3 +22,6 @@ clap.workspace = true
 [features]
 default = ["metrics"]
 metrics = ["pagebox-storage/metrics", "pagebox-wal/metrics", "pagebox-btree/metrics"]
+
+[dev-dependencies]
+tempfile.workspace = true
