@@ -4,9 +4,9 @@ use std::time::Duration;
 #[cfg(feature = "metrics")]
 use fast_telemetry::{HistogramSnapshot, MetricLabels, MetricMeta, MetricVisitor};
 use micromeasure::{
-    BenchContext, ConcurrentBenchContext, ConcurrentBenchControl, ConcurrentSampleInfo,
-    ConcurrentSampleLifecycle, ConcurrentWorker, ConcurrentWorkerResult, MeasurementDomain,
-    MetricValue, Throughput, benchmark_main, black_box,
+    BenchContext, BenchmarkCaseOrder, ConcurrentBenchContext, ConcurrentBenchControl,
+    ConcurrentSampleInfo, ConcurrentSampleLifecycle, ConcurrentWorker, ConcurrentWorkerResult,
+    MeasurementDomain, MetricValue, Throughput, benchmark_main, black_box,
 };
 use pagebox_frame_kernel::PAGE_SIZE;
 use pagebox_wal::{CommitMode, WAL_BUF_RECORDS, Wal};
@@ -199,6 +199,28 @@ impl WalSampleMetrics {
                 self.durable_advances,
                 "advances",
                 "Durable advances",
+            ),
+            wal_metric(
+                "commits_per_durable",
+                ratio(self.flush_calls, self.durable_advances),
+                "commits/durable",
+                "Commits/durable",
+            ),
+            wal_metric(
+                "writes_per_durable",
+                ratio(self.write_calls, self.durable_advances),
+                "writes/durable",
+                "Writes/durable",
+            ),
+            wal_metric(
+                "durable_latency_us",
+                if self.sync_latency_count > 0 {
+                    ratio(self.sync_latency_ns, self.sync_latency_count) / 1_000.0
+                } else {
+                    ratio(self.write_latency_ns, self.write_latency_count) / 1_000.0
+                },
+                "us",
+                "Durable latency",
             ),
             wal_metric(
                 "commits_per_barrier",
@@ -444,6 +466,13 @@ fn wal_direct_io_metadata() -> &'static str {
     }
 }
 
+fn env_u64_or(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
 fn append_buffer_only(ctx: &mut AppendBufferOnlyCtx, chunk_size: usize, _chunk_num: usize) {
     for i in 0..chunk_size {
         let pid = i as u64;
@@ -526,6 +555,19 @@ fn concurrent_commit_worker_inner(ctx: &ConcurrentWalCtx, control: &ConcurrentBe
 benchmark_main!(|runner| {
     let sync_backend = wal_sync_backend_metadata();
     let direct_io = wal_direct_io_metadata();
+    let delay_min_us = env_u64_or("PAGEBOX_WAL_GROUP_COMMIT_DELAY_MIN_US", 100);
+    let delay_max_default_us = if sync_backend == "fdatasync" { 0 } else { 250 };
+    let delay_max_us = env_u64_or(
+        "PAGEBOX_WAL_GROUP_COMMIT_DELAY_MAX_US",
+        delay_max_default_us,
+    );
+    let target_default_records = if sync_backend == "fdatasync" { 256 } else { 32 };
+    let target_records = env_u64_or(
+        "PAGEBOX_WAL_GROUP_COMMIT_TARGET_RECORDS",
+        target_default_records,
+    );
+    let case_seed = env_u64_or("PAGEBOX_BENCH_CASE_SEED", 0x7061_6765_626f_7809);
+    let case_cooldown_ms = env_u64_or("PAGEBOX_BENCH_CASE_COOLDOWN_MS", 1_000);
 
     runner.group::<AppendBufferOnlyCtx>("wal_append", |g| {
         g.throughput(Throughput::per_operation(WAL_BUF_RECORDS as u64, "pages"))
@@ -616,7 +658,14 @@ benchmark_main!(|runner| {
             .bench("records_8192", replay_walk);
     });
 
-    for &n_threads in &[1usize, 2, 4, 8] {
+    runner.set_case_cooldown(Duration::from_millis(case_cooldown_ms));
+    let thread_counts = [1usize, 2, 4, 8];
+    let case_order = runner.ordered_case_indices(
+        thread_counts.len(),
+        BenchmarkCaseOrder::Randomized { seed: case_seed },
+    );
+    for case_index in case_order {
+        let n_threads = thread_counts[case_index];
         let benchmark_name = format!("{n_threads}t");
         // Keep each WAL and its background threads alive across samples. The
         // lifecycle hook resets persistent state outside the timed window.
@@ -658,6 +707,11 @@ benchmark_main!(|runner| {
                 .throughput(Throughput::per_operation(1, "pages"))
                 .metadata("sync_backend", sync_backend)
                 .metadata("direct_io", direct_io)
+                .metadata("delay_min_us", delay_min_us.to_string())
+                .metadata("delay_max_us", delay_max_us.to_string())
+                .metadata("target_records", target_records.to_string())
+                .metadata("case_seed", case_seed.to_string())
+                .metadata("case_cooldown_ms", case_cooldown_ms.to_string())
                 .lifecycle(|| ResetWalLifecycle)
                 .factory(&append_factory)
                 .bench(&benchmark_name, &append_workers);
@@ -671,6 +725,11 @@ benchmark_main!(|runner| {
                     .measurement_domain(MeasurementDomain::Io)
                     .metadata("sync_backend", sync_backend)
                     .metadata("direct_io", direct_io)
+                    .metadata("delay_min_us", delay_min_us.to_string())
+                    .metadata("delay_max_us", delay_max_us.to_string())
+                    .metadata("target_records", target_records.to_string())
+                    .metadata("case_seed", case_seed.to_string())
+                    .metadata("case_cooldown_ms", case_cooldown_ms.to_string())
                     .lifecycle(StrictWalLifecycle::default)
                     .factory(&strict_factory)
                     .bench(&benchmark_name, &commit_workers);
@@ -701,6 +760,11 @@ benchmark_main!(|runner| {
                     .throughput(Throughput::per_operation(1, "commits"))
                     .metadata("sync_backend", sync_backend)
                     .metadata("direct_io", direct_io)
+                    .metadata("delay_min_us", delay_min_us.to_string())
+                    .metadata("delay_max_us", delay_max_us.to_string())
+                    .metadata("target_records", target_records.to_string())
+                    .metadata("case_seed", case_seed.to_string())
+                    .metadata("case_cooldown_ms", case_cooldown_ms.to_string())
                     .lifecycle(|| ResetWalLifecycle)
                     .factory(&relaxed_factory)
                     .bench(&benchmark_name, &relaxed_workers);
