@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use micromeasure::{
@@ -56,57 +56,66 @@ impl BenchContext for ReplayCtx {
     }
 }
 
-struct ConcurrentWalCtx {
+struct ConcurrentWalState {
     wal: Arc<Wal>,
     _dir: tempfile::TempDir,
     pages: Arc<Vec<[u8; PAGE_SIZE]>>,
 }
 
+#[derive(Clone)]
+struct ConcurrentWalCtx(Arc<ConcurrentWalState>);
+
+impl std::ops::Deref for ConcurrentWalCtx {
+    type Target = ConcurrentWalState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 impl ConcurrentWalCtx {
     fn prepare_with_mode(commit_mode: CommitMode, num_threads: usize) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let wal = Arc::new(Wal::open_opts(&dir.path().join("wal")).unwrap());
+        // Keep backend comparisons on the same single-shard topology. The
+        // production default may create one shard per available CPU, which
+        // makes per-sample setup dominate this benchmark and is not comparable
+        // with io_uring's required single-shard layout.
+        let wal = Arc::new(Wal::open_with_shards(&dir.path().join("wal"), 1).unwrap());
         wal.set_commit_mode(commit_mode);
         let page_count = (num_threads.max(1) * 64).next_power_of_two();
         let pages = Arc::new((0..page_count as u64).map(page_data).collect());
-        Self {
+        Self(Arc::new(ConcurrentWalState {
             wal,
             _dir: dir,
             pages,
-        }
+        }))
     }
 }
 
+#[derive(Clone)]
 struct ConcurrentWalAppendCtx(ConcurrentWalCtx);
 
 impl ConcurrentBenchContext for ConcurrentWalAppendCtx {
-    fn prepare(num_threads: usize) -> Self {
-        Self(ConcurrentWalCtx::prepare_with_mode(
-            CommitMode::Strict,
-            num_threads,
-        ))
+    fn prepare(_num_threads: usize) -> Self {
+        panic!("concurrent WAL benchmarks must use their shared factory")
     }
 }
 
+#[derive(Clone)]
 struct ConcurrentWalCommitStrictCtx(ConcurrentWalCtx);
 
 impl ConcurrentBenchContext for ConcurrentWalCommitStrictCtx {
-    fn prepare(num_threads: usize) -> Self {
-        Self(ConcurrentWalCtx::prepare_with_mode(
-            CommitMode::Strict,
-            num_threads,
-        ))
+    fn prepare(_num_threads: usize) -> Self {
+        panic!("concurrent WAL benchmarks must use their shared factory")
     }
 }
 
+#[derive(Clone)]
 struct ConcurrentWalCommitRelaxedCtx(ConcurrentWalCtx);
 
 impl ConcurrentBenchContext for ConcurrentWalCommitRelaxedCtx {
-    fn prepare(num_threads: usize) -> Self {
-        Self(ConcurrentWalCtx::prepare_with_mode(
-            CommitMode::Relaxed,
-            num_threads,
-        ))
+    fn prepare(_num_threads: usize) -> Self {
+        panic!("concurrent WAL benchmarks must use their shared factory")
     }
 }
 
@@ -191,10 +200,10 @@ fn concurrent_commit_worker_inner(
     let base = ((control.thread_index() as u64) << 32) | control.role_thread_index() as u64;
 
     while !control.should_stop() {
-        let idx = (commits as usize) % ctx.pages.len();
+        let idx = (commits as usize) % ctx.0.pages.len();
         let pid = base.wrapping_add(commits);
-        let lsn = ctx.wal.append_page_image(pid, &ctx.pages[idx]).unwrap();
-        black_box(ctx.wal.flush_at_least(lsn));
+        let lsn = ctx.0.wal.append_page_image(pid, &ctx.0.pages[idx]).unwrap();
+        black_box(ctx.0.wal.flush_at_least(lsn));
         commits = commits.wrapping_add(1);
     }
 
@@ -292,11 +301,36 @@ benchmark_main!(|runner| {
     });
 
     for &n_threads in &[1usize, 2, 4, 8] {
+        // micromeasure invokes its factory once per warm-up or measured
+        // sample. Clone a shared prepared context so a 200 ms sample measures
+        // the steady-state workload instead of WAL construction and shutdown.
+        let append_ctx = OnceLock::<ConcurrentWalAppendCtx>::new();
+        let append_factory = |num_threads| {
+            append_ctx
+                .get_or_init(|| {
+                    ConcurrentWalAppendCtx(ConcurrentWalCtx::prepare_with_mode(
+                        CommitMode::Strict,
+                        num_threads,
+                    ))
+                })
+                .clone()
+        };
         let append_workers = [ConcurrentWorker {
             name: "append_worker",
             threads: n_threads,
             run: concurrent_append_worker,
         }];
+        let strict_ctx = OnceLock::<ConcurrentWalCommitStrictCtx>::new();
+        let strict_factory = |num_threads| {
+            strict_ctx
+                .get_or_init(|| {
+                    ConcurrentWalCommitStrictCtx(ConcurrentWalCtx::prepare_with_mode(
+                        CommitMode::Strict,
+                        num_threads,
+                    ))
+                })
+                .clone()
+        };
         let commit_workers = [ConcurrentWorker {
             name: "commit_worker",
             threads: n_threads,
@@ -306,6 +340,7 @@ benchmark_main!(|runner| {
         runner.concurrent_group::<ConcurrentWalAppendCtx>("wal_concurrent_append", |g| {
             g.sample_duration(Duration::from_millis(200))
                 .throughput(Throughput::per_operation(1, "pages"))
+                .factory(&append_factory)
                 .bench(&format!("{n_threads}t"), &append_workers);
         });
 
@@ -314,10 +349,22 @@ benchmark_main!(|runner| {
             |g| {
                 g.sample_duration(Duration::from_millis(200))
                     .throughput(Throughput::per_operation(1, "commits"))
+                    .factory(&strict_factory)
                     .bench(&format!("{n_threads}t"), &commit_workers);
             },
         );
 
+        let relaxed_ctx = OnceLock::<ConcurrentWalCommitRelaxedCtx>::new();
+        let relaxed_factory = |num_threads| {
+            relaxed_ctx
+                .get_or_init(|| {
+                    ConcurrentWalCommitRelaxedCtx(ConcurrentWalCtx::prepare_with_mode(
+                        CommitMode::Relaxed,
+                        num_threads,
+                    ))
+                })
+                .clone()
+        };
         let relaxed_workers = [ConcurrentWorker {
             name: "commit_worker",
             threads: n_threads,
@@ -329,6 +376,7 @@ benchmark_main!(|runner| {
             |g| {
                 g.sample_duration(Duration::from_millis(200))
                     .throughput(Throughput::per_operation(1, "commits"))
+                    .factory(&relaxed_factory)
                     .bench(&format!("{n_threads}t"), &relaxed_workers);
             },
         );

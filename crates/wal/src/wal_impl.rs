@@ -938,6 +938,14 @@ impl Wal {
         Self::open_opts_with_shards(path, sync_backend, wal_shard_count())
     }
 
+    /// Open or create a WAL with an explicit shard count and the configured
+    /// sync backend. This is useful when the caller, rather than the process
+    /// environment, owns the concurrency topology. The io_uring backend still
+    /// uses its required single-shard layout.
+    pub fn open_with_shards(path: &Path, shard_count: usize) -> io::Result<Self> {
+        Self::open_opts_with_shards(path, wal_sync_backend(), shard_count)
+    }
+
     #[cfg(test)]
     pub(crate) fn open_with_shards_for_test(path: &Path, shard_count: usize) -> io::Result<Self> {
         Self::open_opts_with_shards(path, WalSyncBackend::Fdatasync, shard_count)

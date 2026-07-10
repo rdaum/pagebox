@@ -1380,6 +1380,32 @@ mod io_uring_tests {
     }
 
     #[test]
+    fn iouring_repeated_open_drop_preserves_ring_memory_lifetime() {
+        let path = tmp_path("iouring_repeated_open_drop");
+        let _cleanup = Cleanup(path.clone());
+        let page = page_data(91);
+
+        for iteration in 0..16u64 {
+            let wal = open_iouring(&path);
+            let lsn = wal.append_page_image(iteration, &page).unwrap();
+            assert!(
+                wal.flush_at_least(lsn) >= lsn,
+                "iteration {iteration} should become durable"
+            );
+            drop(wal);
+        }
+
+        let wal = open_iouring(&path);
+        let mut replayed = Vec::new();
+        wal.replay(|lsn, pid, _| replayed.push((lsn, pid))).unwrap();
+        assert_eq!(
+            replayed,
+            (1..=16).zip(0..16).collect::<Vec<_>>(),
+            "repeated ring teardown must not corrupt the WAL or process memory"
+        );
+    }
+
+    #[test]
     fn iouring_append_flush_reopen_recovers() {
         let path = tmp_path("iouring_append_flush_reopen");
         let _cleanup = Cleanup(path.clone());

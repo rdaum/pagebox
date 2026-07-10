@@ -46,8 +46,8 @@ use crate::wal_impl::{PendingWalWrite, WalBuffer};
 
 const IORING_ENTER_GETEVENTS: u32 = 1 << 0;
 
-/// `IORING_SETUP_NO_MMAP` — the ring memory is user-allocated, not mmap'd
-/// from the ring fd. Avoids broken CQ mmap on some kernels (≥5.18).
+/// `IORING_SETUP_NO_MMAP` — the ring memory is user-allocated rather than
+/// mapped from the ring fd. Available since Linux 6.5.
 const IORING_SETUP_NO_MMAP: u32 = 1 << 14;
 
 #[allow(dead_code)]
@@ -210,15 +210,14 @@ fn slot_of(user_data: u64) -> u32 {
 /// memory (via `IORING_SETUP_NO_MMAP`).
 pub(crate) struct IoUring {
     ring_fd: RawFd,
-    // User-allocated ring memory, kept for dealloc in Drop.
+    // Anonymous mappings supplied to the kernel for the ring lifetime. These
+    // must not come from the process allocator: closing an io_uring fd starts
+    // asynchronous kernel teardown, so heap pages could otherwise be reused
+    // while the kernel still holds them pinned.
     sq_region: *mut u8,
-    #[allow(dead_code)]
     sq_region_sz: usize,
-    sq_layout: std::alloc::Layout,
     cq_region: *mut u8,
-    #[allow(dead_code)]
     cq_region_sz: usize,
-    cq_layout: std::alloc::Layout,
     // Cached field addresses inside the ring memory.
     sqes_ptr: *mut IoUringSqe,
     sq_head: *mut AtomicU32,
@@ -239,16 +238,54 @@ unsafe impl Send for IoUring {}
 unsafe impl Sync for IoUring {}
 
 impl IoUring {
+    fn page_size() -> io::Result<usize> {
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page_size <= 0 {
+            return Err(io::Error::last_os_error());
+        }
+        usize::try_from(page_size)
+            .ok()
+            .filter(|size| size.is_power_of_two())
+            .ok_or_else(|| io::Error::other("invalid system page size"))
+    }
+
+    fn page_align(size: usize, page_size: usize) -> io::Result<usize> {
+        size.checked_add(page_size - 1)
+            .map(|size| size & !(page_size - 1))
+            .ok_or_else(|| io::Error::other("io_uring region size overflow"))
+    }
+
+    fn map_region(size: usize) -> io::Result<*mut u8> {
+        let region = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if region == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(region.cast())
+    }
+
+    unsafe fn unmap_region(region: *mut u8, size: usize) {
+        if !region.is_null() {
+            unsafe { libc::munmap(region.cast(), size) };
+        }
+    }
+
     /// Create a ring with `entries` SQ slots. On a kernel without io_uring
     /// (`ENOSYS` from `io_uring_setup`) the error is surfaced so `Wal::open`
     /// fails clearly rather than silently degrading.
     ///
-    /// Uses `IORING_SETUP_NO_MMAP` (kernel ≥5.18) to avoid `mmap` of the
-    /// ring regions, which is broken on some nvidia-variant kernels. The
-    /// ring memory is user-allocated and handed to the kernel via the
-    /// `sq_off.user_addr` / `cq_off.user_addr` params fields. A preview
-    /// `io_uring_setup` call (without NO_MMAP) determines the exact ring
-    /// sizes first, then a second call creates the real ring.
+    /// Uses `IORING_SETUP_NO_MMAP` to avoid mapping the ring fd, which is
+    /// broken on some nvidia-variant kernels. Anonymous mappings are handed to
+    /// the kernel via the `sq_off.user_addr` / `cq_off.user_addr` fields. A
+    /// preview `io_uring_setup` call determines the required geometry first.
     pub(crate) fn new(entries: u32) -> io::Result<Self> {
         // --- Preview call: discover the kernel's actual entry counts and
         // ring field offsets. We don't mmap this ring — just read params. ---
@@ -277,28 +314,24 @@ impl IoUring {
         // the SQ array — whichever extends further.
         let rings_struct_sz = sq_ring_sz.max(cq_ring_sz);
 
-        let page = 4096usize;
+        let page = Self::page_size()?;
         // SQ region: SQE array only (sq_off.user_addr points to SQEs).
-        let sq_region_sz = ((sqe_array_sz + page - 1) & !(page - 1)).max(page * 16);
+        let sq_region_sz = Self::page_align(sqe_array_sz, page)?.max(page * 16);
         // CQ region: the rings struct (SQ ring fields + CQ ring fields + SQ
         // array). Generously over-allocated to absorb any kernel-version
         // variation in field offsets.
-        let cq_region_sz = ((rings_struct_sz + page - 1) & !(page - 1)).max(page * 32);
+        let cq_region_sz = Self::page_align(rings_struct_sz, page)?.max(page * 32);
 
-        // --- Allocations: user-provided ring memory. ---
-        let sq_layout = std::alloc::Layout::from_size_align(sq_region_sz, page).unwrap();
-        let cq_layout = std::alloc::Layout::from_size_align(cq_region_sz, page).unwrap();
-        let sq_region = unsafe { std::alloc::alloc_zeroed(sq_layout) };
-        let cq_region = unsafe { std::alloc::alloc_zeroed(cq_layout) };
-        if sq_region.is_null() || cq_region.is_null() {
-            if !sq_region.is_null() {
-                unsafe { std::alloc::dealloc(sq_region, sq_layout) };
+        // Anonymous mappings remain distinct from allocator-managed memory
+        // while the kernel asynchronously tears down its pinned-page view.
+        let sq_region = Self::map_region(sq_region_sz)?;
+        let cq_region = match Self::map_region(cq_region_sz) {
+            Ok(region) => region,
+            Err(err) => {
+                unsafe { Self::unmap_region(sq_region, sq_region_sz) };
+                return Err(err);
             }
-            if !cq_region.is_null() {
-                unsafe { std::alloc::dealloc(cq_region, cq_layout) };
-            }
-            return Err(io::Error::new(io::ErrorKind::OutOfMemory, "ring alloc"));
-        }
+        };
 
         // --- Real call: IORING_SETUP_NO_MMAP. ---
         let mut params = IoUringParams::zero();
@@ -314,30 +347,32 @@ impl IoUring {
         };
         if fd < 0 {
             let e = io::Error::last_os_error();
-            unsafe { std::alloc::dealloc(sq_region, sq_layout) };
-            unsafe { std::alloc::dealloc(cq_region, cq_layout) };
+            unsafe { Self::unmap_region(sq_region, sq_region_sz) };
+            unsafe { Self::unmap_region(cq_region, cq_region_sz) };
             return Err(e);
         }
         let ring_fd = fd as RawFd;
 
-        // Verify the real call matches the preview (same entries → same
-        // ring geometry). If these differ, our allocation sizes are wrong.
-        debug_assert_eq!(
-            params.sq_entries, sq_entries,
-            "io_uring sq_entries mismatch between preview and real call"
-        );
-        debug_assert_eq!(
-            params.cq_entries, cq_entries,
-            "io_uring cq_entries mismatch between preview and real call"
-        );
-        debug_assert_eq!(
-            params.sq_off.array, preview.sq_off.array,
-            "io_uring sq_off.array mismatch"
-        );
-        debug_assert_eq!(
-            params.cq_off.cqes, preview.cq_off.cqes,
-            "io_uring cq_off.cqes mismatch"
-        );
+        // The real setup must fit the preview-sized mappings. Keep this a
+        // release-mode check because dereferencing mismatched geometry would
+        // be memory-unsafe.
+        let real_sqe_size = params.sq_entries as usize * std::mem::size_of::<IoUringSqe>();
+        let real_sq_ring_size =
+            params.sq_off.array as usize + params.sq_entries as usize * std::mem::size_of::<u32>();
+        let real_cq_ring_size = params.cq_off.cqes as usize
+            + params.cq_entries as usize * std::mem::size_of::<IoUringCqe>();
+        let geometry_matches = params.sq_entries == sq_entries
+            && params.cq_entries == cq_entries
+            && real_sqe_size <= sq_region_sz
+            && real_sq_ring_size.max(real_cq_ring_size) <= cq_region_sz;
+        if !geometry_matches {
+            unsafe { libc::close(ring_fd) };
+            unsafe { Self::unmap_region(sq_region, sq_region_sz) };
+            unsafe { Self::unmap_region(cq_region, cq_region_sz) };
+            return Err(io::Error::other(
+                "io_uring geometry changed between preview and real setup",
+            ));
+        }
 
         // --- Resolve field pointers within user-allocated memory. ---
         // With NO_MMAP: sq_off.user_addr = SQE array; cq_off.user_addr =
@@ -360,10 +395,8 @@ impl IoUring {
             ring_fd,
             sq_region,
             sq_region_sz,
-            sq_layout,
             cq_region,
             cq_region_sz,
-            cq_layout,
             sqes_ptr,
             sq_head,
             sq_tail,
@@ -382,6 +415,28 @@ impl IoUring {
     #[allow(dead_code)]
     pub(crate) fn sq_entries(&self) -> u32 {
         self.sq_entries
+    }
+
+    fn available_submissions(&self) -> u32 {
+        let tail = unsafe { (*self.sq_tail).load(Ordering::Relaxed) };
+        let head = unsafe { (*self.sq_head).load(Ordering::Acquire) };
+        self.sq_entries.saturating_sub(tail.wrapping_sub(head))
+    }
+
+    fn ensure_submission_space(&mut self, needed: u32) -> io::Result<()> {
+        if needed > self.sq_entries {
+            return Err(io::Error::other("io_uring submission exceeds ring size"));
+        }
+        if self.available_submissions() < needed {
+            self.flush_and_enter(0)?;
+        }
+        if self.available_submissions() < needed {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "io_uring submission queue remained full",
+            ));
+        }
+        Ok(())
     }
 
     /// Submit a `WRITE` SQE (single-buffer pwrite). The buffer must remain
@@ -506,7 +561,10 @@ impl IoUring {
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }
-        self.pending_submissions = 0;
+        let consumed = u32::try_from(ret)
+            .unwrap_or(u32::MAX)
+            .min(self.pending_submissions);
+        self.pending_submissions -= consumed;
         Ok(())
     }
 
@@ -546,6 +604,10 @@ impl IoUring {
         self.pending_submissions = 0;
         pending
     }
+
+    pub(crate) fn restore_pending_submissions(&mut self, pending: u32) {
+        self.pending_submissions = self.pending_submissions.saturating_add(pending);
+    }
 }
 
 impl Drop for IoUring {
@@ -554,12 +616,8 @@ impl Drop for IoUring {
             if self.ring_fd >= 0 {
                 libc::close(self.ring_fd);
             }
-            if !self.sq_region.is_null() {
-                std::alloc::dealloc(self.sq_region, self.sq_layout);
-            }
-            if !self.cq_region.is_null() {
-                std::alloc::dealloc(self.cq_region, self.cq_layout);
-            }
+            Self::unmap_region(self.sq_region, self.sq_region_sz);
+            Self::unmap_region(self.cq_region, self.cq_region_sz);
         }
     }
 }
@@ -680,6 +738,9 @@ impl IoUringShared {
             };
             if ret < 0 {
                 let err = io::Error::last_os_error();
+                let mut ring = self.ring.lock();
+                ring.restore_pending_submissions(to_submit);
+                drop(ring);
                 if err.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
@@ -689,6 +750,12 @@ impl IoUringShared {
                 eprintln!("WAL io_uring reaper error: {err}");
                 std::thread::sleep(std::time::Duration::from_millis(1));
                 continue;
+            }
+            let consumed = u32::try_from(ret).unwrap_or(u32::MAX).min(to_submit);
+            if consumed < to_submit {
+                self.ring
+                    .lock()
+                    .restore_pending_submissions(to_submit - consumed);
             }
             // Reap and dispatch all ready CQEs.
             let mut ring = self.ring.lock();
@@ -787,6 +854,8 @@ impl WalIoBackend for IoUringBackend {
         let buffer = write.buffer;
         let buf_ptr = buffer.buffer.as_slice().as_ptr();
         let len_u32 = len as u32;
+        let mut ring = self.shared.ring.lock();
+        ring.ensure_submission_space(2)?;
         let slot = self.shared.alloc_slot(InFlightWrite {
             buffer,
             max_lsn,
@@ -794,18 +863,11 @@ impl WalIoBackend for IoUringBackend {
             fd,
         });
         let user_data = pack_write(slot);
-        let mut ring = self.shared.ring.lock();
         let enqueued = ring.submit_write(fd, buf_ptr, len_u32, offset, user_data, true)?;
-        if !enqueued {
-            ring.flush_and_enter(0)?;
-            ring.submit_write(fd, buf_ptr, len_u32, offset, user_data, true)?;
-        }
+        debug_assert!(enqueued, "reserved io_uring WRITE slot disappeared");
         let fsync_user_data = pack_fsync(slot);
         let fsync_enqueued = ring.submit_fsync(fd, fsync_user_data, true)?;
-        if !fsync_enqueued {
-            ring.flush_and_enter(0)?;
-            ring.submit_fsync(fd, fsync_user_data, true)?;
-        }
+        debug_assert!(fsync_enqueued, "reserved io_uring FSYNC slot disappeared");
         Ok(SubmitResult::Submitted)
     }
 
