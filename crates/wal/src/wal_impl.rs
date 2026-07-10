@@ -410,6 +410,7 @@ pub(crate) struct WalState {
     pub(crate) active: WalBuffer,
     pub(crate) spare_buffers: Vec<WalBuffer>,
     pub(crate) pending_writes: VecDeque<PendingWalWrite>,
+    submitted_writes: SubmittedWrites,
     pub(crate) writes_in_progress: usize,
     pub(crate) file_offset: u64,
     pub(crate) allocated_size: u64,
@@ -417,6 +418,65 @@ pub(crate) struct WalState {
     pub(crate) next_buffer_epoch: u64,
     pub(crate) crash_shutdown: bool,
     pub(crate) shutdown: bool,
+}
+
+struct SubmittedWrites {
+    entries: VecDeque<SubmittedWrite>,
+    high_water_lsn: Lsn,
+}
+
+struct SubmittedWrite {
+    max_lsn: Lsn,
+    completed: bool,
+}
+
+impl SubmittedWrites {
+    fn new(high_water_lsn: Lsn) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            high_water_lsn,
+        }
+    }
+
+    fn push(&mut self, max_lsn: Lsn) {
+        self.entries.push_back(SubmittedWrite {
+            max_lsn,
+            completed: false,
+        });
+    }
+
+    fn complete(&mut self, max_lsn: Lsn) -> Option<Lsn> {
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.max_lsn == max_lsn && !entry.completed)
+            .unwrap_or_else(|| panic!("unknown WAL write completion for LSN {max_lsn}"));
+        entry.completed = true;
+
+        let previous_high_water = self.high_water_lsn;
+        while self.entries.front().is_some_and(|entry| entry.completed) {
+            let entry = self.entries.pop_front().expect("completed front entry");
+            self.high_water_lsn = self.high_water_lsn.max(entry.max_lsn);
+        }
+        (self.high_water_lsn > previous_high_water).then_some(self.high_water_lsn)
+    }
+}
+
+#[cfg(test)]
+mod submitted_writes_tests {
+    use super::SubmittedWrites;
+
+    #[test]
+    fn written_progress_waits_for_the_submitted_extent_prefix() {
+        let mut writes = SubmittedWrites::new(0);
+        writes.push(10);
+        writes.push(5);
+        writes.push(20);
+
+        assert_eq!(writes.complete(5), None);
+        assert_eq!(writes.complete(10), Some(10));
+        assert_eq!(writes.complete(20), Some(20));
+    }
 }
 
 pub(crate) struct WalBuffer {
@@ -2245,6 +2305,7 @@ impl WalInner {
                 active: WalBuffer::new(1),
                 spare_buffers: vec![WalBuffer::new(2)],
                 pending_writes: VecDeque::new(),
+                submitted_writes: SubmittedWrites::new(max_lsn),
                 writes_in_progress: 0,
                 file_offset,
                 allocated_size,
@@ -2603,20 +2664,24 @@ impl WalInner {
                 durable_lsn,
                 write_latency_ns,
             } => {
-                self.written_lsn.fetch_max(max_lsn, Ordering::Release);
-                if let Some(durable) = durable_lsn {
-                    self.advance_durable_lsn(durable);
-                }
                 self.stats
                     .latencies
                     .get(WalLatency::Write)
                     .record(write_latency_ns);
                 let mut state = self.state.lock();
+                let contiguous_written = state.submitted_writes.complete(max_lsn);
                 let epoch = Self::next_buffer_epoch_locked(&mut state);
                 let mut buffer = buffer;
                 buffer.reset(epoch);
                 state.spare_buffers.push(buffer);
                 state.writes_in_progress -= 1;
+                drop(state);
+                if let Some(written) = contiguous_written {
+                    self.written_lsn.fetch_max(written, Ordering::Release);
+                }
+                if let Some(durable) = durable_lsn {
+                    self.advance_durable_lsn(durable);
+                }
                 self.flush_done.notify_all();
                 self.flush_requested.notify_all();
             }
@@ -2691,6 +2756,7 @@ impl WalInner {
 
     fn pop_pending_write_locked(&self, state: &mut WalState) -> Option<PendingWalWrite> {
         let write = state.pending_writes.pop_front()?;
+        state.submitted_writes.push(write.max_lsn);
         state.writes_in_progress += 1;
         Some(write)
     }

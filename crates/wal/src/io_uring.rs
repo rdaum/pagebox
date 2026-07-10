@@ -707,6 +707,28 @@ impl IoUringShared {
         self.fd_to_inner.lock().get(&fd).and_then(|w| w.upgrade())
     }
 
+    fn complete_write(&self, slot: u32, res: i32) -> io::Result<Option<Completion>> {
+        let mut in_flight = self.in_flight.lock();
+        let write = in_flight
+            .get_mut(slot as usize)
+            .and_then(Option::as_mut)
+            .ok_or_else(|| io::Error::other("unknown io_uring WRITE completion"))?;
+        validate_write_completion(write.expected_len, res)?;
+        let Some(buffer) = write.buffer.take() else {
+            return Err(io::Error::other("duplicate io_uring WRITE completion"));
+        };
+        let write_latency_ns = write.write_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let completion = Completion {
+            kind: CompletionKind::Written {
+                buffer,
+                max_lsn: write.max_lsn,
+                durable_lsn: None,
+                write_latency_ns,
+            },
+        };
+        Ok(Some(completion))
+    }
+
     /// The dedicated reaper thread. Blocks in `io_uring_enter(GETEVENTS)` and
     /// dispatches CQEs to the correct `WalInner` via `fd_to_inner`. One reaper
     /// serves all shards, avoiding the thundering herd of N driver threads
@@ -770,36 +792,51 @@ impl IoUringShared {
 
     /// Dispatch a CQE to the correct `WalInner`, looked up by fd.
     fn dispatch_cqe(&self, user_data: u64, res: i32) {
-        if res < 0 {
-            let err = io::Error::from_raw_os_error(-res);
-            panic!("WAL io_uring op failed — durability compromised: {err}");
-        }
-        if is_fsync(user_data)
-            && let Some(write) = self.take_slot(slot_of(user_data))
-        {
-            let write_latency_ns =
-                write.write_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-            let completion = Completion {
-                kind: CompletionKind::Written {
-                    buffer: write.buffer,
-                    max_lsn: write.max_lsn,
-                    durable_lsn: Some(write.max_lsn),
-                    write_latency_ns,
-                },
-            };
-            match self.lookup_inner(write.fd) {
-                Some(inner) => inner.handle_completion(completion),
-                None => {
-                    // The WalInner has been dropped (shutdown). The buffer
-                    // is dropped with the completion — no leak.
-                }
+        let slot = slot_of(user_data);
+        if is_fsync(user_data) {
+            if res < 0 {
+                let err = io::Error::from_raw_os_error(-res);
+                panic!("WAL io_uring FSYNC failed — durability compromised: {err}");
             }
+            let Some(write) = self.take_slot(slot) else {
+                panic!("unknown io_uring FSYNC completion");
+            };
+            assert!(
+                write.buffer.is_none(),
+                "io_uring FSYNC completed before its linked WRITE"
+            );
+            let sync_latency_ns =
+                write.write_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            if let Some(inner) = self.lookup_inner(write.fd) {
+                inner.handle_completion(Completion {
+                    kind: CompletionKind::Durable {
+                        lsn: write.max_lsn,
+                        sync_latency_ns,
+                    },
+                });
+            }
+            return;
+        }
+
+        let fd = self
+            .in_flight
+            .lock()
+            .get(slot as usize)
+            .and_then(Option::as_ref)
+            .map(|write| write.fd)
+            .unwrap_or_else(|| panic!("unknown io_uring WRITE completion"));
+        let completion = self
+            .complete_write(slot, res)
+            .unwrap_or_else(|err| panic!("WAL io_uring WRITE failed: {err}"));
+        if let (Some(inner), Some(completion)) = (self.lookup_inner(fd), completion) {
+            inner.handle_completion(completion);
         }
     }
 }
 
 struct InFlightWrite {
-    buffer: WalBuffer,
+    buffer: Option<WalBuffer>,
+    expected_len: usize,
     max_lsn: Lsn,
     write_start: std::time::Instant,
     /// The WAL file fd this write targets. Used to dispatch the CQE
@@ -857,7 +894,8 @@ impl WalIoBackend for IoUringBackend {
         let mut ring = self.shared.ring.lock();
         ring.ensure_submission_space(2)?;
         let slot = self.shared.alloc_slot(InFlightWrite {
-            buffer,
+            buffer: Some(buffer),
+            expected_len: len,
             max_lsn,
             write_start,
             fd,
@@ -985,6 +1023,19 @@ impl WalIoBackend for IoUringBackend {
     }
 }
 
+fn validate_write_completion(expected_len: usize, res: i32) -> io::Result<()> {
+    if res < 0 {
+        return Err(io::Error::from_raw_os_error(-res));
+    }
+    if res as usize != expected_len {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            format!("short io_uring write: expected {expected_len} bytes, wrote {res}"),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1001,5 +1052,16 @@ mod tests {
             16,
             "CQE must be 16 bytes"
         );
+    }
+
+    #[test]
+    fn write_completion_requires_the_full_requested_length() {
+        assert!(validate_write_completion(4096, 4096).is_ok());
+
+        let short = validate_write_completion(4096, 2048).unwrap_err();
+        assert_eq!(short.kind(), io::ErrorKind::WriteZero);
+
+        let failed = validate_write_completion(4096, -libc::EIO).unwrap_err();
+        assert_eq!(failed.raw_os_error(), Some(libc::EIO));
     }
 }
