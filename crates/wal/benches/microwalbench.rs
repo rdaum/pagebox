@@ -301,19 +301,23 @@ benchmark_main!(|runner| {
     });
 
     for &n_threads in &[1usize, 2, 4, 8] {
-        // micromeasure invokes its factory once per warm-up or measured
-        // sample. Clone a shared prepared context so a 200 ms sample measures
-        // the steady-state workload instead of WAL construction and shutdown.
+        // micromeasure invokes the factory outside each warm-up or measured
+        // sample. Keep the threads and ring alive, but truncate the WAL before
+        // returning the context so every timed sample starts from a bounded,
+        // quiescent log instead of inheriting an ever-growing file.
         let append_ctx = OnceLock::<ConcurrentWalAppendCtx>::new();
         let append_factory = |num_threads| {
-            append_ctx
-                .get_or_init(|| {
-                    ConcurrentWalAppendCtx(ConcurrentWalCtx::prepare_with_mode(
-                        CommitMode::Strict,
-                        num_threads,
-                    ))
-                })
-                .clone()
+            let ctx = append_ctx.get_or_init(|| {
+                ConcurrentWalAppendCtx(ConcurrentWalCtx::prepare_with_mode(
+                    CommitMode::Strict,
+                    num_threads,
+                ))
+            });
+            ctx.0
+                .wal
+                .reset()
+                .expect("reset concurrent append WAL between samples");
+            ctx.clone()
         };
         let append_workers = [ConcurrentWorker {
             name: "append_worker",
@@ -322,14 +326,17 @@ benchmark_main!(|runner| {
         }];
         let strict_ctx = OnceLock::<ConcurrentWalCommitStrictCtx>::new();
         let strict_factory = |num_threads| {
-            strict_ctx
-                .get_or_init(|| {
-                    ConcurrentWalCommitStrictCtx(ConcurrentWalCtx::prepare_with_mode(
-                        CommitMode::Strict,
-                        num_threads,
-                    ))
-                })
-                .clone()
+            let ctx = strict_ctx.get_or_init(|| {
+                ConcurrentWalCommitStrictCtx(ConcurrentWalCtx::prepare_with_mode(
+                    CommitMode::Strict,
+                    num_threads,
+                ))
+            });
+            ctx.0
+                .wal
+                .reset()
+                .expect("reset strict concurrent WAL between samples");
+            ctx.clone()
         };
         let commit_workers = [ConcurrentWorker {
             name: "commit_worker",
@@ -356,14 +363,17 @@ benchmark_main!(|runner| {
 
         let relaxed_ctx = OnceLock::<ConcurrentWalCommitRelaxedCtx>::new();
         let relaxed_factory = |num_threads| {
-            relaxed_ctx
-                .get_or_init(|| {
-                    ConcurrentWalCommitRelaxedCtx(ConcurrentWalCtx::prepare_with_mode(
-                        CommitMode::Relaxed,
-                        num_threads,
-                    ))
-                })
-                .clone()
+            let ctx = relaxed_ctx.get_or_init(|| {
+                ConcurrentWalCommitRelaxedCtx(ConcurrentWalCtx::prepare_with_mode(
+                    CommitMode::Relaxed,
+                    num_threads,
+                ))
+            });
+            ctx.0
+                .wal
+                .reset()
+                .expect("reset relaxed concurrent WAL between samples");
+            ctx.clone()
         };
         let relaxed_workers = [ConcurrentWorker {
             name: "commit_worker",
