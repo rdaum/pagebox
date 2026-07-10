@@ -622,7 +622,7 @@ impl Drop for IoUring {
 // IoUringShared — ring state shared across all WAL shards
 // ---------------------------------------------------------------------------
 
-use crate::backend::{Completion, CompletionKind, SubmitResult, WalIoBackend};
+use crate::backend::{Completion, CompletionKind, SubmitResult, SyncSubmission, WalIoBackend};
 use crate::format::{
     WAL_IO_URING_GROUP_COMMIT_DELAY_MAX_US, WAL_IO_URING_GROUP_COMMIT_TARGET_RECORDS, env_u64_us,
 };
@@ -853,8 +853,10 @@ struct SyncBarrierState {
 }
 
 impl SyncBarrierState {
-    fn request(&mut self, lsn: Lsn) {
+    fn request(&mut self, lsn: Lsn) -> bool {
+        let previous = self.requested_lsn;
         self.requested_lsn = self.requested_lsn.max(lsn);
+        self.requested_lsn > previous
     }
 
     fn next_target(&self) -> Option<Lsn> {
@@ -941,12 +943,16 @@ impl WalIoBackend for IoUringBackend {
         Ok(SubmitResult::Submitted)
     }
 
-    fn submit_sync(&self, barrier_lsn: Lsn) -> io::Result<()> {
+    fn submit_sync(&self, barrier_lsn: Lsn) -> io::Result<SyncSubmission> {
         let mut ring = self.shared.ring.lock();
         let mut barrier = self.shared.sync_barrier.lock();
-        barrier.request(barrier_lsn);
+        let target_advanced = barrier.request(barrier_lsn);
         let Some(target_lsn) = barrier.next_target() else {
-            return Ok(());
+            return Ok(if target_advanced {
+                SyncSubmission::Coalesced
+            } else {
+                SyncSubmission::Unchanged
+            });
         };
         ring.ensure_submission_space(1)?;
         let enqueued = ring.submit_fsync(self.fd, USER_DATA_FSYNC, true, true)?;
@@ -956,7 +962,7 @@ impl WalIoBackend for IoUringBackend {
             fd: self.fd,
             started: std::time::Instant::now(),
         });
-        Ok(())
+        Ok(SyncSubmission::Submitted)
     }
 
     fn sync_in_flight(&self) -> bool {
@@ -1134,7 +1140,7 @@ mod tests {
     #[test]
     fn sync_requests_coalesce_behind_one_in_flight_barrier() {
         let mut barrier = SyncBarrierState::default();
-        barrier.request(10);
+        assert!(barrier.request(10));
         assert_eq!(barrier.next_target(), Some(10));
         barrier.submitted(InFlightSync {
             lsn: 10,
@@ -1142,7 +1148,8 @@ mod tests {
             started: std::time::Instant::now(),
         });
 
-        barrier.request(20);
+        assert!(!barrier.request(10));
+        assert!(barrier.request(20));
         assert_eq!(barrier.next_target(), None);
         assert_eq!(barrier.complete().map(|sync| sync.lsn), Some(10));
         assert_eq!(barrier.next_target(), Some(20));

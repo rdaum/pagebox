@@ -73,6 +73,13 @@ pub(crate) enum SubmitResult {
     Submitted,
 }
 
+pub(crate) enum SyncSubmission {
+    Submitted,
+    Coalesced,
+    Unchanged,
+    BackendManaged,
+}
+
 /// One I/O completion drained from a backend.
 pub(crate) struct Completion {
     pub(crate) kind: CompletionKind,
@@ -106,7 +113,7 @@ pub(crate) trait WalIoBackend: Send + Sync {
     /// no-op (the backend-internal syncer thread is self-driven via the shared
     /// condvar); io_uring submits one drained fsync barrier; and
     /// `pwritev2_dsync` writes are durable inline.
-    fn submit_sync(&self, barrier_lsn: Lsn) -> io::Result<()>;
+    fn submit_sync(&self, barrier_lsn: Lsn) -> io::Result<SyncSubmission>;
 
     /// Whether a separately completed durability barrier is in flight.
     /// The driver uses this to avoid repeatedly submitting the same target.
@@ -236,11 +243,11 @@ impl WalIoBackend for FdatasyncBackend {
         })
     }
 
-    fn submit_sync(&self, _barrier_lsn: Lsn) -> io::Result<()> {
+    fn submit_sync(&self, _barrier_lsn: Lsn) -> io::Result<SyncSubmission> {
         // The syncer thread is self-driven via the shared `flush_requested`
         // condvar (notified by `request_durable` / `wait_for_durable` /
         // `set_commit_mode` / the driver). Nothing to do here.
-        Ok(())
+        Ok(SyncSubmission::BackendManaged)
     }
 
     fn poll_completions(&self, _sink: &mut dyn FnMut(Completion)) {
@@ -441,8 +448,8 @@ impl WalIoBackend for Pwritev2DsyncBackend {
         })
     }
 
-    fn submit_sync(&self, _barrier_lsn: Lsn) -> io::Result<()> {
-        Ok(())
+    fn submit_sync(&self, _barrier_lsn: Lsn) -> io::Result<SyncSubmission> {
+        Ok(SyncSubmission::BackendManaged)
     }
 
     fn poll_completions(&self, _sink: &mut dyn FnMut(Completion)) {}

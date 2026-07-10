@@ -139,6 +139,8 @@ pub enum WalEvent {
     WriteBytes,
     /// Background syncer invoked a sync syscall.
     SyncCall,
+    /// Durability target absorbed by an already in-flight io_uring barrier.
+    SyncCoalesced,
     /// `durable_lsn` was advanced by the syncer.
     DurableAdvance,
     /// Page-image records appended.
@@ -464,12 +466,21 @@ impl SubmittedWrites {
     }
 }
 
+fn should_submit_sync(
+    pending_sync: bool,
+    sync_in_flight: bool,
+    written_lsn: Lsn,
+    sync_target: Lsn,
+) -> bool {
+    pending_sync && (!sync_in_flight || written_lsn > sync_target)
+}
+
 #[cfg(test)]
 mod submitted_writes_tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use super::{SubmittedWrites, Wal};
+    use super::{SubmittedWrites, Wal, should_submit_sync};
 
     #[test]
     fn written_progress_waits_for_the_submitted_extent_prefix() {
@@ -481,6 +492,14 @@ mod submitted_writes_tests {
         assert_eq!(writes.complete(5), None);
         assert_eq!(writes.complete(10), Some(10));
         assert_eq!(writes.complete(20), Some(20));
+    }
+
+    #[test]
+    fn sync_submission_waits_for_a_new_target_while_barrier_is_in_flight() {
+        assert!(should_submit_sync(true, false, 10, 10));
+        assert!(should_submit_sync(true, true, 20, 10));
+        assert!(!should_submit_sync(true, true, 10, 10));
+        assert!(!should_submit_sync(false, false, 10, 0));
     }
 
     #[test]
@@ -2593,10 +2612,13 @@ impl WalInner {
                     {
                         return;
                     }
-                    let sync_target_advanced = written > self.backend.sync_target();
                     if pending_write
-                        || (pending_sync
-                            && (!self.backend.sync_in_flight() || sync_target_advanced))
+                        || should_submit_sync(
+                            pending_sync,
+                            self.backend.sync_in_flight(),
+                            written,
+                            self.backend.sync_target(),
+                        )
                     {
                         break;
                     }
@@ -2700,9 +2722,26 @@ impl WalInner {
                 let pending_sync = written > durable
                     && (requested_durable > durable
                         || (relaxed_mode && self.should_sync_relaxed(written, last_sync)));
-                if pending_sync && let Err(err) = self.backend.submit_sync(written) {
-                    self.record_backend_failure(err);
-                    return;
+                if should_submit_sync(
+                    pending_sync,
+                    self.backend.sync_in_flight(),
+                    written,
+                    self.backend.sync_target(),
+                ) {
+                    match self.backend.submit_sync(written) {
+                        Ok(crate::backend::SyncSubmission::Coalesced) => {
+                            self.stats.events.inc(WalEvent::SyncCoalesced);
+                        }
+                        Ok(
+                            crate::backend::SyncSubmission::Submitted
+                            | crate::backend::SyncSubmission::Unchanged
+                            | crate::backend::SyncSubmission::BackendManaged,
+                        ) => {}
+                        Err(err) => {
+                            self.record_backend_failure(err);
+                            return;
+                        }
+                    }
                 }
             }
             // Update last_sync when a sync completion was observed this
