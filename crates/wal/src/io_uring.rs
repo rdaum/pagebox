@@ -717,7 +717,12 @@ impl IoUringShared {
             }
             return;
         }
-        let write_latency_ns = write.write_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let completed_at = std::time::Instant::now();
+        let write_latency_ns = completed_at
+            .duration_since(write.write_start)
+            .as_nanos()
+            .min(u64::MAX as u128) as u64;
+        self.sync_barrier.lock().write_completed(completed_at);
         let completion = Completion {
             kind: CompletionKind::Written {
                 buffer: write.buffer,
@@ -807,11 +812,13 @@ impl IoUringShared {
     /// Dispatch a CQE to the correct `WalInner`, looked up by fd.
     fn dispatch_cqe(&self, user_data: u64, res: i32) {
         if is_fsync(user_data) {
-            let sync = self.sync_barrier.lock().complete();
-            let Some(sync) = sync else {
+            let completed_at = std::time::Instant::now();
+            let completed_sync = self.sync_barrier.lock().complete(completed_at);
+            let Some(completed_sync) = completed_sync else {
                 self.record_failure_for_all("unknown io_uring FSYNC completion");
                 return;
             };
+            let sync = completed_sync.sync;
             if res < 0 {
                 let err = io::Error::from_raw_os_error(-res);
                 if let Some(inner) = self.lookup_inner(sync.fd) {
@@ -819,12 +826,13 @@ impl IoUringShared {
                 }
                 return;
             }
-            let sync_latency_ns = sync.started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
             if let Some(inner) = self.lookup_inner(sync.fd) {
                 inner.handle_completion(Completion {
                     kind: CompletionKind::Durable {
                         lsn: sync.lsn,
-                        sync_latency_ns,
+                        sync_latency_ns: completed_sync.sync_latency_ns,
+                        drain_wait_ns: completed_sync.drain_wait_ns,
+                        fsync_latency_ns: completed_sync.fsync_latency_ns,
                     },
                 });
             }
@@ -850,6 +858,7 @@ struct SyncBarrierState {
     requested_lsn: Lsn,
     completed_lsn: Lsn,
     in_flight: Option<InFlightSync>,
+    last_write_completion: Option<std::time::Instant>,
 }
 
 impl SyncBarrierState {
@@ -868,17 +877,41 @@ impl SyncBarrierState {
         assert!(self.in_flight.replace(sync).is_none());
     }
 
-    fn complete(&mut self) -> Option<InFlightSync> {
+    fn write_completed(&mut self, completed_at: std::time::Instant) {
+        self.last_write_completion = Some(completed_at);
+    }
+
+    fn complete(&mut self, completed_at: std::time::Instant) -> Option<CompletedSync> {
         let sync = self.in_flight.take()?;
         self.completed_lsn = self.completed_lsn.max(sync.lsn);
-        Some(sync)
+        let drain_completed_at = self
+            .last_write_completion
+            .filter(|write_completed_at| *write_completed_at > sync.started)
+            .unwrap_or(sync.started);
+        Some(CompletedSync {
+            sync_latency_ns: duration_ns(completed_at.duration_since(sync.started)),
+            drain_wait_ns: duration_ns(drain_completed_at.duration_since(sync.started)),
+            fsync_latency_ns: duration_ns(completed_at.duration_since(drain_completed_at)),
+            sync,
+        })
     }
+}
+
+struct CompletedSync {
+    sync: InFlightSync,
+    sync_latency_ns: u64,
+    drain_wait_ns: u64,
+    fsync_latency_ns: u64,
 }
 
 struct InFlightSync {
     lsn: Lsn,
     fd: RawFd,
     started: std::time::Instant,
+}
+
+fn duration_ns(duration: std::time::Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
 }
 
 /// io_uring backend. One `IoUringShared` is shared across all WAL shards so
@@ -1085,7 +1118,11 @@ impl WalIoBackend for IoUringBackend {
                 return;
             }
             if is_fsync(user_data) {
-                let _ = self.shared.sync_barrier.lock().complete();
+                let _ = self
+                    .shared
+                    .sync_barrier
+                    .lock()
+                    .complete(std::time::Instant::now());
             } else {
                 let _ = self.shared.take_slot(slot_of(user_data));
             }
@@ -1151,7 +1188,12 @@ mod tests {
         assert!(!barrier.request(10));
         assert!(barrier.request(20));
         assert_eq!(barrier.next_target(), None);
-        assert_eq!(barrier.complete().map(|sync| sync.lsn), Some(10));
+        assert_eq!(
+            barrier
+                .complete(std::time::Instant::now())
+                .map(|completed| completed.sync.lsn),
+            Some(10)
+        );
         assert_eq!(barrier.next_target(), Some(20));
 
         barrier.submitted(InFlightSync {
@@ -1159,7 +1201,32 @@ mod tests {
             fd: 7,
             started: std::time::Instant::now(),
         });
-        assert_eq!(barrier.complete().map(|sync| sync.lsn), Some(20));
+        assert_eq!(
+            barrier
+                .complete(std::time::Instant::now())
+                .map(|completed| completed.sync.lsn),
+            Some(20)
+        );
         assert_eq!(barrier.next_target(), None);
+    }
+
+    #[test]
+    fn sync_latency_splits_drain_wait_from_fsync_service() {
+        let started = std::time::Instant::now();
+        let mut barrier = SyncBarrierState::default();
+        assert!(barrier.request(10));
+        barrier.submitted(InFlightSync {
+            lsn: 10,
+            fd: 7,
+            started,
+        });
+        barrier.write_completed(started + std::time::Duration::from_millis(2));
+
+        let completed = barrier
+            .complete(started + std::time::Duration::from_millis(5))
+            .unwrap();
+        assert_eq!(completed.sync_latency_ns, 5_000_000);
+        assert_eq!(completed.drain_wait_ns, 2_000_000);
+        assert_eq!(completed.fsync_latency_ns, 3_000_000);
     }
 }

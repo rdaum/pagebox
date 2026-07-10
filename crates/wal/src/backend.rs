@@ -98,7 +98,12 @@ pub(crate) enum CompletionKind {
     /// An fsync finished; `durable_lsn` should advance to `lsn`. Retained for
     /// backends that report durability separately from write completion.
     #[allow(dead_code)]
-    Durable { lsn: Lsn, sync_latency_ns: u64 },
+    Durable {
+        lsn: Lsn,
+        sync_latency_ns: u64,
+        drain_wait_ns: u64,
+        fsync_latency_ns: u64,
+    },
 }
 
 #[allow(dead_code)]

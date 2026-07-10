@@ -84,8 +84,14 @@ struct WalSampleMetrics {
     sync_calls: u64,
     sync_coalesced: u64,
     durable_advances: u64,
+    write_latency_count: u64,
+    write_latency_ns: u64,
     sync_latency_count: u64,
     sync_latency_ns: u64,
+    drain_latency_count: u64,
+    drain_latency_ns: u64,
+    fsync_latency_count: u64,
+    fsync_latency_ns: u64,
 }
 
 #[cfg(feature = "metrics")]
@@ -126,15 +132,32 @@ impl WalSampleMetrics {
                 labels: MetricLabels<'_>,
                 histogram: &dyn HistogramSnapshot,
             ) {
-                if meta.name != "wal_latencies"
-                    || !labels
-                        .iter()
-                        .any(|label| label.name == "latency" && label.value == "sync")
-                {
+                if meta.name != "wal_latencies" {
                     return;
                 }
-                self.0.sync_latency_count += histogram.count();
-                self.0.sync_latency_ns += histogram.sum();
+                let latency = labels
+                    .iter()
+                    .find(|label| label.name == "latency")
+                    .map(|label| label.value);
+                match latency {
+                    Some("write") => {
+                        self.0.write_latency_count += histogram.count();
+                        self.0.write_latency_ns += histogram.sum();
+                    }
+                    Some("sync") => {
+                        self.0.sync_latency_count += histogram.count();
+                        self.0.sync_latency_ns += histogram.sum();
+                    }
+                    Some("sync_drain") => {
+                        self.0.drain_latency_count += histogram.count();
+                        self.0.drain_latency_ns += histogram.sum();
+                    }
+                    Some("sync_fsync") => {
+                        self.0.fsync_latency_count += histogram.count();
+                        self.0.fsync_latency_ns += histogram.sum();
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -151,10 +174,22 @@ impl WalSampleMetrics {
             sync_calls: self.sync_calls.saturating_sub(start.sync_calls),
             sync_coalesced: self.sync_coalesced.saturating_sub(start.sync_coalesced),
             durable_advances: self.durable_advances.saturating_sub(start.durable_advances),
+            write_latency_count: self
+                .write_latency_count
+                .saturating_sub(start.write_latency_count),
+            write_latency_ns: self.write_latency_ns.saturating_sub(start.write_latency_ns),
             sync_latency_count: self
                 .sync_latency_count
                 .saturating_sub(start.sync_latency_count),
             sync_latency_ns: self.sync_latency_ns.saturating_sub(start.sync_latency_ns),
+            drain_latency_count: self
+                .drain_latency_count
+                .saturating_sub(start.drain_latency_count),
+            drain_latency_ns: self.drain_latency_ns.saturating_sub(start.drain_latency_ns),
+            fsync_latency_count: self
+                .fsync_latency_count
+                .saturating_sub(start.fsync_latency_count),
+            fsync_latency_ns: self.fsync_latency_ns.saturating_sub(start.fsync_latency_ns),
         }
     }
 
@@ -165,8 +200,14 @@ impl WalSampleMetrics {
         self.sync_calls += other.sync_calls;
         self.sync_coalesced += other.sync_coalesced;
         self.durable_advances += other.durable_advances;
+        self.write_latency_count += other.write_latency_count;
+        self.write_latency_ns += other.write_latency_ns;
         self.sync_latency_count += other.sync_latency_count;
         self.sync_latency_ns += other.sync_latency_ns;
+        self.drain_latency_count += other.drain_latency_count;
+        self.drain_latency_ns += other.drain_latency_ns;
+        self.fsync_latency_count += other.fsync_latency_count;
+        self.fsync_latency_ns += other.fsync_latency_ns;
     }
 }
 
@@ -240,7 +281,11 @@ impl ConcurrentWalCtx {
         let writes_per_barrier = ratio(total.write_calls, total.sync_calls);
         let coalesced_per_barrier = ratio(total.sync_coalesced, total.sync_calls);
         let mean_write_kib = ratio(total.write_bytes, total.write_calls) / 1024.0;
+        let mean_write_completion_us =
+            ratio(total.write_latency_ns, total.write_latency_count) / 1_000.0;
         let mean_sync_us = ratio(total.sync_latency_ns, total.sync_latency_count) / 1_000.0;
+        let mean_drain_us = ratio(total.drain_latency_ns, total.drain_latency_count) / 1_000.0;
+        let mean_fsync_us = ratio(total.fsync_latency_ns, total.fsync_latency_count) / 1_000.0;
 
         println!("  WAL barrier metrics ({measured_samples} measured samples):");
         println!(
@@ -251,8 +296,11 @@ impl ConcurrentWalCtx {
             "    commits/barrier={commits_per_barrier:.3} writes/barrier={writes_per_barrier:.3} coalesced/barrier={coalesced_per_barrier:.3}"
         );
         println!(
-            "    mean_write={mean_write_kib:.1} KiB mean_barrier_latency={mean_sync_us:.1} us durable_advances={}",
+            "    mean_write={mean_write_kib:.1} KiB write_completion={mean_write_completion_us:.1} us durable_advances={}",
             total.durable_advances
+        );
+        println!(
+            "    barrier_total={mean_sync_us:.1} us drain_wait={mean_drain_us:.1} us fsync_service={mean_fsync_us:.1} us"
         );
     }
 }

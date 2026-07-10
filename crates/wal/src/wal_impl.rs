@@ -169,6 +169,10 @@ pub enum WalLatency {
     Write,
     /// Per-`fdatasync` latency from the syncer thread.
     Sync,
+    /// io_uring barrier time waiting for preceding WRITE completions.
+    SyncDrain,
+    /// io_uring time from the final preceding WRITE completion to FSYNC CQE.
+    SyncFsync,
 }
 
 /// WAL telemetry: per-event labelled counters and per-latency labelled
@@ -2810,12 +2814,22 @@ impl WalInner {
             CompletionKind::Durable {
                 lsn,
                 sync_latency_ns,
+                drain_wait_ns,
+                fsync_latency_ns,
             } => {
                 self.stats.events.inc(WalEvent::SyncCall);
                 self.stats
                     .latencies
                     .get(WalLatency::Sync)
                     .record(sync_latency_ns);
+                self.stats
+                    .latencies
+                    .get(WalLatency::SyncDrain)
+                    .record(drain_wait_ns);
+                self.stats
+                    .latencies
+                    .get(WalLatency::SyncFsync)
+                    .record(fsync_latency_ns);
                 self.advance_durable_lsn(lsn);
                 self.flush_done.notify_all();
                 self.flush_requested.notify_all();
