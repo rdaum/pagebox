@@ -1,6 +1,10 @@
+#[cfg(feature = "metrics")]
+use std::sync::Mutex;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+#[cfg(feature = "metrics")]
+use fast_telemetry::{HistogramSnapshot, MetricLabels, MetricMeta, MetricVisitor};
 use micromeasure::{
     BenchContext, ConcurrentBenchContext, ConcurrentBenchControl, ConcurrentWorker,
     ConcurrentWorkerResult, Throughput, benchmark_main, black_box,
@@ -60,6 +64,110 @@ struct ConcurrentWalState {
     wal: Arc<Wal>,
     _dir: tempfile::TempDir,
     pages: Arc<Vec<[u8; PAGE_SIZE]>>,
+    #[cfg(feature = "metrics")]
+    strict_sample_metrics: Mutex<WalSampleSeries>,
+}
+
+#[cfg(feature = "metrics")]
+#[derive(Default)]
+struct WalSampleSeries {
+    start: Option<WalSampleMetrics>,
+    completed: Vec<WalSampleMetrics>,
+}
+
+#[cfg(feature = "metrics")]
+#[derive(Clone, Copy, Default)]
+struct WalSampleMetrics {
+    flush_calls: u64,
+    write_calls: u64,
+    write_bytes: u64,
+    sync_calls: u64,
+    sync_coalesced: u64,
+    durable_advances: u64,
+    sync_latency_count: u64,
+    sync_latency_ns: u64,
+}
+
+#[cfg(feature = "metrics")]
+impl WalSampleMetrics {
+    fn capture(wal: &Wal) -> Self {
+        struct Visitor(WalSampleMetrics);
+
+        impl MetricVisitor for Visitor {
+            fn counter(&mut self, meta: MetricMeta<'_>, labels: MetricLabels<'_>, value: i64) {
+                if meta.name != "wal_events" {
+                    return;
+                }
+                let value = value.max(0) as u64;
+                let event = labels
+                    .iter()
+                    .find(|label| label.name == "event")
+                    .map(|label| label.value);
+                match event {
+                    Some("flush_call") => self.0.flush_calls += value,
+                    Some("write_call") => self.0.write_calls += value,
+                    Some("write_bytes") => self.0.write_bytes += value,
+                    Some("sync_call") => self.0.sync_calls += value,
+                    Some("sync_coalesced") => self.0.sync_coalesced += value,
+                    Some("durable_advance") => self.0.durable_advances += value,
+                    _ => {}
+                }
+            }
+
+            fn gauge_i64(&mut self, _meta: MetricMeta<'_>, _labels: MetricLabels<'_>, _value: i64) {
+            }
+
+            fn gauge_f64(&mut self, _meta: MetricMeta<'_>, _labels: MetricLabels<'_>, _value: f64) {
+            }
+
+            fn histogram(
+                &mut self,
+                meta: MetricMeta<'_>,
+                labels: MetricLabels<'_>,
+                histogram: &dyn HistogramSnapshot,
+            ) {
+                if meta.name != "wal_latencies"
+                    || !labels
+                        .iter()
+                        .any(|label| label.name == "latency" && label.value == "sync")
+                {
+                    return;
+                }
+                self.0.sync_latency_count += histogram.count();
+                self.0.sync_latency_ns += histogram.sum();
+            }
+        }
+
+        let mut visitor = Visitor(Self::default());
+        wal.visit_metrics(&mut visitor);
+        visitor.0
+    }
+
+    fn delta(self, start: Self) -> Self {
+        Self {
+            flush_calls: self.flush_calls.saturating_sub(start.flush_calls),
+            write_calls: self.write_calls.saturating_sub(start.write_calls),
+            write_bytes: self.write_bytes.saturating_sub(start.write_bytes),
+            sync_calls: self.sync_calls.saturating_sub(start.sync_calls),
+            sync_coalesced: self.sync_coalesced.saturating_sub(start.sync_coalesced),
+            durable_advances: self.durable_advances.saturating_sub(start.durable_advances),
+            sync_latency_count: self
+                .sync_latency_count
+                .saturating_sub(start.sync_latency_count),
+            sync_latency_ns: self.sync_latency_ns.saturating_sub(start.sync_latency_ns),
+        }
+    }
+
+    fn add_assign(&mut self, other: Self) {
+        self.flush_calls += other.flush_calls;
+        self.write_calls += other.write_calls;
+        self.write_bytes += other.write_bytes;
+        self.sync_calls += other.sync_calls;
+        self.sync_coalesced += other.sync_coalesced;
+        self.durable_advances += other.durable_advances;
+        self.sync_latency_count += other.sync_latency_count;
+        self.sync_latency_ns += other.sync_latency_ns;
+    }
 }
 
 #[derive(Clone)]
@@ -88,7 +196,73 @@ impl ConcurrentWalCtx {
             wal,
             _dir: dir,
             pages,
+            #[cfg(feature = "metrics")]
+            strict_sample_metrics: Mutex::new(WalSampleSeries::default()),
         }))
+    }
+
+    fn reset_strict_sample(&self) {
+        #[cfg(feature = "metrics")]
+        self.finish_strict_sample_metrics();
+        self.wal
+            .reset()
+            .expect("reset strict concurrent WAL between samples");
+        #[cfg(feature = "metrics")]
+        {
+            self.strict_sample_metrics.lock().unwrap().start =
+                Some(WalSampleMetrics::capture(&self.wal));
+        }
+    }
+
+    #[cfg(feature = "metrics")]
+    fn finish_strict_sample_metrics(&self) {
+        let end = WalSampleMetrics::capture(&self.wal);
+        let mut series = self.strict_sample_metrics.lock().unwrap();
+        if let Some(start) = series.start.take() {
+            series.completed.push(end.delta(start));
+        }
+    }
+
+    #[cfg(feature = "metrics")]
+    fn report_strict_sample_metrics(&self, measured_samples: usize) {
+        self.finish_strict_sample_metrics();
+        let series = self.strict_sample_metrics.lock().unwrap();
+        assert!(
+            series.completed.len() >= measured_samples,
+            "missing strict WAL metric samples"
+        );
+        let samples = &series.completed[series.completed.len() - measured_samples..];
+        let mut total = WalSampleMetrics::default();
+        for sample in samples {
+            total.add_assign(*sample);
+        }
+        let commits_per_barrier = ratio(total.flush_calls, total.sync_calls);
+        let writes_per_barrier = ratio(total.write_calls, total.sync_calls);
+        let coalesced_per_barrier = ratio(total.sync_coalesced, total.sync_calls);
+        let mean_write_kib = ratio(total.write_bytes, total.write_calls) / 1024.0;
+        let mean_sync_us = ratio(total.sync_latency_ns, total.sync_latency_count) / 1_000.0;
+
+        println!("  WAL barrier metrics ({measured_samples} measured samples):");
+        println!(
+            "    commits={} writes={} barriers={} coalesced_targets={}",
+            total.flush_calls, total.write_calls, total.sync_calls, total.sync_coalesced
+        );
+        println!(
+            "    commits/barrier={commits_per_barrier:.3} writes/barrier={writes_per_barrier:.3} coalesced/barrier={coalesced_per_barrier:.3}"
+        );
+        println!(
+            "    mean_write={mean_write_kib:.1} KiB mean_barrier_latency={mean_sync_us:.1} us durable_advances={}",
+            total.durable_advances
+        );
+    }
+}
+
+#[cfg(feature = "metrics")]
+fn ratio(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
     }
 }
 
@@ -182,20 +356,17 @@ fn concurrent_commit_worker(
     ctx: &ConcurrentWalCommitStrictCtx,
     control: &ConcurrentBenchControl,
 ) -> ConcurrentWorkerResult {
-    concurrent_commit_worker_inner(&ctx.0, control)
+    ConcurrentWorkerResult::operations(concurrent_commit_worker_inner(&ctx.0, control))
 }
 
 fn concurrent_commit_relaxed_worker(
     ctx: &ConcurrentWalCommitRelaxedCtx,
     control: &ConcurrentBenchControl,
 ) -> ConcurrentWorkerResult {
-    concurrent_commit_worker_inner(&ctx.0, control)
+    ConcurrentWorkerResult::operations(concurrent_commit_worker_inner(&ctx.0, control))
 }
 
-fn concurrent_commit_worker_inner(
-    ctx: &ConcurrentWalCtx,
-    control: &ConcurrentBenchControl,
-) -> ConcurrentWorkerResult {
+fn concurrent_commit_worker_inner(ctx: &ConcurrentWalCtx, control: &ConcurrentBenchControl) -> u64 {
     let mut commits = 0u64;
     let base = ((control.thread_index() as u64) << 32) | control.role_thread_index() as u64;
 
@@ -207,7 +378,7 @@ fn concurrent_commit_worker_inner(
         commits = commits.wrapping_add(1);
     }
 
-    ConcurrentWorkerResult::operations(commits)
+    commits
 }
 
 benchmark_main!(|runner| {
@@ -301,6 +472,7 @@ benchmark_main!(|runner| {
     });
 
     for &n_threads in &[1usize, 2, 4, 8] {
+        let benchmark_name = format!("{n_threads}t");
         // micromeasure invokes the factory outside each warm-up or measured
         // sample. Keep the threads and ring alive, but truncate the WAL before
         // returning the context so every timed sample starts from a bounded,
@@ -332,10 +504,7 @@ benchmark_main!(|runner| {
                     num_threads,
                 ))
             });
-            ctx.0
-                .wal
-                .reset()
-                .expect("reset strict concurrent WAL between samples");
+            ctx.0.reset_strict_sample();
             ctx.clone()
         };
         let commit_workers = [ConcurrentWorker {
@@ -348,7 +517,7 @@ benchmark_main!(|runner| {
             g.sample_duration(Duration::from_millis(200))
                 .throughput(Throughput::per_operation(1, "pages"))
                 .factory(&append_factory)
-                .bench(&format!("{n_threads}t"), &append_workers);
+                .bench(&benchmark_name, &append_workers);
         });
 
         runner.concurrent_group::<ConcurrentWalCommitStrictCtx>(
@@ -357,9 +526,26 @@ benchmark_main!(|runner| {
                 g.sample_duration(Duration::from_millis(200))
                     .throughput(Throughput::per_operation(1, "commits"))
                     .factory(&strict_factory)
-                    .bench(&format!("{n_threads}t"), &commit_workers);
+                    .bench(&benchmark_name, &commit_workers);
             },
         );
+        #[cfg(feature = "metrics")]
+        {
+            let measured_samples = runner
+                .results()
+                .into_iter()
+                .rev()
+                .find(|result| {
+                    result.group == "wal_concurrent_commit_strict" && result.name == benchmark_name
+                })
+                .map(|result| result.stats.samples)
+                .expect("missing strict concurrent benchmark result");
+            strict_ctx
+                .get()
+                .expect("strict concurrent WAL context was not prepared")
+                .0
+                .report_strict_sample_metrics(measured_samples);
+        }
 
         let relaxed_ctx = OnceLock::<ConcurrentWalCommitRelaxedCtx>::new();
         let relaxed_factory = |num_threads| {
@@ -387,7 +573,7 @@ benchmark_main!(|runner| {
                 g.sample_duration(Duration::from_millis(200))
                     .throughput(Throughput::per_operation(1, "commits"))
                     .factory(&relaxed_factory)
-                    .bench(&format!("{n_threads}t"), &relaxed_workers);
+                    .bench(&benchmark_name, &relaxed_workers);
             },
         );
     }
