@@ -1,6 +1,6 @@
 //! Engine adapters.
 //!
-//! Each submodule wraps an external KV engine in the [`KvEngine`] trait.
+//! Each submodule wraps a KV engine in the [`KvEngine`](crate::engine::KvEngine) trait.
 
 pub mod kvstore_adapter;
 

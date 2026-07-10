@@ -12,7 +12,8 @@ Extracted from an unpublished OLTP database ("Boxter"). `kvstore` is the referen
 crates + `clap`), proving the substrate composes with no database-level types in scope.
 
 Substrate components: swizzled-pointer buffer pool (anonymous-`mmap` `MAP_NORESERVE` reservation, resident-budget
-eviction); file-backed page store (sharded free-page allocator, 4K/64K classes, header-resident user-meta slots);
+eviction); file-backed page store (sharded free-page allocator, one unified 64 KiB page size, header-resident
+user-meta slots);
 WAL (group commit, configurable sync backends, relaxed/strict commit modes, streaming replay, crash recovery);
 concurrent B+tree (swizzled references, hybrid latching, B-link right-sibling chase, ordered/prefix scans, reopen
 recovery via user-meta slots); hybrid optimistic/shared/exclusive latch; SWIP hot/cool/evicted state machine on a
@@ -94,12 +95,16 @@ patterns without evidence and explicit maintainer direction. Do not introduce de
 
 ## Repository Structure
 
-Cargo workspace (resolver v3, Rust edition 2024, MSRV 1.95). Each hot-path crate exposes a `metrics` feature (on by
-default); disabled, the crate pulls zero telemetry dependencies and no-op shims take their place.
+Cargo workspace (resolver v3, Rust edition 2024, MSRV 1.95). The WAL, storage, and B+tree crates expose a `metrics`
+feature; the hybrid latch exposes `latch-metrics`. These features are enabled by default and select
+`fast-telemetry`; the first three crates use local no-op shims when their own feature is disabled. Because internal
+dependencies currently retain their default features, disabling one top-level crate's defaults does not guarantee
+that `fast-telemetry` disappears from the complete dependency graph.
 
 ```text
 crates/
 ├── kvstore/           # Example durable KV store binary (proves composition)
+├── kvbench/            # Workload/verification harness; optional external-engine adapters
 ├── btree/             # Concurrent B+tree: swizzled pointers, hybrid latching, ordered scans
 ├── storage/           # Buffer pool, page store, slotted pages, free-page allocator, buffer frames
 ├── wal/               # WAL: format, append path, group commit, sync, replay, telemetry
@@ -126,9 +131,10 @@ kvstore        -> btree, storage, wal, frame-kernel  (+ clap)
 
 Feature flags and metrics:
 
-- `--features metrics` (default): enables `fast-telemetry` in `pagebox-wal`, `pagebox-storage`, `pagebox-btree`,
-  and `pagebox-hybrid-latch`.
-- `--no-default-features`: no-op telemetry shims, zero telemetry dependencies.
+- `metrics` (default) enables `fast-telemetry` in `pagebox-wal`, `pagebox-storage`, and `pagebox-btree`.
+- `latch-metrics` (default) enables latch telemetry in `pagebox-hybrid-latch`.
+- `--no-default-features` disables the selected crate's own default feature. Internal dependencies currently keep
+  their defaults, so inspect `cargo tree -e features` before claiming a fully telemetry-free graph.
 - Downstream embedders propagate the feature:
   ```toml
   [features]
@@ -139,7 +145,9 @@ Feature flags and metrics:
 WAL runtime configuration (environment variables, read in `pagebox-wal`):
 
 - `PAGEBOX_WAL_DIRECT_IO=1`: open WAL segments with `O_DIRECT` and aligned writes (Linux-gated).
-- `PAGEBOX_WAL_SYNC_BACKEND=fdatasync|pwritev2_dsync`: select the durable-sync backend.
+- `PAGEBOX_WAL_SYNC_BACKEND=fdatasync|pwritev2_dsync|io_uring`: select the durable-sync backend (`io_uring` is
+  Linux-only).
+- `PAGEBOX_WAL_SHARDS=N`: select WAL shards for the synchronous backends; `io_uring` currently forces one shard.
 - `PAGEBOX_WAL_GROUP_COMMIT_DELAY_MAX_US`, `PAGEBOX_WAL_GROUP_COMMIT_TARGET_RECORDS`: group-commit batching knobs.
 
 Tests, runs, and benchmarks:
@@ -177,8 +185,9 @@ the harness the existing bench uses.
 - Avoid deep nesting. Prefer early returns, `let else`, match guards, and match let-chains so the success path stays
   visible and failure cases are handled up front.
 - Define custom errors with `Display` and `std::error::Error` where appropriate. On the storage and WAL hot paths,
-  prefer infallible fast paths with explicit panic-on-invariant-violation guards (see `#[should_panic]` tests in the
-  audit) over viral `Result` propagation when the failure is a genuine internal-corruption case.
+  prefer infallible fast paths with explicit panic-on-invariant-violation guards (see the existing
+  `#[should_panic]` contract tests) over viral `Result` propagation when the failure is a genuine
+  internal-corruption case.
 - Add tests for new functionality and regressions; prefer real logic over mocked behaviour, and property/differential
   tests against a `BTreeMap` / model oracle over another happy-path smoke test. Use descriptive assertion messages.
 - Use Canadian English spellings in docs and comments.
@@ -191,7 +200,7 @@ The B+tree traversal, buffer pool fix/evict, slotted-page insert/scan, free-page
 paths are all hot. Prefer low or zero-copy solutions (page bytes are accessed in place through buffer-frame slices;
 do not copy them out unless an API boundary requires ownership — the B+tree `lookup_with` callback variant exists
 specifically to avoid allocating on the read path). Avoid unnecessary allocations. Follow cache-friendly patterns
-(slotted pages keep the slot array and key/value heap on the same 4 KiB page; do not introduce indirection that
+(slotted pages keep the slot array and key/value heap on the same 64 KiB page; do not introduce indirection that
 defeats this). Use benchmark evidence for optimization claims; measure before and after.
 
 Key patterns and invariants (preserved across changes):

@@ -29,9 +29,9 @@ need precise coordination.
 ## Used By
 
 - `pagebox-storage` for frame latching.
-- `pagebox-btree` and `pagebox-betree` for tree page traversal and mutation.
-- `pagebox-runtime` and `pagebox-tpcc-esque` for telemetry and integration paths.
+- `pagebox-btree` for tree page traversal and mutation.
 
 ## Uses
 
-- No other Boxter crates.
+- `parking_lot` for the blocking shared/exclusive lock.
+- Optional `fast-telemetry` through the default `latch-metrics` feature.

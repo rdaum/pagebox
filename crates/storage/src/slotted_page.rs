@@ -1,8 +1,8 @@
-//! Slotted-page container: a sorted key/value byte layout that fits in a
-//! single 4 KiB page.
+//! Slotted-page container: a sorted key/value byte layout that fits in one
+//! unified 64 KiB Pagebox page.
 //!
-//! [`SlottedPage`] is the in-memory page format used by the B+tree (and,
-//! transitively, by the table layer). It is `#[repr(transparent)]` over a
+//! [`SlottedPage`] is the in-memory page format used by the B+tree. It is
+//! `#[repr(transparent)]` over a
 //! `[u8; PAGE_SIZE]`: zero allocation, zero indirection — a `SlottedPage`
 //! *is* the frame's page bytes reinterpreted. All access is through
 //! `unsafe` casting helpers ([`SlottedPage::from_page`] /
@@ -14,12 +14,12 @@
 //! ```text
 //!  ┌──────────┬───────────────┬──────────────┬────────────────────┐
 //!  │PageHeader│ Slot[0] ...   │   <gap>      │ value key  value key│
-//!  │ 16 bytes │ slot array    │ (free space) │     ↑ data heap  ↑  │
+//!  │ 24 bytes │ slot array    │ (free space) │     ↑ data heap  ↑  │
 //!  └──────────┴───────────────┴──────────────┴────────────────────┘
 //!   ← slot array grows forward                data heap grows backward ←
 //! ```
 //!
-//! The 16-byte `PageHeader` holds `num_slots`, `data_offset` (start of the
+//! The 24-byte `PageHeader` holds `num_slots`, `data_offset` (start of the
 //! live data heap, growing *down* from `PAGE_SIZE`), `space_used`, a packed
 //! `flags` word (low byte = page-specific flags; nibble 1 = page-type
 //! discriminator; see [`PageType`]), and the page LSN. Each 12-byte `Slot`

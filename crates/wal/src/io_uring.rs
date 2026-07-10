@@ -9,16 +9,17 @@
 //!
 //! ## Model
 //!
-//! The [`IoUring`] owns the ring fd and three `mmap`'d regions (SQ ring, SQE
-//! array, CQ ring). Writes are submitted as `IORING_OP_WRITEV` SQEs; an fsync
-//! is submitted as an `IORING_OP_FSYNC` SQE linked to the preceding write via
-//! `IOSQE_IO_LINK` so the fsync only fires once the write completes. SQE
-//! `user_data` carries a packed id encoding whether the completion is a write
-//! or fsync and (for writes) the slab slot holding the in-flight `WalBuffer`.
+//! [`IoUring`] owns the ring fd and two user-allocated regions: an SQE array
+//! and a combined SQ/CQ ring structure supplied through
+//! `IORING_SETUP_NO_MMAP`. Writes are submitted as `IORING_OP_WRITE` SQEs; an
+//! `IORING_OP_FSYNC` SQE is linked to each write with `IOSQE_IO_LINK`, so the
+//! fsync only fires after its write completes. SQE `user_data` encodes whether
+//! the completion is a write or fsync and the slab slot holding the in-flight
+//! `WalBuffer`.
 //!
-//! Completion reaping is a single atomic CQ tail/head dance; no syscalls are
-//! needed to reap. `io_uring_enter` is called to flush submitted SQEs to the
-//! kernel and (optionally) to wait for completions.
+//! A dedicated reaper thread calls `io_uring_enter` to flush submissions and
+//! wait for CQEs. Reaping a ready CQE is then an atomic CQ tail/head update;
+//! the reaper dispatches it to the correct `WalInner` through an fd registry.
 //!
 //! v1 deliberately uses plain kernel polling (no `SQPOLL`, no registered
 //! buffers/files); those are future optimisations requiring their own bench
@@ -537,9 +538,9 @@ impl IoUring {
         self.pending_submissions
     }
 
-    /// Atomically take and reset the pending-submission count. Used by
-    /// [`IoUringBackend::poll_completions_blocking`] to flush SQEs without
-    /// holding the ring mutex during the blocking `io_uring_enter` syscall.
+    /// Atomically take and reset the pending-submission count so the reaper
+    /// (or the blocking fallback hook) can enter the kernel without holding
+    /// the ring mutex.
     pub(crate) fn take_pending_submissions(&mut self) -> u32 {
         let pending = self.pending_submissions;
         self.pending_submissions = 0;

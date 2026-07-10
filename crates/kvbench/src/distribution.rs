@@ -36,7 +36,7 @@ impl Distribution {
     }
 }
 
-/// A bound sampling generator. Call [`sample`] with the current operation
+/// A bound sampling generator. Call [`KeySampler::sample`] with the current operation
 /// index (0-based) to get a key index in `[0, record_count)`.
 pub enum KeySampler {
     Uniform(UniformGen),

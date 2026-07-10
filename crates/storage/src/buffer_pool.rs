@@ -997,7 +997,7 @@ impl Drop for EvictionPermit<'_> {
 /// frames.
 ///
 /// The token is `!Copy` and `!Clone` so it must be explicitly constructed
-/// via [`BufferPool::no_latches`]. It is a witness type: the caller constructs
+/// via [`NoLatches::new`]. It is a witness type: the caller constructs
 /// it at a point where they know no guards are held. The borrow checker
 /// cannot enforce this in the general case (shared borrows of `&self`
 /// coexist), but the token makes the contract visible at every blocking call
@@ -1009,9 +1009,7 @@ impl Drop for EvictionPermit<'_> {
 /// Constructing `NoLatches` while any of these are alive is a contract
 /// violation that may cause pool exhaustion or deadlock:
 /// - [`SharedFrame`], [`ExclusiveFrame`], [`OptimisticFrame`]
-/// - [`SharedGuard`](pagebox_hybrid_latch::SharedGuard),
-///   [`ExclusiveGuard`](pagebox_hybrid_latch::ExclusiveGuard),
-///   [`OptimisticGuard`](pagebox_hybrid_latch::OptimisticGuard)
+/// - [`SharedGuard`], [`ExclusiveGuard`], [`OptimisticGuard`]
 pub struct NoLatches<'a> {
     _marker: core::marker::PhantomData<&'a BufferPool>,
 }
@@ -3770,9 +3768,9 @@ impl BufferPool {
     /// Mark a frame dirty after the caller has appended an equivalent logical
     /// WAL record and has the record LSN.
     ///
-    /// This is for page classes that are not represented by 4 KiB full-page
-    /// WAL images. Eviction and checkpoint still enforce WAL-before-data by
-    /// flushing this LSN before writing the page.
+    /// This is for callers that log an equivalent logical mutation instead of
+    /// a full-page image. Eviction and checkpoint still enforce WAL-before-data
+    /// by flushing this LSN before writing the page.
     ///
     /// # Safety
     /// `bf` must point to a live, pinned frame managed by this pool.

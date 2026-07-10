@@ -50,7 +50,8 @@
 //!
 //! ## Buffer sizing
 //!
-//! `WAL_BUF_CAPACITY` (64 MiB) is the in-memory append buffer.
+//! `WAL_BUF_CAPACITY` is the in-memory append-buffer capacity, derived as the
+//! next power of two large enough for one maximum-size batch.
 //! `wal_buf_records` derives the maximum number of records that fit:
 //! `(BATCH_MAX_RECORDS + 1) × PAGE_SIZE` per full batch, plus a partial final
 //! batch. The re-exported [`WAL_BUF_RECORDS`] constant is the public cap

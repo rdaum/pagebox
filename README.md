@@ -61,6 +61,8 @@ that possible:
   replay, and crash recovery.
 - A **file-backed page store** with a free-page allocator, header-resident user
   meta slots, and sync/fsync control.
+- A single **64 KiB page size** shared by the page store, buffer frames, WAL
+  records, slotted pages, and B+tree nodes.
 
 ## Crates
 
@@ -74,6 +76,7 @@ that possible:
 | `pagebox-storage`      | Buffer pool, page store, page formats, buffer frames, slotted pages, free-page allocation, and page provider. |
 | `pagebox-btree`        | Production concurrent B+tree with swizzled pointers, hybrid latching, and ordered scans.                      |
 | `kvstore`              | Example durable KV store binary built on the substrate (see below).                                           |
+| `kvbench`              | Workload and verification harness with optional adapters for external KV engines.                             |
 
 Internal dependency DAG:
 
@@ -85,6 +88,8 @@ hybrid-latch   (parking_lot; + optional fast-telemetry)
 wal            -> frame-kernel, threading
 storage        -> frame-kernel, hybrid-latch, swip-kernel, threading, wal
 btree          -> hybrid-latch, storage, swip-kernel
+kvstore        -> btree, storage, wal, frame-kernel (+ clap)
+kvbench        -> kvstore (+ optional comparison engines)
 ```
 
 I've tried to keep Pagebox with very little outward coupling. It depends only on
@@ -115,15 +120,20 @@ mid-write and reopening will recover committed page images from the WAL.
 
 ## Telemetry
 
-Each crate that instruments hot paths (`pagebox-wal`, `pagebox-storage`,
-`pagebox-btree`, `pagebox-hybrid-latch`) exposes a `metrics` feature, on by default. With `metrics` enabled, the crate
-uses [`fast-telemetry`](https://crates.io/crates/fast-telemetry) counters,
-histograms, and gauges. With it disabled, no-op shims take their place and the
-crate pulls zero telemetry dependencies:
+`pagebox-wal`, `pagebox-storage`, and `pagebox-btree` expose a `metrics`
+feature; `pagebox-hybrid-latch` exposes `latch-metrics`. All are enabled by
+default and use [`fast-telemetry`](https://crates.io/crates/fast-telemetry)
+counters, histograms, and gauges. Disabling a crate's own feature selects its
+local no-op shims:
 
 ```bash
 cargo build -p pagebox-storage --no-default-features
 ```
+
+Internal dependencies currently retain their default features, so that command
+does not by itself guarantee that `fast-telemetry` disappears from the complete
+dependency graph. Use `cargo tree -e features` to verify the graph relevant to
+an embedding.
 
 A downstream application can propagate the feature:
 

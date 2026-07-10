@@ -17,14 +17,13 @@
 //!
 //! Durability arrives either inline with the write (`pwritev2_dsync`), via a
 //! backend-internal syncer thread (`fdatasync`, which advances `durable_lsn`
-//! directly and wakes flush waiters), or via a later `Durable` completion
-//! reaped from the ring (io_uring, Phase 3).
+//! directly and wakes flush waiters), or when the dedicated io_uring reaper
+//! dispatches the linked fsync CQE.
 //!
-//! The driver loop calls [`WalInner::handle_completion`] for every completion
-//! it observes (inline returns for sync backends, drained via
-//! [`WalIoBackend::poll_completions`] for async backends), which is the single
-//! place LSN advancement, buffer reclamation, telemetry, and condvar wake-ups
-//! happen — keeping those invariants identical across backends.
+//! The driver loop calls [`WalInner::handle_completion`] for inline and polled
+//! write completions; the io_uring reaper calls the same method after fd-based
+//! dispatch. The fdatasync syncer advances durability directly after the
+//! syscall completes.
 //!
 //! [`WalInner::handle_completion`]: crate::wal_impl::WalInner::handle_completion
 
@@ -69,8 +68,7 @@ pub(crate) enum SubmitResult {
         write_latency_ns: u64,
     },
     /// The buffer is now in flight (io_uring). Ownership has transferred to
-    /// the backend; a `Written` completion (and any linked `Durable`
-    /// completion) surfaces via [`WalIoBackend::poll_completions`].
+    /// the backend until the dedicated reaper dispatches the linked fsync CQE.
     #[allow(dead_code)]
     Submitted,
 }
@@ -90,15 +88,13 @@ pub(crate) enum CompletionKind {
         durable_lsn: Option<Lsn>,
         write_latency_ns: u64,
     },
-    /// An fsync finished; `durable_lsn` should advance to `lsn`. Surfaced by
-    /// the io_uring backend's fsync CQE reaping (Phase 3) and, in Phase 2,
-    /// the fdatasync syncer's completion queue.
+    /// An fsync finished; `durable_lsn` should advance to `lsn`. Retained for
+    /// backends that report durability separately from write completion.
     #[allow(dead_code)]
     Durable { lsn: Lsn, sync_latency_ns: u64 },
 }
 
-#[allow(dead_code)] // submit_sync / poll_completions / needs_syncer_thread are
-// exercised from Phase 2 (unified loop) and Phase 3 (io_uring).
+#[allow(dead_code)]
 pub(crate) trait WalIoBackend: Send + Sync {
     /// Submit a sealed buffer for writing. Records `WriteCall` / `WriteBytes`
     /// telemetry (the backend knows the byte count); the per-write latency is
@@ -108,8 +104,8 @@ pub(crate) trait WalIoBackend: Send + Sync {
 
     /// Request durability up to `barrier_lsn`. For `fdatasync` this is a
     /// no-op (the backend-internal syncer thread is self-driven via the shared
-    /// condvar); for io_uring it submits an fsync SQE; for `pwritev2_dsync`
-    /// it is a no-op (writes are durable inline).
+    /// condvar); for io_uring the fsync is already linked to each submitted
+    /// write; for `pwritev2_dsync` writes are durable inline.
     fn submit_sync(&self, barrier_lsn: Lsn);
 
     /// Drain ready completions into `sink`. Non-blocking: flushes pending
@@ -117,12 +113,9 @@ pub(crate) trait WalIoBackend: Send + Sync {
     /// waiting when no CQEs are ready (via [`WalIoBackend::has_in_flight`]).
     fn poll_completions(&self, sink: &mut dyn FnMut(Completion));
 
-    /// Block until at least one completion is ready, then drain it. Called
-    /// by the driver loop when it has in-flight work but no pending writes.
-    /// Non-io_uring backends have no async completions, so the default is a
-    /// no-op. The io_uring implementation releases the ring mutex during
-    /// `io_uring_enter` so other threads (wait_for_durable) can reap CQEs
-    /// concurrently.
+    /// Optional blocking completion hook. Synchronous backends use the no-op
+    /// default; the current io_uring path normally relies on its dedicated
+    /// reaper thread instead.
     fn poll_completions_blocking(&self, _sink: &mut dyn FnMut(Completion)) {}
 
     /// Whether the backend has in-flight writes whose completions haven't
@@ -142,15 +135,14 @@ pub(crate) trait WalIoBackend: Send + Sync {
     fn group_commit_delay_max_us(&self) -> u64;
     fn group_commit_target_records(&self) -> u64;
 
-    /// Spawn any backend-specific thread (fdatasync syncer). Called after the
-    /// writer thread is started and `WalInner` is fully constructed. No-op for
-    /// backends without an extra thread.
+    /// Spawn backend-specific threads: the fdatasync syncer or the shared
+    /// io_uring reaper. Called after the writer thread is started and
+    /// `WalInner` is fully constructed.
     fn start(&self, inner: &Arc<WalInner>) -> io::Result<()>;
 
-    /// Stop and join backend-specific threads (fdatasync syncer) / reap
-    /// outstanding io_uring completions on clean shutdown. Called after the
-    /// writer thread has joined. On crash shutdown the backend should stop
-    /// without draining.
+    /// Stop and join backend-specific threads and drain outstanding work on
+    /// clean shutdown. Called after the writer thread has joined. On crash
+    /// shutdown the backend should stop without draining.
     fn drain_for_shutdown(&self);
 }
 
@@ -240,8 +232,8 @@ impl WalIoBackend for FdatasyncBackend {
     }
 
     fn poll_completions(&self, _sink: &mut dyn FnMut(Completion)) {
-        // Phase 1 fdatasync: the syncer advances durable_lsn + notifies
-        // flush_done directly (see run_syncer). Nothing to poll here.
+        // The syncer advances durable_lsn and notifies flush_done directly
+        // (see run_syncer). Nothing to poll here.
     }
 
     fn needs_syncer_thread(&self) -> bool {
@@ -368,7 +360,7 @@ impl FdatasyncBackend {
 
             let sync_latency_ns = Self::sync_fd(fd);
             last_sync = Instant::now();
-            // Advance durable_lsn + notify directly (Phase 1 pattern). This
+            // Advance durable_lsn + notify directly. This
             // avoids the round-trip through the SegQueue → driver poll,
             // which introduced a phase-locked timeout race under group-commit
             // contention.

@@ -1,24 +1,25 @@
 //! [`Wal`] — the append / write / sync pipeline, group-commit coordination,
 //! and recovery entry point.
 //!
-//! TheWal is a thin outer shell over a primary [`WalInner`] plus zero or
+//! [`Wal`] is a thin outer shell over a primary [`WalInner`] plus zero or
 //! more extra shards. Each shard owns:
 //!
-//! - A 64 MiB `AlignedBuf`-backed `WalBuffer` that callers copy record bytes
-//!   into under a `parking_lot::Mutex<WalState>`.
+//! - An `AlignedBuf`-backed `WalBuffer`, sized from the maximum on-disk batch,
+//!   that callers copy record bytes into under a
+//!   `parking_lot::Mutex<WalState>`.
 //! - A *writer* background thread (always spawned) that drains full or
 //!   deadline-elapsed buffers via `pwrite`.
 //! - A *syncer* background thread (spawned only for the `fdatasync` backend)
 //!   that advances `durable_lsn` once per drained buffer. The
 //!   `pwritev2_dsync` backend does the durable write inline in the writer
-//!   thread, so no syncer is needed.
+//!   thread, so no syncer is needed. The `io_uring` backend submits linked
+//!   write→fsync chains and uses a dedicated CQE reaper thread.
 //!
 //! ## LSN routing
 //!
-//! LSNS are claimed from a shared atomic (`next_lsn`); the shard is selected
-//! by `(lsn - 1) / shard_width` where `shard_width` is computed at open time
-//! so the LSN space is split evenly across shards. Per-thread shard
-//! affinity is also tracked (via `WAL_THREAD_STATES`) so=
+//! LSNs are claimed from a shared atomic (`next_lsn`) and interleaved across
+//! shards by `(lsn - 1) % shard_count`. Per-thread shard affinity is tracked
+//! via `WAL_THREAD_STATES`, so
 //! [`Wal::commit_current_thread`] can resolve the right shard from the
 //! calling thread's local state.
 //!
@@ -1547,8 +1548,8 @@ impl Wal {
     /// and return its newly-claimed LSN. Payloads are chunked at
     /// `LOGICAL_CHUNK_MAX_LEN`; short payloads are packed into a single
     /// data page alongside others. [`Wal::recover`] surfaces these as
-    /// [`WalReplayRecord::Logical`] for the caller's index/table layer to
-    /// apply.
+    /// [`WalReplayRecord::Logical`] for the caller's higher-level recovery
+    /// logic to apply.
     pub fn append_logical(&self, kind: u64, payload: &[u8]) -> io::Result<Lsn> {
         let lsn = self.claim_lsn();
         let inner = self.inner_for_lsn(lsn);
@@ -2405,12 +2406,11 @@ impl WalInner {
     }
 
     /// The unified per-shard driver loop. One code path serves every backend:
-    /// it polls backend completions (fdatasync `Durable` from the syncer queue,
-    /// io_uring CQEs in Phase 3, nothing for `pwritev2_dsync`), then seals and
-    /// submits writes, then requests durability. The wait predicate is the
-    /// disjunction of the old writer and syncer predicates so a single loop
-    /// replaces both; durable advancement and condvar wake-ups happen only in
-    /// [`WalInner::handle_completion`], keeping the invariants uniform.
+    /// it polls non-blocking backend completions, seals and submits writes, then
+    /// requests durability. The fdatasync syncer advances durability directly;
+    /// `pwritev2_dsync` reports it with the completed write; the io_uring reaper
+    /// dispatches completed write→fsync chains and wakes this driver. The wait
+    /// predicate combines write, durability, relaxed-mode, and shutdown work.
     fn driver_loop(&self) {
         let mut last_write = Instant::now();
         let mut last_sync = Instant::now();

@@ -11,7 +11,7 @@
 //! A [`Wal`] instance is one or more *shards*, each running a writer thread
 //! and (for `fdatasync` backends) a syncer thread. Appends claim an LSN from a
 //! shared atomic, route to the owning shard by LSN, and copy record bytes
-//! into a 64 MiB `AlignedBuf` write buffer packed as `[batch meta page] +
+//! into an `AlignedBuf` write buffer sized from the maximum batch and packed as `[batch meta page] +
 //! up to `BATCH_MAX_RECORDS` data pages`. The writer thread drains full
 //! (or deadline-elapsed) buffers to disk with `pwrite`; the syncer thread
 //! then calls the configured sync backend. Stragglers that miss the current
@@ -57,20 +57,24 @@
 //!   the durable write, so no separate syncer thread is spawned. Falls back
 //!   to `fdatasync` on non-Linux.
 //! - `io_uring` — Linux io_uring (kernel ≥5.18 with `IORING_SETUP_NO_MMAP`);
-//!   writes submitted as `IORING_OP_WRITE` SQEs with a linked
-//!   `IORING_OP_FSYNC` SQE so durability arrives as a CQE. One ring-driver
-//!   thread per shard drains completions to advance `written_lsn` /
-//!   `durable_lsn` and reclaim buffers. v1 uses plain kernel polling (no
-//!   `SQPOLL`, no registered buffers/files). Falls back to `fdatasync` on
-//!   non-Linux.
+//!   writes are submitted as `IORING_OP_WRITE` SQEs linked to
+//!   `IORING_OP_FSYNC`. A dedicated reaper thread blocks for CQEs, dispatches
+//!   them through the shared ring's fd→`WalInner` registry, advances
+//!   `written_lsn` / `durable_lsn`, reclaims buffers, and wakes driver threads.
+//!   The current implementation forces one shard so group commit produces one
+//!   write→fsync chain per cycle. It uses no `SQPOLL` or registered
+//!   buffers/files. Selecting `io_uring` on non-Linux falls back to
+//!   `fdatasync`.
 //!
 //! ### Group commit
 //!
-//! Both backends apply a leader-follower group-commit policy: the first
+//! All backends apply a leader-follower group-commit policy: the first
 //! follower to arrive after a quiet period becomes the leader, waits a short
-//! delay (`PAGEBOX_WAL_GROUP_COMMIT_DELAY_MAX_US`, default 1 ms for
-//! `fdatasync`, 250 µs for `pwritev2_dsync`), accumulates arriving followers,
-//! then releases them. The leader cuts the delay short once
+//! backend-specific delay, accumulates arriving followers, then releases them.
+//! `fdatasync` defaults to no explicit delay and relies on natural concurrent
+//! batching; `pwritev2_dsync` and `io_uring` default to 250 µs. The generic
+//! `PAGEBOX_WAL_GROUP_COMMIT_DELAY_MAX_US` or backend-specific variables can
+//! override those defaults. The leader cuts the delay short once
 //! `PAGEBOX_WAL_GROUP_COMMIT_TARGET_RECORDS` followers pile on. Relaxed mode
 //! also drives background writes and syncs on time / record-count
 //! thresholds (`PAGEBOX_WAL_RELAXED_*`).

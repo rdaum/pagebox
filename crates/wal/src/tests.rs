@@ -1262,11 +1262,10 @@ fn clean_shutdown_flushes_active_buffer_even_when_written_lsn_is_higher() {
 }
 
 // ---------------------------------------------------------------------------
-// Shutdown concurrent with flush — guards the Phase 2 unification where
-// durable advancement moved from the syncer thread into the driver loop
-// (via the completion queue + poll). The invariant: every strict commit
-// that returned must be durable after a clean shutdown, and reopen + replay
-// must surface every committed record with contiguous, unique LSNs.
+// Shutdown concurrent with flush guards the shared completion/notification
+// path. Every strict commit that returned must be durable after a clean
+// shutdown, and reopen + replay must surface every committed record with
+// contiguous, unique LSNs.
 // ---------------------------------------------------------------------------
 
 #[test]

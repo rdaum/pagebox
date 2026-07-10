@@ -1,12 +1,12 @@
 //! Pagebox's storage substrate: buffer pool, page store, slotted pages, free-page
 //! allocator, and buffer frames.
 //!
-//! `pagebox-storage` is the layer underneath trees and tables. It owns page
+//! `pagebox-storage` is the layer underneath persistent page-based structures. It owns page
 //! *residency* (which pages are memory-resident and how they got there), page
 //! *format* (the byte layout shared by every buffer-managed page), and page
 //! *allocation* (both on disk via the page store and in-memory via the
-//! sharded free-page allocator). Higher-level machinery — the B+tree, the
-//! table layer — composes these primitives into indexes and relations. This
+//! sharded free-page allocator). Higher-level machinery such as the B+tree
+//! composes these primitives into indexes and other structures. This
 //! crate intentionally contains no SQL, no MVCC, and no row format of its
 //! own; the slotted-page container is a generic sorted key/value byte layout.
 //!
@@ -20,7 +20,9 @@
 //! - [`buffer_frame`]: the per-page in-memory slot — a 4096-aligned frame
 //!   combining a [`buffer_frame::BufferFrame`]'s latch (a
 //!   `pagebox_hybrid_latch::HybridLatch`), a frame header, and the page bytes
-//!   themselves. The frame is the unit of pinning, latching, and eviction.
+//!   themselves. Page bytes use the workspace's unified 64 KiB
+//!   `pagebox_frame_kernel::PAGE_SIZE`; the frame is the unit of pinning,
+//!   latching, and eviction.
 //! - [`buffer_pool`]: the [`buffer_pool::BufferPool`] owns an array of frames.
 //!   It performs fix/evict (resident-budget second-chance or batch-clock), pin
 //!   accounting, prefetch, dirty-page tracking, the recovery-aware dt registry,
@@ -87,10 +89,11 @@
 //!
 //! The `metrics` feature (default) wires `fast-telemetry` counters, gauges,
 //! and histograms into the buffer pool, slotted page, and page store. Disable
-//! it with `--no-default-features`; no-op shim types take the real ones'
-//! place so the hot path compiles unchanged and pulls zero telemetry
-//! dependencies. The `cfg(miri)` build also deploys the shims so Miri runs
-//! against the unmodified hot path without telemetry allocations.
+//! it with `--no-default-features` to select this crate's no-op shim types.
+//! Internal dependencies currently retain their own default features, so that
+//! flag alone does not guarantee a telemetry-free dependency graph. The
+//! `cfg(miri)` build also deploys the local shims so Miri runs against the
+//! unmodified hot path without telemetry allocations.
 //!
 //! ## Miri and loom
 //!

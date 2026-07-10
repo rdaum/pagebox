@@ -27,9 +27,8 @@ build typed page-residency behaviour on top of this 64-bit state machine.
 ## Used By
 
 - `pagebox-storage` for buffer-pool page references.
-- `pagebox-btree` and `pagebox-betree` for tree child/page references.
-- `pagebox-table` and `pagebox-runtime` through their storage and index paths.
+- `pagebox-btree` for tree child/page references.
 
 ## Uses
 
-- No other Boxter crates.
+- No dependencies.

@@ -4,15 +4,16 @@ Concurrent B+tree index implementation.
 
 ## Role
 
-`pagebox-btree` provides the ordered index used by the table layer for primary
-and secondary access paths. It sits above the page/buffer substrate and below
-MVCC/table semantics.
+`pagebox-btree` provides a persistent ordered byte-key/byte-value index above
+the page and buffer-pool substrate. It intentionally contains no row, MVCC, or
+database-level types.
 
 ## Major Pieces
 
-- `src/btree.rs` contains the tree implementation, page traversal, mutation,
-  splitting, range scans, iterators, and stats.
-- `src/lib.rs` exposes the public tree surface used by table and runtime code.
+- `src/btree.rs` contains the public tree implementation and tests.
+- `src/btree/` contains node representation, parent-edge handling, split
+  publication, split-child identities, and statistics.
+- `src/lib.rs` exports `BTree`.
 - `benches/` contains tree microbenchmarks and workload-shaped probes.
 
 ## Key Concepts
@@ -20,13 +21,12 @@ MVCC/table semantics.
 - Keys and payloads are byte strings; higher layers decide value encodings.
 - SWIPs represent hot, cool, and evicted child/page references.
 - Hybrid latches protect concurrent traversal, updates, and publication.
-- Range and prefix scans support SQL index lookup, index scan, and range scan
-  plans through the table/query layers.
+- Ordered, prefix, ascending-range, and descending-range scans are part of the
+  public byte-oriented API.
 
 ## Used By
 
-- `pagebox-table` for table primary and secondary indexes.
-- `pagebox-runtime` for database-level index ownership and metadata operations.
+- `kvstore` as its durable ordered key/value index.
 
 ## Uses
 

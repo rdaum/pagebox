@@ -6,7 +6,7 @@ Thread spawning, CPU topology detection, and optional pinning helpers.
 
 `pagebox-threading` centralizes Linux-aware thread creation and CPU pinning. It
 detects heterogeneous CPU topology, classifies performance and efficient cores,
-and provides helpers used by storage, WAL, table, runtime, and workloads.
+and provides helpers used by the storage and WAL background threads.
 
 ## Major Pieces
 
@@ -27,10 +27,8 @@ and provides helpers used by storage, WAL, table, runtime, and workloads.
 
 ## Used By
 
-- `pagebox-storage`, `pagebox-wal`, `pagebox-table`, and `pagebox-runtime` for
-  background/service work.
-- `pagebox-tpcc-esque` for workload worker placement.
+- `pagebox-storage` and `pagebox-wal` for background/service work.
 
 ## Uses
 
-- No other Boxter crates.
+- `libc` for CPU affinity on Linux.

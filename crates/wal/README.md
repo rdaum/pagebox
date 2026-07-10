@@ -4,9 +4,9 @@ Write-ahead log format, append path, and durability coordination.
 
 ## Role
 
-`pagebox-wal` owns the log records and IO path used to make table/storage changes
-durable. It provides append, group commit, sync, recovery scanning, and WAL
-benchmarking support for the runtime and lower storage layers.
+`pagebox-wal` owns the log records and I/O path used to make page and logical
+changes durable. It provides append, group commit, sync, recovery scanning, and
+WAL benchmarking support without depending on the storage crate.
 
 ## Major Pieces
 
@@ -21,19 +21,17 @@ benchmarking support for the runtime and lower storage layers.
   (`fdatasync`, `pwritev2_dsync`).
 - `src/io_uring.rs` (Linux) implements the io_uring backend: hand-defined
   kernel uapi structs, `IORING_SETUP_NO_MMAP` ring creation, linked
-  WRITE→FSYNC SQE chains, and CQE-driven completion reaping.
+  WRITE→FSYNC SQE chains, a shared in-flight slab, fd-based completion
+  dispatch, and a dedicated CQE reaper thread.
 - `src/bin/profile_wal.rs` profiles WAL throughput and latency.
 - `benches/` contains WAL benchmarks.
 
 ## Used By
 
-- `pagebox-runtime` for database durability, checkpoint/replay, and recovery.
-- `pagebox-table` for table-level mutation logging.
 - `pagebox-storage` for storage-level durability integration.
-- `pagebox-server` and `pagebox-tpcc-esque` for hosted and workload telemetry.
+- `kvstore` for recovery, strict/relaxed commits, and checkpoint/reset.
 
 ## Uses
 
 - `pagebox-frame-kernel` for page/frame identifiers included in storage records.
 - `pagebox-threading` for background flush and worker support.
-- `pagebox-storage` for page-oriented integration points.
