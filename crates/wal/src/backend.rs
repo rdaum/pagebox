@@ -104,9 +104,20 @@ pub(crate) trait WalIoBackend: Send + Sync {
 
     /// Request durability up to `barrier_lsn`. For `fdatasync` this is a
     /// no-op (the backend-internal syncer thread is self-driven via the shared
-    /// condvar); for io_uring the fsync is already linked to each submitted
-    /// write; for `pwritev2_dsync` writes are durable inline.
-    fn submit_sync(&self, barrier_lsn: Lsn);
+    /// condvar); io_uring submits one drained fsync barrier; and
+    /// `pwritev2_dsync` writes are durable inline.
+    fn submit_sync(&self, barrier_lsn: Lsn) -> io::Result<()>;
+
+    /// Whether a separately completed durability barrier is in flight.
+    /// The driver uses this to avoid repeatedly submitting the same target.
+    fn sync_in_flight(&self) -> bool {
+        false
+    }
+
+    /// Highest written LSN already recorded for a durability barrier.
+    fn sync_target(&self) -> Lsn {
+        0
+    }
 
     /// Drain ready completions into `sink`. Non-blocking: flushes pending
     /// SQEs and reaps whatever CQEs are ready. The driver loop handles
@@ -225,10 +236,11 @@ impl WalIoBackend for FdatasyncBackend {
         })
     }
 
-    fn submit_sync(&self, _barrier_lsn: Lsn) {
+    fn submit_sync(&self, _barrier_lsn: Lsn) -> io::Result<()> {
         // The syncer thread is self-driven via the shared `flush_requested`
         // condvar (notified by `request_durable` / `wait_for_durable` /
         // `set_commit_mode` / the driver). Nothing to do here.
+        Ok(())
     }
 
     fn poll_completions(&self, _sink: &mut dyn FnMut(Completion)) {
@@ -290,8 +302,14 @@ impl FdatasyncBackend {
 
         let mut last_sync = Instant::now();
         loop {
+            if inner.has_backend_failure() {
+                return;
+            }
             let mut state = inner.state.lock();
             loop {
+                if inner.has_backend_failure() {
+                    return;
+                }
                 let relaxed_mode =
                     inner.commit_mode.load(Ordering::Acquire) == CommitMode::Relaxed as u64;
                 let durable = inner.durable_lsn.load(Ordering::Acquire);
@@ -358,7 +376,13 @@ impl FdatasyncBackend {
             let fd = state.fd;
             drop(state);
 
-            let sync_latency_ns = Self::sync_fd(fd);
+            let sync_latency_ns = match Self::sync_fd(fd) {
+                Ok(latency) => latency,
+                Err(err) => {
+                    inner.record_backend_failure(err);
+                    return;
+                }
+            };
             last_sync = Instant::now();
             // Advance durable_lsn + notify directly. This
             // avoids the round-trip through the SegQueue → driver poll,
@@ -376,16 +400,12 @@ impl FdatasyncBackend {
         }
     }
 
-    /// Run `fdatasync` and return its latency in nanoseconds. Panics on
-    /// failure (durability contract violation), matching the pre-trait code.
-    fn sync_fd(fd: std::os::fd::RawFd) -> u64 {
+    /// Run `fdatasync` and return its latency in nanoseconds.
+    fn sync_fd(fd: std::os::fd::RawFd) -> io::Result<u64> {
         let sync_start = Instant::now();
-        let ret = sync_wal_fd(fd);
+        sync_wal_fd(fd)?;
         let latency = sync_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        if let Err(err) = ret {
-            panic!("WAL sync failed — durability compromised: {err}");
-        }
-        latency
+        Ok(latency)
     }
 }
 
@@ -421,7 +441,9 @@ impl WalIoBackend for Pwritev2DsyncBackend {
         })
     }
 
-    fn submit_sync(&self, _barrier_lsn: Lsn) {}
+    fn submit_sync(&self, _barrier_lsn: Lsn) -> io::Result<()> {
+        Ok(())
+    }
 
     fn poll_completions(&self, _sink: &mut dyn FnMut(Completion)) {}
 

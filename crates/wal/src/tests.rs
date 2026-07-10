@@ -1355,8 +1355,9 @@ fn shutdown_concurrent_with_flush_preserves_all_committed_records() {
 
 // ---------------------------------------------------------------------------
 // io_uring backend (Linux-only). These exercise the completion-driven path:
-// writes submitted as WRITEV SQEs, fsyncs as linked FSYNC SQEs, and CQE
-// reap advancing written_lsn / durable_lsn + reclaiming buffers. Real
+// writes submitted as WRITE SQEs, durability coalesced behind drained FSYNC
+// SQEs, and CQE reaping advancing written_lsn / durable_lsn + reclaiming
+// buffers. Real
 // invariants, not "did not panic" smoke (per AGENTS.md).
 // ---------------------------------------------------------------------------
 

@@ -11,11 +11,10 @@
 //!
 //! [`IoUring`] owns the ring fd and two user-allocated regions: an SQE array
 //! and a combined SQ/CQ ring structure supplied through
-//! `IORING_SETUP_NO_MMAP`. Writes are submitted as `IORING_OP_WRITE` SQEs; an
-//! `IORING_OP_FSYNC` SQE is linked to each write with `IOSQE_IO_LINK`, so the
-//! fsync only fires after its write completes. SQE `user_data` encodes whether
-//! the completion is a write or fsync and the slab slot holding the in-flight
-//! `WalBuffer`.
+//! `IORING_SETUP_NO_MMAP`. Writes are submitted as independent
+//! `IORING_OP_WRITE` SQEs. Durability requests coalesce behind one
+//! `IORING_OP_FSYNC` SQE with `IOSQE_IO_DRAIN`, which orders the barrier after
+//! every preceding write in the ring.
 //!
 //! A dedicated reaper thread calls `io_uring_enter` to flush submissions and
 //! wait for CQEs. Reaping a ready CQE is then an atomic CQ tail/head update;
@@ -55,7 +54,7 @@ const IORING_OP_NOP: u8 = 0;
 const IORING_OP_FSYNC: u8 = 3;
 const IORING_OP_WRITE: u8 = 23;
 
-const IOSQE_IO_LINK: u8 = 1 << 2;
+const IOSQE_IO_DRAIN: u8 = 1 << 1;
 
 const IORING_FSYNC_DATASYNC: u32 = 1 << 0;
 
@@ -195,9 +194,6 @@ const USER_DATA_SLOT_MASK: u64 = !(1 << 63);
 
 fn pack_write(slot: u32) -> u64 {
     slot as u64
-}
-fn pack_fsync(slot: u32) -> u64 {
-    (slot as u64) | USER_DATA_FSYNC
 }
 fn is_fsync(user_data: u64) -> bool {
     (user_data & USER_DATA_FSYNC) != 0
@@ -450,7 +446,6 @@ impl IoUring {
         len: u32,
         offset: u64,
         user_data: u64,
-        link: bool,
     ) -> io::Result<bool> {
         let tail = unsafe { (*self.sq_tail).load(Ordering::Relaxed) };
         let head = unsafe { (*self.sq_head).load(Ordering::Acquire) };
@@ -466,9 +461,6 @@ impl IoUring {
         sqe.len = len;
         sqe.union_off = offset;
         sqe.user_data = user_data;
-        if link {
-            sqe.flags |= IOSQE_IO_LINK;
-        }
         unsafe {
             (*self.sq_array.add(idx)).store(idx as u32, Ordering::Release);
         }
@@ -480,14 +472,15 @@ impl IoUring {
     }
 
     /// Submit an `FSYNC` SQE. With `IORING_FSYNC_DATASYNC` it matches the
-    /// `fdatasync` semantics the other backends use. Set `link=false` for a
-    /// standalone fsync; the linked-write variant links the *preceding* write
-    /// SQE instead (see `submit_writev` with `link=true`).
+    /// `fdatasync` semantics the other backends use. With `drain`, the kernel
+    /// starts the fsync only after every previously submitted request has
+    /// completed.
     pub(crate) fn submit_fsync(
         &mut self,
         fd: RawFd,
         user_data: u64,
         datasync: bool,
+        drain: bool,
     ) -> io::Result<bool> {
         let tail = unsafe { (*self.sq_tail).load(Ordering::Relaxed) };
         let head = unsafe { (*self.sq_head).load(Ordering::Acquire) };
@@ -502,6 +495,9 @@ impl IoUring {
         sqe.user_data = user_data;
         if datasync {
             sqe.union_flags = IORING_FSYNC_DATASYNC;
+        }
+        if drain {
+            sqe.flags |= IOSQE_IO_DRAIN;
         }
         unsafe {
             (*self.sq_array.add(idx)).store(idx as u32, Ordering::Release);
@@ -652,6 +648,7 @@ pub(crate) struct IoUringShared {
     /// for any shard.
     in_flight: Mutex<Vec<Option<InFlightWrite>>>,
     free_slots: Mutex<Vec<u32>>,
+    sync_barrier: Mutex<SyncBarrierState>,
     /// Maps each shard's WAL file fd → `Weak<WalInner>`. Used to dispatch
     /// CQE completions to the correct shard. Registered in `start`.
     fd_to_inner: Mutex<HashMap<RawFd, Weak<WalInner>>>,
@@ -673,6 +670,7 @@ impl IoUringShared {
             ring: Mutex::new(ring),
             in_flight: Mutex::new(Vec::with_capacity(64)),
             free_slots: Mutex::new(Vec::new()),
+            sync_barrier: Mutex::new(SyncBarrierState::default()),
             fd_to_inner: Mutex::new(HashMap::new()),
             reaper: Mutex::new(None),
             shutdown: std::sync::atomic::AtomicBool::new(false),
@@ -707,26 +705,43 @@ impl IoUringShared {
         self.fd_to_inner.lock().get(&fd).and_then(|w| w.upgrade())
     }
 
-    fn complete_write(&self, slot: u32, res: i32) -> io::Result<Option<Completion>> {
-        let mut in_flight = self.in_flight.lock();
-        let write = in_flight
-            .get_mut(slot as usize)
-            .and_then(Option::as_mut)
-            .ok_or_else(|| io::Error::other("unknown io_uring WRITE completion"))?;
-        validate_write_completion(write.expected_len, res)?;
-        let Some(buffer) = write.buffer.take() else {
-            return Err(io::Error::other("duplicate io_uring WRITE completion"));
+    fn complete_write(&self, slot: u32, res: i32) {
+        let Some(write) = self.take_slot(slot) else {
+            self.record_failure_for_all("unknown io_uring WRITE completion");
+            return;
         };
+        let inner = self.lookup_inner(write.fd);
+        if let Err(err) = validate_write_completion(write.expected_len, res) {
+            if let Some(inner) = inner {
+                inner.record_backend_failure(format!("io_uring WRITE failed: {err}"));
+            }
+            return;
+        }
         let write_latency_ns = write.write_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         let completion = Completion {
             kind: CompletionKind::Written {
-                buffer,
+                buffer: write.buffer,
                 max_lsn: write.max_lsn,
                 durable_lsn: None,
                 write_latency_ns,
             },
         };
-        Ok(Some(completion))
+        if let Some(inner) = inner {
+            inner.handle_completion(completion);
+        }
+    }
+
+    fn record_failure_for_all(&self, error: impl std::fmt::Display) {
+        let error = error.to_string();
+        let inners: Vec<_> = self
+            .fd_to_inner
+            .lock()
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for inner in inners {
+            inner.record_backend_failure(&error);
+        }
     }
 
     /// The dedicated reaper thread. Blocks in `io_uring_enter(GETEVENTS)` and
@@ -769,9 +784,8 @@ impl IoUringShared {
                 if self.shutdown.load(Ordering::Acquire) {
                     return;
                 }
-                eprintln!("WAL io_uring reaper error: {err}");
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                continue;
+                self.record_failure_for_all(format!("io_uring_enter failed: {err}"));
+                return;
             }
             let consumed = u32::try_from(ret).unwrap_or(u32::MAX).min(to_submit);
             if consumed < to_submit {
@@ -792,25 +806,24 @@ impl IoUringShared {
 
     /// Dispatch a CQE to the correct `WalInner`, looked up by fd.
     fn dispatch_cqe(&self, user_data: u64, res: i32) {
-        let slot = slot_of(user_data);
         if is_fsync(user_data) {
+            let sync = self.sync_barrier.lock().complete();
+            let Some(sync) = sync else {
+                self.record_failure_for_all("unknown io_uring FSYNC completion");
+                return;
+            };
             if res < 0 {
                 let err = io::Error::from_raw_os_error(-res);
-                panic!("WAL io_uring FSYNC failed — durability compromised: {err}");
+                if let Some(inner) = self.lookup_inner(sync.fd) {
+                    inner.record_backend_failure(format!("io_uring FSYNC failed: {err}"));
+                }
+                return;
             }
-            let Some(write) = self.take_slot(slot) else {
-                panic!("unknown io_uring FSYNC completion");
-            };
-            assert!(
-                write.buffer.is_none(),
-                "io_uring FSYNC completed before its linked WRITE"
-            );
-            let sync_latency_ns =
-                write.write_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-            if let Some(inner) = self.lookup_inner(write.fd) {
+            let sync_latency_ns = sync.started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            if let Some(inner) = self.lookup_inner(sync.fd) {
                 inner.handle_completion(Completion {
                     kind: CompletionKind::Durable {
-                        lsn: write.max_lsn,
+                        lsn: sync.lsn,
                         sync_latency_ns,
                     },
                 });
@@ -818,24 +831,12 @@ impl IoUringShared {
             return;
         }
 
-        let fd = self
-            .in_flight
-            .lock()
-            .get(slot as usize)
-            .and_then(Option::as_ref)
-            .map(|write| write.fd)
-            .unwrap_or_else(|| panic!("unknown io_uring WRITE completion"));
-        let completion = self
-            .complete_write(slot, res)
-            .unwrap_or_else(|err| panic!("WAL io_uring WRITE failed: {err}"));
-        if let (Some(inner), Some(completion)) = (self.lookup_inner(fd), completion) {
-            inner.handle_completion(completion);
-        }
+        self.complete_write(slot_of(user_data), res);
     }
 }
 
 struct InFlightWrite {
-    buffer: Option<WalBuffer>,
+    buffer: WalBuffer,
     expected_len: usize,
     max_lsn: Lsn,
     write_start: std::time::Instant,
@@ -844,9 +845,43 @@ struct InFlightWrite {
     fd: RawFd,
 }
 
+#[derive(Default)]
+struct SyncBarrierState {
+    requested_lsn: Lsn,
+    completed_lsn: Lsn,
+    in_flight: Option<InFlightSync>,
+}
+
+impl SyncBarrierState {
+    fn request(&mut self, lsn: Lsn) {
+        self.requested_lsn = self.requested_lsn.max(lsn);
+    }
+
+    fn next_target(&self) -> Option<Lsn> {
+        (self.in_flight.is_none() && self.requested_lsn > self.completed_lsn)
+            .then_some(self.requested_lsn)
+    }
+
+    fn submitted(&mut self, sync: InFlightSync) {
+        assert!(self.in_flight.replace(sync).is_none());
+    }
+
+    fn complete(&mut self) -> Option<InFlightSync> {
+        let sync = self.in_flight.take()?;
+        self.completed_lsn = self.completed_lsn.max(sync.lsn);
+        Some(sync)
+    }
+}
+
+struct InFlightSync {
+    lsn: Lsn,
+    fd: RawFd,
+    started: std::time::Instant,
+}
+
 /// io_uring backend. One `IoUringShared` is shared across all WAL shards so
-/// only one fsync is in flight at a time. Writes are submitted as `WRITE` SQEs
-/// with a linked `FSYNC` SQE so durability arrives as a separate CQE. CQE
+/// only one fsync is in flight at a time. Writes are submitted as independent
+/// `WRITE` SQEs; durability requests coalesce behind a drained `FSYNC`. CQE
 /// completions are dispatched to the correct `WalInner` via the `fd_to_inner`
 /// registry.
 pub(crate) struct IoUringBackend {
@@ -892,31 +927,55 @@ impl WalIoBackend for IoUringBackend {
         let buf_ptr = buffer.buffer.as_slice().as_ptr();
         let len_u32 = len as u32;
         let mut ring = self.shared.ring.lock();
-        ring.ensure_submission_space(2)?;
+        ring.ensure_submission_space(1)?;
         let slot = self.shared.alloc_slot(InFlightWrite {
-            buffer: Some(buffer),
+            buffer,
             expected_len: len,
             max_lsn,
             write_start,
             fd,
         });
         let user_data = pack_write(slot);
-        let enqueued = ring.submit_write(fd, buf_ptr, len_u32, offset, user_data, true)?;
+        let enqueued = ring.submit_write(fd, buf_ptr, len_u32, offset, user_data)?;
         debug_assert!(enqueued, "reserved io_uring WRITE slot disappeared");
-        let fsync_user_data = pack_fsync(slot);
-        let fsync_enqueued = ring.submit_fsync(fd, fsync_user_data, true)?;
-        debug_assert!(fsync_enqueued, "reserved io_uring FSYNC slot disappeared");
         Ok(SubmitResult::Submitted)
     }
 
-    fn submit_sync(&self, barrier_lsn: Lsn) {
-        let _ = barrier_lsn;
+    fn submit_sync(&self, barrier_lsn: Lsn) -> io::Result<()> {
+        let mut ring = self.shared.ring.lock();
+        let mut barrier = self.shared.sync_barrier.lock();
+        barrier.request(barrier_lsn);
+        let Some(target_lsn) = barrier.next_target() else {
+            return Ok(());
+        };
+        ring.ensure_submission_space(1)?;
+        let enqueued = ring.submit_fsync(self.fd, USER_DATA_FSYNC, true, true)?;
+        debug_assert!(enqueued, "reserved io_uring FSYNC slot disappeared");
+        barrier.submitted(InFlightSync {
+            lsn: target_lsn,
+            fd: self.fd,
+            started: std::time::Instant::now(),
+        });
+        Ok(())
+    }
+
+    fn sync_in_flight(&self) -> bool {
+        self.shared.sync_barrier.lock().in_flight.is_some()
+    }
+
+    fn sync_target(&self) -> Lsn {
+        self.shared.sync_barrier.lock().requested_lsn
     }
 
     fn poll_completions(&self, _sink: &mut dyn FnMut(Completion)) {
         let mut ring = self.shared.ring.lock();
-        if ring.pending_submissions() > 0 {
-            let _ = ring.flush_and_enter(0);
+        if ring.pending_submissions() > 0
+            && let Err(err) = ring.flush_and_enter(0)
+        {
+            drop(ring);
+            self.shared
+                .record_failure_for_all(format!("io_uring_enter failed: {err}"));
+            return;
         }
         ring.drain_cqes(&mut |user_data, res| self.shared.dispatch_cqe(user_data, res));
     }
@@ -940,7 +999,8 @@ impl WalIoBackend for IoUringBackend {
         if ret < 0 {
             let err = io::Error::last_os_error();
             if err.kind() != io::ErrorKind::Interrupted {
-                eprintln!("WAL io_uring_enter warning: {err}");
+                self.shared
+                    .record_failure_for_all(format!("io_uring_enter failed: {err}"));
             }
         }
         let mut ring = self.shared.ring.lock();
@@ -949,6 +1009,7 @@ impl WalIoBackend for IoUringBackend {
 
     fn has_in_flight(&self) -> bool {
         self.shared.in_flight.lock().iter().any(|s| s.is_some())
+            || self.shared.sync_barrier.lock().in_flight.is_some()
     }
 
     fn needs_syncer_thread(&self) -> bool {
@@ -1014,7 +1075,12 @@ impl WalIoBackend for IoUringBackend {
         let mut ring = self.shared.ring.lock();
         let _ = ring.flush_and_enter(0);
         ring.drain_cqes(&mut |user_data, _res| {
+            if user_data == NOP_USER_DATA {
+                return;
+            }
             if is_fsync(user_data) {
+                let _ = self.shared.sync_barrier.lock().complete();
+            } else {
                 let _ = self.shared.take_slot(slot_of(user_data));
             }
         });
@@ -1063,5 +1129,30 @@ mod tests {
 
         let failed = validate_write_completion(4096, -libc::EIO).unwrap_err();
         assert_eq!(failed.raw_os_error(), Some(libc::EIO));
+    }
+
+    #[test]
+    fn sync_requests_coalesce_behind_one_in_flight_barrier() {
+        let mut barrier = SyncBarrierState::default();
+        barrier.request(10);
+        assert_eq!(barrier.next_target(), Some(10));
+        barrier.submitted(InFlightSync {
+            lsn: 10,
+            fd: 7,
+            started: std::time::Instant::now(),
+        });
+
+        barrier.request(20);
+        assert_eq!(barrier.next_target(), None);
+        assert_eq!(barrier.complete().map(|sync| sync.lsn), Some(10));
+        assert_eq!(barrier.next_target(), Some(20));
+
+        barrier.submitted(InFlightSync {
+            lsn: 20,
+            fd: 7,
+            started: std::time::Instant::now(),
+        });
+        assert_eq!(barrier.complete().map(|sync| sync.lsn), Some(20));
+        assert_eq!(barrier.next_target(), None);
     }
 }

@@ -12,8 +12,9 @@
 //! - A *syncer* background thread (spawned only for the `fdatasync` backend)
 //!   that advances `durable_lsn` once per drained buffer. The
 //!   `pwritev2_dsync` backend does the durable write inline in the writer
-//!   thread, so no syncer is needed. The `io_uring` backend submits linked
-//!   write→fsync chains and uses a dedicated CQE reaper thread.
+//!   thread, so no syncer is needed. The `io_uring` backend submits writes
+//!   independently, coalesces durability behind a drained fsync, and uses a
+//!   dedicated CQE reaper thread.
 //!
 //! ## LSN routing
 //!
@@ -341,6 +342,7 @@ const PAGE_PATCH_RANGE_HEADER_LEN: usize = 8;
 pub(crate) struct WalInner {
     pub(crate) state: Mutex<WalState>,
     pub(crate) backend: Box<dyn WalIoBackend>,
+    backend_failure: Mutex<Option<String>>,
     pub(crate) next_lsn: Arc<AtomicU64>,
     pub(crate) appended_lsn: AtomicU64,
     pub(crate) written_lsn: AtomicU64,
@@ -464,7 +466,10 @@ impl SubmittedWrites {
 
 #[cfg(test)]
 mod submitted_writes_tests {
-    use super::SubmittedWrites;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::{SubmittedWrites, Wal};
 
     #[test]
     fn written_progress_waits_for_the_submitted_extent_prefix() {
@@ -476,6 +481,48 @@ mod submitted_writes_tests {
         assert_eq!(writes.complete(5), None);
         assert_eq!(writes.complete(10), Some(10));
         assert_eq!(writes.complete(20), Some(20));
+    }
+
+    #[test]
+    fn backend_failure_wakes_all_waiters_and_surfaces_on_their_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = Arc::new(Wal::open_with_shards_for_test(&dir.path().join("wal"), 1).unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiters: Vec<_> = (0..3)
+            .map(|_| {
+                let wal = Arc::clone(&wal);
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        wal.flush_at_least(1)
+                    }))
+                    .expect_err("flush should surface the backend failure");
+                    let message = failure
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| failure.downcast_ref::<&str>().copied())
+                        .unwrap_or_default();
+                    tx.send(message.contains("injected failure")).unwrap();
+                })
+            })
+            .collect();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while wal.inner.state.lock().flush_waiters < waiters.len() {
+            assert!(Instant::now() < deadline, "flush waiters did not block");
+            std::thread::yield_now();
+        }
+        wal.inner.record_backend_failure("injected failure");
+
+        for _ in &waiters {
+            assert!(
+                rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                "caller should receive the stored backend failure"
+            );
+        }
+        for waiter in waiters {
+            waiter.join().unwrap();
+        }
     }
 }
 
@@ -1035,12 +1082,9 @@ impl Wal {
     ) -> io::Result<Self> {
         let shard_count = shard_count.clamp(1, 256);
 
-        // io_uring: force a single shard. Multi-shard generates N independent
-        // write+fsync chains (one per shard), causing N× more fsyncs. With
-        // 1 shard, group commit batches all threads' appends into one
-        // write+fsync per cycle — the optimal pattern for io_uring's
-        // linked SQE model. The reaper thread handles CQE reaping so the
-        // driver never blocks in io_uring_enter.
+        // io_uring currently uses one shard so every thread contributes to the
+        // same write stream and drained durability barrier. The reaper thread
+        // handles CQE reaping so the driver never blocks in io_uring_enter.
         let shard_count = if sync_backend.is_io_uring() {
             1
         } else {
@@ -2209,6 +2253,28 @@ impl Drop for Wal {
 }
 
 impl WalInner {
+    pub(crate) fn record_backend_failure(&self, error: impl std::fmt::Display) {
+        let mut failure = self.backend_failure.lock();
+        if failure.is_none() {
+            *failure = Some(error.to_string());
+        }
+        drop(failure);
+        let _state = self.state.lock();
+        self.flush_done.notify_all();
+        self.flush_requested.notify_all();
+    }
+
+    pub(crate) fn has_backend_failure(&self) -> bool {
+        self.backend_failure.lock().is_some()
+    }
+
+    fn panic_if_backend_failed(&self) {
+        let failure = self.backend_failure.lock().clone();
+        if let Some(error) = failure {
+            panic!("WAL backend failed — durability compromised: {error}");
+        }
+    }
+
     fn request_durable(&self, target_lsn: Lsn) {
         let _state = self.state.lock();
         self.requested_durable_lsn
@@ -2219,8 +2285,10 @@ impl WalInner {
     }
 
     fn wait_for_durable(&self, target_lsn: Lsn) -> Lsn {
+        self.panic_if_backend_failed();
         let mut state = self.state.lock();
         loop {
+            self.panic_if_backend_failed();
             let current = self.durable_lsn.load(Ordering::Acquire);
             if current >= target_lsn {
                 return current;
@@ -2232,21 +2300,9 @@ impl WalInner {
             self.flush_requested.notify_all();
             self.stats.events.inc(WalEvent::FlushWait);
 
-            // Try to reap CQEs before blocking on the condvar. This is the
-            // io_uring fast path: if the write+fsync CQE has already arrived,
-            // poll_completions drains it (advancing durable_lsn via
-            // handle_completion) and we return without waiting at all. Without
-            // this, a waiter would block for up to 10ms on the condvar even
-            // though the CQE was already available.
-            drop(state);
-            self.backend
-                .poll_completions(&mut |c| self.handle_completion(c));
-            let current = self.durable_lsn.load(Ordering::Acquire);
-            if current >= target_lsn {
-                return current;
-            }
-
-            state = self.state.lock();
+            // The dedicated io_uring reaper owns CQE processing. Callers wait
+            // only on the notified durability state, keeping ring entry and
+            // io-wq teardown off short-lived client threads.
             state.flush_waiters += 1;
             let wait_start = Instant::now();
             self.flush_done
@@ -2260,6 +2316,7 @@ impl WalInner {
     }
 
     fn commit_at_least(&self, target_lsn: Lsn) -> Lsn {
+        self.panic_if_backend_failed();
         self.stats.events.inc(WalEvent::FlushCall);
         let current = self.durable_lsn.load(Ordering::Acquire);
         if current >= target_lsn {
@@ -2275,6 +2332,7 @@ impl WalInner {
     }
 
     fn strict_flush_at_least(&self, target_lsn: Lsn) -> Lsn {
+        self.panic_if_backend_failed();
         self.stats.events.inc(WalEvent::FlushCall);
         let current = self.durable_lsn.load(Ordering::Acquire);
         if current >= target_lsn {
@@ -2315,6 +2373,7 @@ impl WalInner {
                 shutdown: false,
             }),
             backend,
+            backend_failure: Mutex::new(None),
             next_lsn,
             appended_lsn: AtomicU64::new(max_lsn),
             written_lsn: AtomicU64::new(max_lsn),
@@ -2478,12 +2537,15 @@ impl WalInner {
     /// it polls non-blocking backend completions, seals and submits writes, then
     /// requests durability. The fdatasync syncer advances durability directly;
     /// `pwritev2_dsync` reports it with the completed write; the io_uring reaper
-    /// dispatches completed write→fsync chains and wakes this driver. The wait
+    /// dispatches independent write and drained-fsync completions. The wait
     /// predicate combines write, durability, relaxed-mode, and shutdown work.
     fn driver_loop(&self) {
         let mut last_write = Instant::now();
         let mut last_sync = Instant::now();
         loop {
+            if self.has_backend_failure() {
+                return;
+            }
             // Drain any ready completions first so a durable advance that
             // landed while we were asleep is observed before re-checking the
             // wait / shutdown predicates.
@@ -2493,6 +2555,9 @@ impl WalInner {
             let mut state = self.state.lock();
             let driver_handles_sync = !self.backend.needs_syncer_thread();
             loop {
+                if self.has_backend_failure() {
+                    return;
+                }
                 let relaxed_mode =
                     self.commit_mode.load(Ordering::Acquire) == CommitMode::Relaxed as u64;
                 let written = self.written_lsn.load(Ordering::Acquire);
@@ -2528,11 +2593,11 @@ impl WalInner {
                     {
                         return;
                     }
-                    // Only break on pending_write. Breaking on pending_sync
-                    // with no pending_write would spin (nothing to submit,
-                    // submit_sync is a no-op); instead fall through to the
-                    // timed wait which re-polls CQEs periodically.
-                    if pending_write {
+                    let sync_target_advanced = written > self.backend.sync_target();
+                    if pending_write
+                        || (pending_sync
+                            && (!self.backend.sync_in_flight() || sync_target_advanced))
+                    {
                         break;
                     }
                     // io_uring: the dedicated reaper thread handles blocking
@@ -2606,20 +2671,38 @@ impl WalInner {
                 || !state.pending_writes.is_empty()
                 || (relaxed_mode && self.should_write_relaxed(&state, last_write))
                 || (state.shutdown && state.active.used > 0);
-            if should_write && state.pending_writes.is_empty() && state.active.used > 0 {
-                self.seal_active_buffer_locked(&mut state)
-                    .expect("WAL buffer seal failed");
+            if should_write
+                && state.pending_writes.is_empty()
+                && state.active.used > 0
+                && let Err(err) = self.seal_active_buffer_locked(&mut state)
+            {
+                drop(state);
+                self.record_backend_failure(err);
+                return;
             }
             if should_write && let Some(write) = self.pop_pending_write_locked(&mut state) {
                 drop(state);
-                self.write_sealed_buffer(write).expect("WAL write failed");
+                if let Err(err) = self.write_sealed_buffer(write) {
+                    self.record_backend_failure(err);
+                    return;
+                }
                 last_write = Instant::now();
-                // A write landed; request durability for whatever is now
-                // written so the syncer / io_uring fsync path makes it durable.
+            } else {
+                drop(state);
+            }
+
+            if driver_handles_sync {
+                let relaxed_mode =
+                    self.commit_mode.load(Ordering::Acquire) == CommitMode::Relaxed as u64;
+                let written = self.written_lsn.load(Ordering::Acquire);
+                let durable = self.durable_lsn.load(Ordering::Acquire);
                 let requested_durable = self.requested_durable_lsn.load(Ordering::Acquire);
-                let written_now = self.written_lsn.load(Ordering::Acquire);
-                if requested_durable > 0 || written_now > self.durable_lsn.load(Ordering::Acquire) {
-                    self.backend.submit_sync(requested_durable.max(written_now));
+                let pending_sync = written > durable
+                    && (requested_durable > durable
+                        || (relaxed_mode && self.should_sync_relaxed(written, last_sync)));
+                if pending_sync && let Err(err) = self.backend.submit_sync(written) {
+                    self.record_backend_failure(err);
+                    return;
                 }
             }
             // Update last_sync when a sync completion was observed this
@@ -2797,8 +2880,7 @@ impl WalInner {
             },
             SubmitResult::Submitted => {
                 // io_uring: buffer ownership transferred to the backend; the
-                // Written completion (and any linked fsync Durable
-                // completion) arrives via `poll_completions`.
+                // Written completion arrives independently via the reaper.
                 return Ok(());
             }
         };
