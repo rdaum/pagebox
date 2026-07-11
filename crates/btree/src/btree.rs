@@ -1831,7 +1831,9 @@ impl BTree {
                 if swip.is_evicted() && swip.as_page_id() == left_pid {
                     continue;
                 }
-                if let Some(child) = unsafe { pool.try_pin_child(swip) } {
+                if (swip.is_hot() || swip.is_cool())
+                    && let Some(child) = unsafe { pool.try_pin_child(swip) }
+                {
                     stack.push(child);
                 }
             }

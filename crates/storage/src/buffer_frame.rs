@@ -31,9 +31,11 @@
 //!
 //! Eviction needs to find and rewrite the routing edge in the parent that
 //! points at the frame being evicted — without it, the parent's `Hot`/`Cool`
-//! SWIP would dangle. [`ParentLink`] enumerates the three cases:
+//! SWIP would dangle. [`ParentLink`] enumerates the four cases:
 //!
 //! - [`ParentLink::None`] — orphan (freshly allocated, never published).
+//! - [`ParentLink::Unswizzled`] — loaded by page ID while its owner edge
+//!   remains evicted, so eviction does not need to rewrite a parent pointer.
 //! - [`ParentLink::Stable`] — a routing edge stored outside any tree page
 //!   (e.g. `BTree::meta_swip`, a table directory `Vec` entry). The pool can
 //!   write `Swip::evicted(pid)` directly through the [`StableSwipRef`] without
@@ -74,6 +76,10 @@ use pagebox_swip_kernel::{AtomicSwipWord as AtomicSwip, SwipWord as Swip};
 pub enum ParentLink {
     /// No parent tracking (orphan, freshly allocated).
     None,
+    /// Loaded by page ID without installing a hot pointer in an owner edge.
+    /// The frame can be evicted directly until a traversal swizzles it and
+    /// replaces this state with `Stable` or `InnerNode`.
+    Unswizzled,
     /// Stable routing edge that outlives the pool
     /// (e.g., BTree::meta_swip, table directory Vec entry).
     /// Eviction writes Swip::evicted(pid) directly through this edge.

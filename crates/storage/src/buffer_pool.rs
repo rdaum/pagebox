@@ -1558,7 +1558,7 @@ fn finish_prefetch_frame(
                 .store(on_disk_lsn, Ordering::Relaxed);
             (*bf).header.core.dirty.store(false, Ordering::Relaxed);
             (*bf).header.core.pin_count.store(0, Ordering::Relaxed);
-            (*bf).header.parent_link = ParentLink::None;
+            (*bf).header.parent_link = ParentLink::Unswizzled;
             (*bf).header.core.state.transition(
                 FrameState::Loading,
                 FrameState::Resident,
@@ -2578,7 +2578,7 @@ impl BufferPool {
 
             // Inline eviction (primary path when bg provider is off,
             // safety valve when it's on).
-            if self.try_evict_any_policy(16) > 0 || self.try_evict_any_batch(16) > 0 {
+            if self.try_evict_any_policy(1) > 0 || self.try_evict_any_batch(1) > 0 {
                 idle = 0;
                 if self.resident_base_pages_available.load(Ordering::Relaxed) >= 1 {
                     return;
@@ -2735,7 +2735,7 @@ impl BufferPool {
         }
         let stable_edge = unsafe { StableSwipRef::from_ref(swip) };
         match unsafe { (*bf).header.parent_link } {
-            ParentLink::None => {}
+            ParentLink::None | ParentLink::Unswizzled => {}
             ParentLink::Stable(edge) if edge.ptr_eq(swip) => {}
             _ => return,
         }
@@ -3560,7 +3560,7 @@ impl BufferPool {
             assert!(found, "page {page_id} not found in store");
 
             unsafe {
-                self.install_loaded_frame_metadata(bf, page_id, ParentLink::None, 1);
+                self.install_loaded_frame_metadata(bf, page_id, ParentLink::Unswizzled, 1);
                 (*bf).header.core.state.transition(
                     FrameState::Evicting,
                     FrameState::Resident,
@@ -3708,7 +3708,7 @@ impl BufferPool {
         }
 
         unsafe {
-            self.install_loaded_frame_metadata(bf, page_id, ParentLink::None, 1);
+            self.install_loaded_frame_metadata(bf, page_id, ParentLink::Unswizzled, 1);
             (*bf).header.core.state.transition(
                 FrameState::Evicting,
                 FrameState::Resident,
@@ -4670,7 +4670,7 @@ impl BufferPool {
         match Self::frame_parent_link(bf) {
             ParentLink::InnerNode(_) => parent_updated,
             ParentLink::None => !Self::frame_is_index_page(bf) || parent_updated,
-            ParentLink::Stable(_) => true,
+            ParentLink::Stable(_) | ParentLink::Unswizzled => true,
         }
     }
 
@@ -4762,6 +4762,7 @@ impl BufferPool {
                 )
             }
             ParentLink::None => true,
+            ParentLink::Unswizzled => true,
             ParentLink::Stable(edge) => {
                 edge.store_evicted(pid);
                 true
@@ -5596,6 +5597,59 @@ mod tests {
                 _ => panic!("expected stable parent link after re-swizzle"),
             }
         }
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn page_id_load_is_directly_evictable_until_reswizzled() {
+        struct AcceptOrphan;
+
+        impl ParentFinder for AcceptOrphan {
+            fn find_and_unswizzle(&self, _child: BufferFrameRef, _child_pid: u64) -> bool {
+                true
+            }
+        }
+
+        let pool = BufferPool::new(1);
+        pool.register_dt(0, Arc::new(AcceptOrphan));
+        let (pid, frame) = pool.allocate_and_fix(NoLatches::new(&pool));
+        let raw = frame.raw();
+        let mut frame = frame.exclusive();
+        let page = frame.page_bytes_mut();
+        let sp = crate::slotted_page::SlottedPage::init(page.try_into().unwrap());
+        sp.set_flag(1 << 1);
+        page_header::write_page_type(page, PageType::Index);
+        frame.mark_dirty();
+        drop(frame);
+        assert_eq!(pool.try_flush_dirty_batch(1).unwrap(), 1);
+        unsafe {
+            (*raw)
+                .header
+                .core
+                .referenced
+                .store(false, Ordering::Relaxed);
+        }
+        assert!(pool.try_evict_one());
+        pool.unregister_dt(0);
+
+        let frame = unsafe { pool.fix_orphan_frame(pid, NoLatches::new(&pool)) };
+        assert!(matches!(
+            unsafe { (*frame.raw()).header.parent_link },
+            ParentLink::Unswizzled
+        ));
+        let raw = frame.raw();
+        drop(frame);
+        unsafe {
+            (*raw)
+                .header
+                .core
+                .referenced
+                .store(false, Ordering::Relaxed);
+        }
+        assert!(
+            pool.try_evict_one(),
+            "a page-ID load has no hot owner edge to unswizzle"
+        );
     }
 
     #[test]
