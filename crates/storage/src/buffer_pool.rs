@@ -1,3 +1,8 @@
+#![allow(
+    unused_unsafe,
+    reason = "NoLatches construction stays explicitly unsafe inside broader unsafe operations"
+)]
+
 //! The concurrent buffer pool: page fixing, residency, eviction, prefetch, and
 //! dirty-page tracking.
 //!
@@ -87,6 +92,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::num::NonZeroU64;
 use std::ops::Deref;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -110,9 +116,9 @@ use crate::metrics_stub::{Counter, Gauge, Histogram, LabeledCounter, LabeledGaug
 
 use crate::buffer_frame::PAGE_SIZE;
 use crate::buffer_frame::{
-    BufferFrame, BufferFrameReadRef, BufferFrameRef, BufferFrameWriteRef, FrameState,
-    PageReclaimer, PageWritebackPreparer, ParentFinder, ParentLink, StableSwipRef,
-    physical_page_number,
+    BufferFrame, BufferFrameReadRef, BufferFrameRef, BufferFrameWriteRef, EvictingFrame, FrameId,
+    FrameState, PageReclaimer, PageWritebackPreparer, ParentFinder, ParentLink, PoolId, StableSwip,
+    StableSwipOwner, physical_page_number,
 };
 use crate::buffer_frame::{Lsn, PageId};
 use crate::free_page_allocator::{FreeExtent, FreePageAllocator};
@@ -120,6 +126,17 @@ use crate::page_header::{self, PageType};
 use crate::page_provider;
 use crate::page_store::{InMemoryPageStore, PageStore};
 use pagebox_swip_kernel::{AtomicSwipWord as AtomicSwip, SwipWord as Swip};
+
+static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_pool_id() -> PoolId {
+    let raw = NEXT_POOL_ID
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(1)
+        })
+        .expect("buffer-pool identity space exhausted");
+    PoolId::new(NonZeroU64::new(raw).expect("buffer-pool identity must be nonzero"))
+}
 
 // ---------------------------------------------------------------------------
 // FreeList — recycled buffer frames
@@ -527,6 +544,7 @@ struct PoolState {
 /// - [`BufferPool::set_wal`] — attach a WAL; after this, dirty pages are
 ///   logged before being written to the data file.
 pub struct BufferPool {
+    id: PoolId,
     self_weak: OnceLock<Weak<BufferPool>>,
     state: PoolState,
     page_table: PageTable,
@@ -996,7 +1014,7 @@ impl Drop for EvictionPermit<'_> {
 // NoLatches — witness token for blocking pool methods
 // ---------------------------------------------------------------------------
 
-/// A witness that no frame latches (shared, exclusive, or optimistic) are
+/// A witness that no blocking frame latches (shared or exclusive) are
 /// currently held by the calling thread.
 ///
 /// Blocking pool methods like [`BufferPool::fix_orphan_frame`] and
@@ -1010,20 +1028,25 @@ impl Drop for EvictionPermit<'_> {
 /// the pinned frame but does not block exclusive-latch acquisition on other
 /// frames.
 ///
-/// The token is `!Copy` and `!Clone` so it must be explicitly constructed
-/// via [`NoLatches::new`]. It is a witness type: the caller constructs
-/// it at a point where they know no guards are held. The borrow checker
-/// cannot enforce this in the general case (shared borrows of `&self`
-/// coexist), but the token makes the contract visible at every blocking call
-/// site and prevents accidentally passing the wrong token across guard
-/// boundaries.
+/// The token is `!Copy` and `!Clone`, and construction is `unsafe`: the borrow
+/// checker cannot prove the absence of guards because shared borrows of
+/// `&self` coexist. Making the proof boundary explicit keeps latch accounting
+/// off every shared/exclusive hot path.
 ///
 /// # Safety contract
 ///
 /// Constructing `NoLatches` while any of these are alive is a contract
 /// violation that may cause pool exhaustion or deadlock:
-/// - [`SharedFrame`], [`ExclusiveFrame`], [`OptimisticFrame`]
-/// - [`SharedGuard`], [`ExclusiveGuard`], [`OptimisticGuard`]
+/// - [`SharedFrame`], [`ExclusiveFrame`]
+/// - raw [`SharedGuard`] or [`ExclusiveGuard`] values obtained through unsafe
+///   internal APIs
+///
+/// ```compile_fail
+/// use pagebox_storage::buffer_pool::{BufferPool, NoLatches};
+///
+/// let pool = BufferPool::new(1);
+/// let witness = NoLatches::new(&pool);
+/// ```
 pub struct NoLatches<'a> {
     _marker: core::marker::PhantomData<&'a BufferPool>,
 }
@@ -1031,17 +1054,15 @@ pub struct NoLatches<'a> {
 impl<'a> NoLatches<'a> {
     /// Construct a `NoLatches` witness.
     ///
-    /// The caller asserts that no frame latches (shared, exclusive, or
-    /// optimistic) are currently held by this thread. This is a documentation
-    /// contract, not a runtime check — the borrow checker cannot enforce it
-    /// because shared borrows of `&self` coexist. The token makes the
-    /// contract visible at every blocking call site.
+    /// The caller asserts that no blocking frame latches are currently held by
+    /// this thread.
     ///
-    /// Passing a `NoLatches` to a blocking pool method while latches are
-    /// held is a contract violation that may cause pool exhaustion or
-    /// deadlock.
+    /// # Safety
+    /// No [`SharedFrame`], [`ExclusiveFrame`], raw [`SharedGuard`], or raw
+    /// [`ExclusiveGuard`] may be live on the calling thread. Violating this
+    /// contract may cause pool exhaustion or deadlock.
     #[must_use]
-    pub fn new(pool: &'a BufferPool) -> Self {
+    pub unsafe fn new(pool: &'a BufferPool) -> Self {
         let _ = pool;
         Self {
             _marker: core::marker::PhantomData,
@@ -1571,11 +1592,11 @@ fn finish_prefetch_frame(
 
 /// A pinned, unlatched handle on a resident frame.
 ///
-/// Returned by [`BufferPool::fix_frame`], [`BufferPool::fix_orphan_frame`],
-/// [`BufferPool::fix_stable_frame`], [`BufferPool::allocate_and_fix`], and
-/// their `try_*` variants. The frame cannot be evicted for the lifetime of
-/// this guard (pin count is incremented by one on construction and
-/// decremented on `Drop`).
+/// Returned by [`BufferPool::fix_orphan_frame`], [`BufferPool::fix_stable`],
+/// and their `try_*` variants. New-page pins remain inside
+/// [`NewStablePage`] or [`NewUnlinkedPage`] until publication. The frame
+/// cannot be evicted for the lifetime of this guard (pin count is incremented
+/// by one on construction and decremented on `Drop`).
 ///
 /// A `PinnedFrame` does **not** carry a latch. To read or write page contents,
 /// the caller must obtain a guard via [`PinnedFrame::optimistic`] (read),
@@ -1587,6 +1608,14 @@ fn finish_prefetch_frame(
 ///
 /// `Clone` and [`PinnedFrame::clone_pin`] increment the pin count again, so
 /// multiple handles may reference the same pinned frame.
+///
+/// ```compile_fail
+/// use pagebox_storage::buffer_pool::PinnedFrame;
+///
+/// fn unlatched_read(frame: &PinnedFrame<'_>) {
+///     let _ = frame.page_bytes();
+/// }
+/// ```
 pub struct PinnedFrame<'a> {
     pool: &'a BufferPool,
     bf: *mut BufferFrame,
@@ -1619,28 +1648,24 @@ impl<'a> PinnedFrame<'a> {
         self.bf
     }
 
-    pub fn frame_ref(&self) -> BufferFrameRef {
+    /// # Safety
+    /// The returned lifetime-erased identity must not be used after this pin
+    /// is released or after its arena slot is recycled. Prefer [`Self::id`]
+    /// for identity that needs to escape the pin.
+    pub unsafe fn frame_ref(&self) -> BufferFrameRef {
         unsafe { BufferFrameRef::from_raw(self.bf) }
-    }
-
-    pub fn read_ref(&self) -> BufferFrameReadRef<'a> {
-        unsafe { self.frame_ref().read_ref() }
     }
 
     pub fn pid(&self) -> u64 {
         unsafe { (*self.bf).header.core.pid }
     }
 
+    pub fn id(&self) -> FrameId {
+        self.pool.frame_id(self.bf)
+    }
+
     pub fn hot_swip(&self) -> Swip {
         Swip::hot(self.bf)
-    }
-
-    pub fn page(&self) -> &[u8; PAGE_SIZE] {
-        unsafe { &(*self.bf).page }
-    }
-
-    pub fn page_bytes(&self) -> &[u8] {
-        unsafe { (*self.bf).page_bytes() }
     }
 
     pub fn mark_dirty(&self) {
@@ -1673,14 +1698,6 @@ impl PoolState {
     }
 }
 
-impl Deref for PinnedFrame<'_> {
-    type Target = BufferFrame;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.bf }
-    }
-}
-
 impl Drop for PinnedFrame<'_> {
     fn drop(&mut self) {
         unsafe { self.pool.unfix_raw(self.bf) };
@@ -1707,24 +1724,38 @@ pub struct OptimisticFrame<'a> {
 }
 
 impl<'a> OptimisticFrame<'a> {
-    pub fn frame_ref(&self) -> BufferFrameRef {
-        self.pinned.frame_ref()
+    /// Return this guard's lifetime-erased frame identity.
+    ///
+    /// # Safety
+    ///
+    /// The returned reference must not outlive this guard's pin, and it must
+    /// not be used to read page bytes without preserving this optimistic
+    /// guard's validation obligation.
+    pub unsafe fn frame_ref(&self) -> BufferFrameRef {
+        unsafe { self.pinned.frame_ref() }
     }
 
-    pub fn read_ref(&self) -> BufferFrameReadRef<'a> {
-        self.pinned.read_ref()
+    /// # Safety
+    /// The returned ordinary byte view may race with a writer. The caller must
+    /// treat all reads as speculative and validate before using any result.
+    pub unsafe fn read_ref(&self) -> BufferFrameReadRef<'_> {
+        unsafe { self.frame_ref().read_ref() }
     }
 
     pub fn pid(&self) -> u64 {
         self.pinned.pid()
     }
 
-    pub fn page(&self) -> &[u8; PAGE_SIZE] {
-        self.pinned.page()
+    /// # Safety
+    /// See [`OptimisticFrame::read_ref`].
+    pub unsafe fn page(&self) -> &[u8; PAGE_SIZE] {
+        unsafe { &(*self.pinned.raw()).page }
     }
 
-    pub fn page_bytes(&self) -> &[u8] {
-        self.pinned.page_bytes()
+    /// # Safety
+    /// See [`OptimisticFrame::read_ref`].
+    pub unsafe fn page_bytes(&self) -> &[u8] {
+        unsafe { (*self.pinned.raw()).page_bytes() }
     }
 
     pub fn validate(&self) -> Result<(), Restart> {
@@ -1778,6 +1809,14 @@ impl<'a> OptimisticFrame<'a> {
 /// real reader lock is held, no exclusive section can be entered concurrently —
 /// the snapshot is frozen for the guard's lifetime. `Clone` re-acquires a fresh
 /// shared lock on the same pinned frame.
+///
+/// ```compile_fail
+/// use pagebox_storage::buffer_pool::SharedFrame;
+///
+/// fn escape<'pool>(frame: SharedFrame<'pool>) -> &'pool [u8] {
+///     frame.page_bytes()
+/// }
+/// ```
 pub struct SharedFrame<'a> {
     pinned: PinnedFrame<'a>,
     guard: SharedGuard<'a>,
@@ -1802,12 +1841,18 @@ impl<'a> SharedFrame<'a> {
 }
 
 impl<'a> SharedFrame<'a> {
-    pub fn frame_ref(&self) -> BufferFrameRef {
-        self.pinned.frame_ref()
+    /// Return this guard's lifetime-erased frame identity.
+    ///
+    /// # Safety
+    ///
+    /// The returned reference must not outlive this guard's pin and shared
+    /// latch. It is identity, not independent page-access authority.
+    pub unsafe fn frame_ref(&self) -> BufferFrameRef {
+        unsafe { self.pinned.frame_ref() }
     }
 
-    pub fn read_ref(&self) -> BufferFrameReadRef<'a> {
-        self.pinned.read_ref()
+    pub fn read_ref(&self) -> BufferFrameReadRef<'_> {
+        unsafe { self.frame_ref().read_ref() }
     }
 
     pub fn pid(&self) -> u64 {
@@ -1815,11 +1860,11 @@ impl<'a> SharedFrame<'a> {
     }
 
     pub fn page(&self) -> &[u8; PAGE_SIZE] {
-        self.pinned.page()
+        unsafe { &(*self.pinned.raw()).page }
     }
 
     pub fn page_bytes(&self) -> &[u8] {
-        self.pinned.page_bytes()
+        unsafe { (*self.pinned.raw()).page_bytes() }
     }
 
     pub fn into_pinned(self) -> PinnedFrame<'a> {
@@ -1837,7 +1882,8 @@ impl Deref for SharedFrame<'_> {
     type Target = BufferFrame;
 
     fn deref(&self) -> &Self::Target {
-        &self.pinned
+        // The shared guard excludes writers for the lifetime of this borrow.
+        unsafe { &*self.pinned.raw() }
     }
 }
 
@@ -1860,6 +1906,219 @@ pub struct ExclusiveFrame<'a> {
     guard: ExclusiveGuard<'a>,
 }
 
+/// A newly allocated stable page that has not yet been installed in an owner.
+///
+/// Dropping the guard aborts the unpublished allocation and returns its frame
+/// capacity without entering durable page-retirement accounting.
+#[must_use]
+pub struct NewStablePage<'pool> {
+    pool: &'pool BufferPool,
+    edge: Option<StableSwip>,
+    frame: Option<ExclusiveFrame<'pool>>,
+}
+
+/// A newly allocated page that has not yet been made reachable by a routing
+/// edge.
+///
+/// The page retains a pin but no latch. Dropping it aborts the unpublished
+/// allocation immediately rather than entering checkpoint-gated retirement.
+/// Callers may exclusively initialise it and return to this unlatched state
+/// before acquiring a parent latch.
+///
+/// ```compile_fail
+/// use pagebox_storage::buffer_pool::{BufferPool, NoLatches};
+///
+/// let pool = BufferPool::new(1);
+/// let page = pool.allocate_unlinked(unsafe { NoLatches::new(&pool) });
+/// let untracked_pin = page.into_pinned();
+/// ```
+#[must_use]
+pub struct NewUnlinkedPage<'pool> {
+    pool: &'pool BufferPool,
+    frame: Option<PinnedFrame<'pool>>,
+}
+
+/// Exclusively latched construction state for a [`NewUnlinkedPage`].
+#[must_use]
+pub struct NewUnlinkedExclusivePage<'pool> {
+    pool: &'pool BufferPool,
+    frame: Option<ExclusiveFrame<'pool>>,
+}
+
+impl NewStablePage<'_> {
+    pub fn pid(&self) -> PageId {
+        self.frame
+            .as_ref()
+            .expect("new stable page frame already consumed")
+            .pid()
+    }
+
+    pub fn page_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
+        self.frame
+            .as_mut()
+            .expect("new stable page frame already consumed")
+            .page_mut()
+    }
+
+    pub fn mark_dirty(&mut self) {
+        self.frame
+            .as_ref()
+            .expect("new stable page frame already consumed")
+            .mark_dirty();
+    }
+
+    /// Run page initialisation through a write view bounded by this unpublished
+    /// page guard. The stable backlink is already installed and cannot be
+    /// separated from the frame during the callback.
+    pub fn with_write<R>(&mut self, f: impl FnOnce(&mut BufferFrameWriteRef<'_>) -> R) -> R {
+        let frame = self
+            .frame
+            .as_mut()
+            .expect("new stable page frame already consumed");
+        let mut write = frame.write_ref();
+        f(&mut write)
+    }
+
+    /// Install the stable edge into a pre-reserved owner slot before releasing
+    /// the frame latch and pin.
+    pub fn install(mut self, slot: &mut Option<StableSwip>) {
+        assert!(slot.is_none(), "stable owner slot must be vacant");
+        let edge = self
+            .edge
+            .take()
+            .expect("new stable page edge already consumed");
+        *slot = Some(edge);
+        drop(self.frame.take());
+    }
+}
+
+impl Drop for NewStablePage<'_> {
+    fn drop(&mut self) {
+        let Some(frame) = self.frame.take() else {
+            return;
+        };
+        let edge = self
+            .edge
+            .take()
+            .expect("unpublished stable frame must retain its owner edge");
+        self.pool.abort_unpublished_stable_frame(frame, edge);
+    }
+}
+
+impl<'pool> NewUnlinkedPage<'pool> {
+    pub fn pid(&self) -> PageId {
+        self.frame
+            .as_ref()
+            .expect("new unlinked page frame already consumed")
+            .pid()
+    }
+
+    pub fn hot_swip(&self) -> Swip {
+        self.frame
+            .as_ref()
+            .expect("new unlinked page frame already consumed")
+            .hot_swip()
+    }
+
+    /// Return the unpublished page's lifetime-erased frame identity.
+    ///
+    /// # Safety
+    /// The identity must not outlive this guard or be used as independent
+    /// dereference authority.
+    pub unsafe fn frame_ref(&self) -> BufferFrameRef {
+        unsafe {
+            self.frame
+                .as_ref()
+                .expect("new unlinked page frame already consumed")
+                .frame_ref()
+        }
+    }
+
+    pub fn exclusive(mut self) -> NewUnlinkedExclusivePage<'pool> {
+        let frame = self
+            .frame
+            .take()
+            .expect("new unlinked page frame already consumed")
+            .exclusive();
+        NewUnlinkedExclusivePage {
+            pool: self.pool,
+            frame: Some(frame),
+        }
+    }
+
+    /// Finish a publication operation that was performed by a specialised
+    /// structural primitive.
+    ///
+    /// # Safety
+    /// An owning parent, root, or sibling edge must already make this page
+    /// reachable, and that edge must remain valid after the returned pin is
+    /// released.
+    pub unsafe fn finish_publication(mut self) -> PinnedFrame<'pool> {
+        self.frame
+            .take()
+            .expect("new unlinked page frame already consumed")
+    }
+}
+
+impl Drop for NewUnlinkedPage<'_> {
+    fn drop(&mut self) {
+        let Some(frame) = self.frame.take() else {
+            return;
+        };
+        self.pool
+            .abort_unpublished_unlinked_frame(frame.exclusive());
+    }
+}
+
+impl<'pool> NewUnlinkedExclusivePage<'pool> {
+    pub fn frame(&self) -> &ExclusiveFrame<'pool> {
+        self.frame
+            .as_ref()
+            .expect("new unlinked page frame already consumed")
+    }
+
+    pub fn frame_mut(&mut self) -> &mut ExclusiveFrame<'pool> {
+        self.frame
+            .as_mut()
+            .expect("new unlinked page frame already consumed")
+    }
+
+    pub fn into_unlatched(mut self) -> NewUnlinkedPage<'pool> {
+        let frame = self
+            .frame
+            .take()
+            .expect("new unlinked page frame already consumed")
+            .into_pinned();
+        NewUnlinkedPage {
+            pool: self.pool,
+            frame: Some(frame),
+        }
+    }
+
+    /// Escape into the raw exclusive-frame protocol for a specialised,
+    /// atomic publication operation such as B+tree root transfer.
+    ///
+    /// # Safety
+    /// The caller must either make the page reachable before releasing the
+    /// returned frame or abort/retire it on every failure path. Ordinary
+    /// split-page publication must retain the typestate guard until its edge
+    /// is installed.
+    pub unsafe fn into_exclusive_frame(mut self) -> ExclusiveFrame<'pool> {
+        self.frame
+            .take()
+            .expect("new unlinked page frame already consumed")
+    }
+}
+
+impl Drop for NewUnlinkedExclusivePage<'_> {
+    fn drop(&mut self) {
+        let Some(frame) = self.frame.take() else {
+            return;
+        };
+        self.pool.abort_unpublished_unlinked_frame(frame);
+    }
+}
+
 impl<'a> ExclusiveFrame<'a> {
     /// # Safety
     ///
@@ -1873,15 +2132,21 @@ impl<'a> ExclusiveFrame<'a> {
         self.pinned.raw()
     }
 
-    pub fn frame_ref(&self) -> BufferFrameRef {
-        self.pinned.frame_ref()
+    /// Return this guard's lifetime-erased frame identity.
+    ///
+    /// # Safety
+    ///
+    /// The returned reference must not outlive this guard's pin and exclusive
+    /// latch. It is identity, not independent page-access authority.
+    pub unsafe fn frame_ref(&self) -> BufferFrameRef {
+        unsafe { self.pinned.frame_ref() }
     }
 
-    pub fn read_ref(&self) -> BufferFrameReadRef<'a> {
-        self.pinned.read_ref()
+    pub fn read_ref(&self) -> BufferFrameReadRef<'_> {
+        unsafe { self.frame_ref().read_ref() }
     }
 
-    pub fn write_ref(&self) -> BufferFrameWriteRef<'a> {
+    pub fn write_ref(&mut self) -> BufferFrameWriteRef<'_> {
         unsafe { self.frame_ref().write_ref() }
     }
 
@@ -1894,11 +2159,11 @@ impl<'a> ExclusiveFrame<'a> {
     }
 
     pub fn page(&self) -> &[u8; PAGE_SIZE] {
-        self.pinned.page()
+        unsafe { &(*self.pinned.raw()).page }
     }
 
     pub fn page_bytes(&self) -> &[u8] {
-        self.pinned.page_bytes()
+        unsafe { (*self.pinned.raw()).page_bytes() }
     }
 
     pub fn page_bytes_mut(&mut self) -> &mut [u8] {
@@ -1916,9 +2181,9 @@ impl<'a> ExclusiveFrame<'a> {
         unsafe { (*bf).header.parent_link = ParentLink::None };
     }
 
-    pub fn set_parent_link_stable(&mut self, swip: StableSwipRef) {
+    pub(crate) fn set_parent_link_stable(&mut self, swip: &StableSwip) {
         let bf = self.raw();
-        unsafe { (*bf).header.parent_link = ParentLink::Stable(swip) };
+        unsafe { (*bf).header.parent_link = ParentLink::Stable(Arc::clone(swip.owner())) };
     }
 
     pub fn guard(&self) -> &ExclusiveGuard<'a> {
@@ -1952,7 +2217,8 @@ impl Deref for ExclusiveFrame<'_> {
     type Target = BufferFrame;
 
     fn deref(&self) -> &Self::Target {
-        &self.pinned
+        // The exclusive guard provides sole frame access for this borrow.
+        unsafe { &*self.pinned.raw() }
     }
 }
 
@@ -2217,6 +2483,24 @@ impl BufferPool {
         Some(unsafe { PinnedFrame::new(self, bf) })
     }
 
+    /// Pin a child only when its routing edge already names a resident frame.
+    ///
+    /// Unlike [`BufferPool::try_pin_child`], this method never resolves an
+    /// EVICTED SWIP through the page table and never starts a page-store read.
+    /// It is intended for structural operations that already hold another
+    /// frame latch and must restart instead of blocking on I/O.
+    ///
+    /// # Safety
+    /// `swip` must come from a valid page routing edge managed by this pool.
+    pub unsafe fn try_pin_resident_child(&self, swip: Swip) -> Option<PinnedFrame<'_>> {
+        if !(swip.is_hot() || swip.is_cool()) {
+            return None;
+        }
+        let _pin_guard = self.lock_hot_pin();
+        let bf = unsafe { self.try_pin_hot_or_cool_swip(swip) }?;
+        Some(unsafe { PinnedFrame::new(self, bf) })
+    }
+
     /// Pin a child frame while the caller already holds `eviction_mu.write()`.
     ///
     /// # Safety
@@ -2320,112 +2604,30 @@ impl BufferPool {
         Some(bf)
     }
 
-    /// # Safety
-    /// `swip` must be a valid AtomicSwip previously returned by this pool.
-    pub unsafe fn fix_frame<'a>(
+    pub fn fix_stable<'a>(
         &'a self,
-        swip: &AtomicSwip,
+        swip: &StableSwip,
         _no_latches: NoLatches<'_>,
     ) -> PinnedFrame<'a> {
-        let mut attempts = 0u32;
-        loop {
-            let s = swip.load(Ordering::Acquire);
-            if s.is_hot() || s.is_cool() {
-                let bf = unsafe { s.as_ptr::<BufferFrame>() };
-                debug_assert!(
-                    self.contains_frame_ptr(bf),
-                    "pool.fix_frame: stale HOT/COOL pointer: raw={:#x} ptr={:#x}",
-                    s.raw(),
-                    bf as usize,
-                );
-                assert!(
-                    self.contains_frame_ptr(bf),
-                    "pool.fix_frame: stale HOT/COOL pointer: raw={:#x} ptr={:#x}",
-                    s.raw(),
-                    bf as usize,
-                );
-                let pre_state = unsafe { (*bf).header.core.state.load(Ordering::Acquire) };
-                if pre_state != FrameState::Resident {
-                    let current = swip.load(Ordering::Acquire);
-                    if current.raw() == s.raw() {
-                        if self.try_repair_nonresident_hot_swip(swip, s, bf, pre_state) {
-                            attempts = 0;
-                            continue;
-                        }
-                        if pre_state == FrameState::Evicting
-                            && unsafe { self.try_rescue_evicting_orphan(bf, (*bf).header.core.pid) }
-                        {
-                            attempts = 0;
-                            continue;
-                        }
-                        if matches!(pre_state, FrameState::Loading | FrameState::Evicting) {
-                            self.wait_for_hot_frame_transition(swip, s, bf);
-                        }
-                    }
-                    attempts = attempts.saturating_add(1);
-                    Self::fix_frame_backoff(attempts);
-                    continue;
-                }
-                let _pin_guard = self.lock_hot_pin();
-                unsafe { (*bf).header.core.pin_count.fetch_add(1, Ordering::Relaxed) };
-                let current = swip.load(Ordering::Acquire);
-                let state = unsafe { (*bf).header.core.state.load(Ordering::Acquire) };
-                if current.raw() == s.raw() && state == FrameState::Resident {
-                    return unsafe { PinnedFrame::new(self, bf) };
-                }
-                unsafe { (*bf).header.core.pin_count.fetch_sub(1, Ordering::Relaxed) };
-                if current.raw() == s.raw() {
-                    if self.try_repair_nonresident_hot_swip(swip, s, bf, state) {
-                        attempts = 0;
-                        continue;
-                    }
-                    if state == FrameState::Evicting
-                        && unsafe { self.try_rescue_evicting_orphan(bf, (*bf).header.core.pid) }
-                    {
-                        attempts = 0;
-                        continue;
-                    }
-                    if matches!(state, FrameState::Loading | FrameState::Evicting) {
-                        self.wait_for_hot_frame_transition(swip, s, bf);
-                    }
-                }
-                attempts = attempts.saturating_add(1);
-                Self::fix_frame_backoff(attempts);
-                continue;
-            }
-            return unsafe { PinnedFrame::new(self, self.fix_raw(swip)) };
-        }
+        self.assert_stable_provenance(swip);
+        unsafe { PinnedFrame::new(self, self.fix_stable_raw(swip.owner())) }
     }
 
-    pub fn fix_stable_frame<'a>(
-        &'a self,
-        swip: StableSwipRef,
-        _no_latches: NoLatches<'_>,
-    ) -> PinnedFrame<'a> {
-        unsafe { self.fix_frame(swip.as_ref(), _no_latches) }
+    fn assert_stable_provenance(&self, swip: &StableSwip) {
+        assert_eq!(
+            swip.pool_id(),
+            self.id,
+            "stable SWIP belongs to a different buffer pool"
+        );
     }
 
-    /// # Safety
-    /// `swip` must be a valid AtomicSwip previously returned by this pool.
-    pub unsafe fn with_fixed_frame<T>(
+    pub fn with_fixed_stable_exclusive<T>(
         &self,
-        swip: &AtomicSwip,
-        _no_latches: NoLatches<'_>,
-        f: impl FnOnce(&PinnedFrame<'_>) -> T,
-    ) -> T {
-        let frame = unsafe { self.fix_frame(swip, _no_latches) };
-        f(&frame)
-    }
-
-    /// # Safety
-    /// `swip` must be a valid AtomicSwip previously returned by this pool.
-    pub unsafe fn with_fixed_exclusive<T>(
-        &self,
-        swip: &AtomicSwip,
-        _no_latches: NoLatches<'_>,
+        swip: &StableSwip,
+        no_latches: NoLatches<'_>,
         f: impl FnOnce(&mut ExclusiveFrame<'_>) -> T,
     ) -> T {
-        let mut frame = unsafe { self.fix_frame(swip, _no_latches) }.exclusive();
+        let mut frame = self.fix_stable(swip, no_latches).exclusive();
         f(&mut frame)
     }
 
@@ -2445,12 +2647,9 @@ impl BufferPool {
         self.contains_frame_ptr(bf)
     }
 
-    /// # Safety
-    /// `swip` must be a valid AtomicSwip previously returned by this pool.
-    ///
-    /// Returns `None` instead of blocking when the referenced frame is
+    /// Returns `None` instead of blocking when the stable edge's frame is
     /// currently contested or not already resident.
-    pub unsafe fn try_fix_frame<'a>(&'a self, swip: &AtomicSwip) -> Option<PinnedFrame<'a>> {
+    unsafe fn try_fix_stable_word<'a>(&'a self, swip: &AtomicSwip) -> Option<PinnedFrame<'a>> {
         let s = swip.load(Ordering::Acquire);
         if s.is_hot() || s.is_cool() {
             let bf = unsafe { s.as_ptr::<BufferFrame>() };
@@ -2488,8 +2687,14 @@ impl BufferPool {
             .map(|bf| unsafe { PinnedFrame::new(self, bf) })
     }
 
-    pub fn try_fix_stable_frame<'a>(&'a self, swip: StableSwipRef) -> Option<PinnedFrame<'a>> {
-        unsafe { self.try_fix_frame(swip.as_ref()) }
+    /// Pin a stable edge only if its page is already resident.
+    ///
+    /// This never performs storage I/O and therefore needs no [`NoLatches`]
+    /// witness. The HOT/COOL path borrows the stable owner without modifying
+    /// its `Arc` count.
+    pub fn try_fix_stable<'a>(&'a self, swip: &StableSwip) -> Option<PinnedFrame<'a>> {
+        self.assert_stable_provenance(swip);
+        unsafe { self.try_fix_stable_word(swip.word()) }
     }
 
     /// # Safety
@@ -2623,12 +2828,12 @@ impl BufferPool {
     /// Panics if all frames are pinned (pool exhausted).
     fn pop_free_frame(&self) -> *mut BufferFrame {
         if let Some(bf) = self.state.free_list.try_pop() {
-            return bf;
+            return self.claim_free_frame(bf);
         }
         let mut backoff = Backoff::new();
         loop {
             if let Some(bf) = self.state.free_list.try_pop() {
-                return bf;
+                return self.claim_free_frame(bf);
             }
 
             // Notify the background page provider that we need frames.
@@ -2668,6 +2873,16 @@ impl BufferPool {
                 self.panic_pool_exhausted();
             }
         }
+    }
+
+    fn claim_free_frame(&self, bf: *mut BufferFrame) -> *mut BufferFrame {
+        let generation = unsafe { &(*bf).header.generation };
+        generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .expect("buffer-frame generation exhausted");
+        bf
     }
 
     unsafe fn try_fix_resident_page(&self, page_id: u64) -> Option<*mut BufferFrame> {
@@ -2724,6 +2939,7 @@ impl BufferPool {
     unsafe fn reswizzle_stable_resident_locked(
         &self,
         swip: &AtomicSwip,
+        owner: &Arc<StableSwipOwner>,
         expected: Swip,
         bf: *mut BufferFrame,
         page_id: u64,
@@ -2733,17 +2949,16 @@ impl BufferPool {
         {
             return;
         }
-        let stable_edge = unsafe { StableSwipRef::from_ref(swip) };
-        match unsafe { (*bf).header.parent_link } {
+        match unsafe { &(*bf).header.parent_link } {
             ParentLink::None | ParentLink::Unswizzled => {}
-            ParentLink::Stable(edge) if edge.ptr_eq(swip) => {}
+            ParentLink::Stable(edge) if Arc::ptr_eq(edge, owner) => {}
             _ => return,
         }
         if swip
             .compare_exchange(expected, Swip::hot(bf), Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            unsafe { (*bf).header.parent_link = ParentLink::Stable(stable_edge) };
+            unsafe { (*bf).header.parent_link = ParentLink::Stable(Arc::clone(owner)) };
         }
     }
 
@@ -2755,6 +2970,17 @@ impl BufferPool {
         addr >= base
             && addr < base.saturating_add(byte_len)
             && (addr - base).is_multiple_of(arena.frame_stride)
+    }
+
+    fn frame_id(&self, bf: *mut BufferFrame) -> FrameId {
+        assert!(
+            self.contains_frame_ptr(bf),
+            "frame does not belong to this pool"
+        );
+        let arena = self.arena();
+        let slot = ((bf as usize - arena.ptr as usize) / arena.frame_stride) as u32;
+        let generation = unsafe { (*bf).header.generation.load(Ordering::Acquire) };
+        FrameId::new(slot, generation)
     }
 
     pub fn new(num_frames: usize) -> Self {
@@ -2776,6 +3002,7 @@ impl BufferPool {
         let state = PoolState::new(frame_count);
 
         let pool = BufferPool {
+            id: allocate_pool_id(),
             self_weak: OnceLock::new(),
             state,
             page_table: PageTable::new(),
@@ -3099,6 +3326,74 @@ impl BufferPool {
         pid
     }
 
+    fn abort_unpublished_stable_frame(&self, mut frame: ExclusiveFrame<'_>, edge: StableSwip) {
+        self.assert_stable_provenance(&edge);
+        frame.set_parent_link_none();
+        drop(edge);
+        self.abort_unpublished_unlinked_frame(frame);
+    }
+
+    fn abort_unpublished_unlinked_frame(&self, frame: ExclusiveFrame<'_>) {
+        let bf = frame.raw();
+        let pid = frame.pid();
+        assert_eq!(
+            unsafe { (*bf).header.core.pin_count.load(Ordering::Acquire) },
+            1,
+            "unpublished page unexpectedly acquired another pin"
+        );
+        assert!(
+            matches!(Self::frame_parent_link(bf), ParentLink::None),
+            "unpublished unlinked page acquired an owning backlink"
+        );
+        unsafe {
+            (*bf).header.core.dirty.store(false, Ordering::Relaxed);
+            (*bf).header.core.referenced.store(false, Ordering::Relaxed);
+            (*bf).header.core.page_lsn.store(0, Ordering::Relaxed);
+            (*bf)
+                .header
+                .core
+                .wal_buffer_epoch
+                .store(0, Ordering::Relaxed);
+            (*bf)
+                .header
+                .core
+                .wal_buffer_offset
+                .store(0, Ordering::Relaxed);
+            (*bf)
+                .header
+                .core
+                .state
+                .store(FrameState::Free, Ordering::Release);
+        }
+        self.page_table.remove(pid);
+        self.release_resident_budget(bf);
+        self.state.free_list.push(bf);
+        drop(frame);
+    }
+
+    /// Retire a stable page after its owning metadata has been durably
+    /// unlinked. The edge is consumed so no future fix can discover the page.
+    ///
+    /// # Safety
+    /// The caller must have removed every durable and in-memory route to this
+    /// stable edge before calling. Reuse remains checkpoint-gated.
+    ///
+    /// ```compile_fail
+    /// use pagebox_storage::buffer_pool::{BufferPool, NoLatches};
+    ///
+    /// let pool = BufferPool::new(1);
+    /// let edge = pool.allocate_page();
+    /// unsafe { pool.retire_stable(edge, NoLatches::new(&pool)) };
+    /// let _ = edge.page_id();
+    /// ```
+    pub unsafe fn retire_stable(&self, edge: StableSwip, no_latches: NoLatches<'_>) -> PageId {
+        self.assert_stable_provenance(&edge);
+        let mut frame = self.fix_stable(&edge, no_latches).exclusive();
+        frame.set_parent_link_none();
+        drop(edge);
+        unsafe { self.retire_unlinked_exclusive_frame(frame) }
+    }
+
     fn allocate_page_id(&self) -> PageId {
         let prior_next_page_number = self.free_page_allocator.next_page_number();
         let pid = self
@@ -3121,16 +3416,13 @@ impl BufferPool {
         pid
     }
 
-    /// Allocate a new page and return a pinned frame.
+    /// Allocate a new page for an internal publication typestate guard.
     ///
-    /// Unlike `allocate_page()` + `fix(&swip)`, this does not set
-    /// `parent_swip` to a stack reference. `parent_swip` is null;
-    /// the caller must set it to the correct owner entry
-    /// after publishing the page.
-    ///
-    /// Returns `(page_id, frame)`. The frame is pinned (pin_count=1),
-    /// NOT exclusively latched, in Resident state.
-    pub fn allocate_and_fix(&self, _no_latches: NoLatches<'_>) -> (u64, PinnedFrame<'_>) {
+    /// Returns `(page_id, frame)`. The frame is pinned (pin_count=1), not
+    /// exclusively latched, and in Resident state. Public callers use
+    /// [`BufferPool::allocate_stable`] or [`BufferPool::allocate_unlinked`],
+    /// which cannot lose track of the unpublished allocation.
+    pub(crate) fn allocate_and_fix(&self, _no_latches: NoLatches<'_>) -> (u64, PinnedFrame<'_>) {
         let pid = self.allocate_page_id();
 
         self.reserve_resident_budget();
@@ -3166,17 +3458,57 @@ impl BufferPool {
         (pid, unsafe { PinnedFrame::new(self, bf) })
     }
 
-    pub fn allocate_and_fix_frame<'a>(
-        &'a self,
-        _no_latches: NoLatches<'_>,
-    ) -> (u64, PinnedFrame<'a>) {
-        self.allocate_and_fix(_no_latches)
+    /// Allocate a resident page whose stable owner and frame backlink are
+    /// created atomically before the caller can observe it.
+    pub fn allocate_stable(&self, no_latches: NoLatches<'_>) -> NewStablePage<'_> {
+        let (_, frame) = self.allocate_and_fix(no_latches);
+        let mut frame = frame.exclusive();
+        let edge = self.stable_frame(&mut frame);
+        NewStablePage {
+            pool: self,
+            edge: Some(edge),
+            frame: Some(frame),
+        }
+    }
+
+    /// Allocate an unlinked page whose publication state is tracked by its
+    /// returned guard.
+    pub fn allocate_unlinked(&self, no_latches: NoLatches<'_>) -> NewUnlinkedPage<'_> {
+        let (_, frame) = self.allocate_and_fix(no_latches);
+        NewUnlinkedPage {
+            pool: self,
+            frame: Some(frame),
+        }
     }
 
     /// Allocate a new page, returning an evicted swip for it.
     /// The page is written to the store but not loaded into a frame.
-    pub fn allocate_page(&self) -> AtomicSwip {
-        AtomicSwip::new(Swip::evicted(self.allocate_page_id()))
+    pub fn allocate_page(&self) -> StableSwip {
+        let page_id = self.allocate_page_id();
+        StableSwip::new(self.id, page_id, Swip::evicted(page_id))
+    }
+
+    /// Create a stable owner for an already allocated page ID.
+    pub fn stable_page(&self, page_id: PageId) -> StableSwip {
+        let page_number = physical_page_number(page_id);
+        assert!(page_number > 0, "stable page ID must be nonzero");
+        assert!(
+            page_number < self.next_page_id.load(Ordering::Acquire),
+            "stable page ID {page_id} was not allocated by this pool"
+        );
+        StableSwip::new(self.id, page_id, Swip::evicted(page_id))
+    }
+
+    /// Create a stable owner for a newly initialised resident frame and install
+    /// the frame's owning backlink before the exclusive latch can be released.
+    fn stable_frame(&self, frame: &mut ExclusiveFrame<'_>) -> StableSwip {
+        assert!(
+            self.contains_frame_ptr(frame.raw()),
+            "stable frame belongs to a different buffer pool"
+        );
+        let stable = StableSwip::new(self.id, frame.pid(), frame.hot_swip());
+        frame.set_parent_link_stable(&stable);
+        stable
     }
 
     /// Fix a swip: ensure its page is resident and return a pointer to the frame.
@@ -3185,11 +3517,20 @@ impl BufferPool {
     /// # Safety
     /// `swip` must be a valid AtomicSwip previously returned by this pool.
     /// If the swip is hot, its buffer frame pointer must be live.
-    unsafe fn fix_raw(&self, swip: &AtomicSwip) -> *mut BufferFrame {
+    unsafe fn fix_stable_raw(&self, owner: &Arc<StableSwipOwner>) -> *mut BufferFrame {
+        // HOT/COOL fixing only borrows the stable owner. Do not clone or drop
+        // this Arc on the resident fast path: refcount traffic belongs to
+        // stable-link lifecycle transitions, never ordinary fixing.
+        unsafe { self.fix_raw(owner.word(), owner) }
+    }
+
+    /// # Safety
+    /// `owner` must belong to this pool.
+    unsafe fn fix_raw(&self, swip: &AtomicSwip, owner: &Arc<StableSwipOwner>) -> *mut BufferFrame {
         loop {
             let s = swip.load(Ordering::Acquire);
 
-            if s.is_hot() {
+            if s.is_hot() || s.is_cool() {
                 let bf = unsafe { s.as_ptr::<BufferFrame>() };
                 debug_assert!(
                     self.contains_frame_ptr(bf),
@@ -3275,7 +3616,7 @@ impl BufferPool {
                 unsafe {
                     (*bf).header.core.pin_count.fetch_add(1, Ordering::Relaxed);
                     (*bf).header.core.referenced.store(true, Ordering::Relaxed);
-                    self.reswizzle_stable_resident_locked(swip, s, bf, page_id);
+                    self.reswizzle_stable_resident_locked(swip, owner, s, bf, page_id);
                 }
                 return bf;
             }
@@ -3340,12 +3681,8 @@ impl BufferPool {
             assert!(found, "page {page_id} not found in store");
 
             unsafe {
-                self.install_loaded_frame_metadata(
-                    bf,
-                    page_id,
-                    ParentLink::Stable(StableSwipRef::from_ref(swip)),
-                    1,
-                );
+                let parent_link = ParentLink::Stable(Arc::clone(owner));
+                self.install_loaded_frame_metadata(bf, page_id, parent_link, 1);
             }
 
             // CAS swip from EVICTED to HOT. Transition Loading → Resident.
@@ -4621,7 +4958,7 @@ impl BufferPool {
     }
 
     fn frame_parent_link(bf: *mut BufferFrame) -> ParentLink {
-        unsafe { (*bf).header.parent_link }
+        unsafe { (*bf).header.parent_link.clone() }
     }
 
     #[cfg(not(miri))]
@@ -4798,8 +5135,13 @@ impl BufferPool {
 
         let hinted_finder = self.dt_registry.lock().get(&dt_id).cloned();
         if let Some(finder) = hinted_finder
-            && let Some(result) =
-                finder.find_and_unswizzle_with_hint(child, pid, parent_pid, slot_index, is_upper)
+            && let Some(result) = finder.find_and_unswizzle_with_hint(
+                unsafe { EvictingFrame::new(child) },
+                pid,
+                parent_pid,
+                slot_index,
+                is_upper,
+            )
         {
             if result {
                 self.metrics
@@ -4870,7 +5212,7 @@ impl BufferPool {
     ) -> bool {
         let hinted_finder = self.dt_registry.lock().get(&dt_id).cloned();
         if let Some(finder) = hinted_finder
-            && finder.find_and_unswizzle(child, pid)
+            && finder.find_and_unswizzle(unsafe { EvictingFrame::new(child) }, pid)
         {
             self.metrics
                 .unswizzle_parent_events
@@ -4892,7 +5234,7 @@ impl BufferPool {
                 .collect::<Vec<_>>()
         };
         for finder in fallback_finders {
-            if finder.find_and_unswizzle(child, pid) {
+            if finder.find_and_unswizzle(unsafe { EvictingFrame::new(child) }, pid) {
                 self.metrics
                     .unswizzle_parent_events
                     .inc(UnswizzleParentEvent::DfsSuccesses);
@@ -4919,7 +5261,7 @@ impl BufferPool {
             .map(Arc::clone)
             .collect::<Vec<_>>();
         for finder in finders {
-            if finder.find_and_unswizzle(child, pid) {
+            if finder.find_and_unswizzle(unsafe { EvictingFrame::new(child) }, pid) {
                 self.metrics
                     .unswizzle_parent_events
                     .inc(UnswizzleParentEvent::DfsSuccesses);
@@ -5311,6 +5653,19 @@ impl Drop for BufferPool {
         // Best-effort on drop — caller should use flush() explicitly
         // when durability matters.
         let _ = self.flush();
+
+        // Arena::drop unmaps raw frame storage without running BufferFrame
+        // destructors. Release every owning stable backlink explicitly first.
+        for idx in 0..self.state.arena.len {
+            let bf = self.raw_frame(idx);
+            unsafe {
+                let old = std::mem::replace(&mut (*bf).header.parent_link, ParentLink::None);
+                if let ParentLink::Stable(owner) = &old {
+                    owner.store_evicted((*bf).header.core.pid);
+                }
+                drop(old);
+            }
+        }
     }
 }
 
@@ -5393,7 +5748,7 @@ mod tests {
         let swip = pool.allocate_page();
         assert!(swip.load(Ordering::Relaxed).is_evicted());
 
-        let bf = unsafe { pool.fix_frame(&swip, NoLatches::new(&pool)) };
+        let bf = pool.fix_stable(&swip, unsafe { NoLatches::new(&pool) });
         let raw = bf.raw();
         assert!(swip.load(Ordering::Relaxed).is_hot());
         assert_eq!(
@@ -5405,6 +5760,315 @@ mod tests {
         assert_eq!(
             unsafe { (*raw).header.core.pin_count.load(Ordering::Relaxed) },
             0
+        );
+    }
+
+    #[test]
+    fn dropping_new_stable_page_aborts_unpublished_allocation() {
+        let pool = BufferPool::new(2);
+        let pid = {
+            let page = pool.allocate_stable(unsafe { NoLatches::new(&pool) });
+            let pid = page.pid();
+            assert!(pool.page_table.lookup(pid).is_some());
+            pid
+        };
+
+        assert!(
+            pool.page_table.lookup(pid).is_none(),
+            "aborted unpublished page must leave no page-table entry"
+        );
+        assert_eq!(pool.num_occupied(), 0);
+        assert_eq!(
+            pool.resident_base_pages_available.load(Ordering::Acquire),
+            pool.resident_base_pages
+        );
+        assert!(
+            pool.pending_reusable_extents.lock().is_empty(),
+            "unpublished abort must not enter durable retirement accounting"
+        );
+    }
+
+    #[test]
+    fn dropping_new_unlinked_page_aborts_without_durable_retirement() {
+        let pool = BufferPool::new(2);
+        let pid = {
+            let page = pool.allocate_unlinked(unsafe { NoLatches::new(&pool) });
+            let pid = page.pid();
+            assert!(pool.page_table.lookup(pid).is_some());
+            pid
+        };
+
+        assert!(pool.page_table.lookup(pid).is_none());
+        assert_eq!(pool.num_occupied(), 0);
+        assert_eq!(
+            pool.resident_base_pages_available.load(Ordering::Acquire),
+            pool.resident_base_pages
+        );
+        assert!(pool.pending_reusable_extents.lock().is_empty());
+    }
+
+    #[test]
+    fn panicking_unlinked_construction_aborts_the_page() {
+        let pool = BufferPool::new(1);
+        let mut pid = 0;
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let page = pool.allocate_unlinked(unsafe { NoLatches::new(&pool) });
+            pid = page.pid();
+            panic!("construction failed");
+        }));
+
+        assert!(result.is_err());
+        assert!(pool.page_table.lookup(pid).is_none());
+        assert_eq!(pool.num_occupied(), 0);
+    }
+
+    #[test]
+    fn frame_id_generation_changes_when_slot_is_reused() {
+        let pool = BufferPool::new(1);
+        let first = pool.allocate_stable(unsafe { NoLatches::new(&pool) });
+        let first_id = first
+            .frame
+            .as_ref()
+            .expect("new page must retain its frame")
+            .pinned
+            .id();
+        drop(first);
+
+        let second = pool.allocate_stable(unsafe { NoLatches::new(&pool) });
+        let second_id = second
+            .frame
+            .as_ref()
+            .expect("new page must retain its frame")
+            .pinned
+            .id();
+
+        assert_eq!(first_id.slot(), second_id.slot());
+        assert_ne!(first_id.generation(), second_id.generation());
+        assert_ne!(first_id, second_id, "reused slots need distinct identities");
+    }
+
+    #[test]
+    fn installing_new_stable_page_publishes_owner_before_unpin() {
+        let pool = BufferPool::new(2);
+        let mut slot = None;
+        let pid = {
+            let mut page = pool.allocate_stable(unsafe { NoLatches::new(&pool) });
+            page.page_mut()[64] = 0x5a;
+            page.mark_dirty();
+            let pid = page.pid();
+            page.install(&mut slot);
+            pid
+        };
+        let edge = slot.as_ref().expect("stable owner slot must be installed");
+        assert_eq!(edge.page_id(), pid);
+
+        let frame = pool
+            .fix_stable(edge, unsafe { NoLatches::new(&pool) })
+            .shared();
+        assert_eq!(frame.page()[64], 0x5a);
+        assert!(matches!(
+            unsafe { &(*frame.frame_ref().as_ptr()).header.parent_link },
+            ParentLink::Stable(owner) if Arc::ptr_eq(owner, edge.owner())
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "stable SWIP belongs to a different buffer pool")]
+    fn cross_pool_stable_fix_is_rejected_before_pointer_decode() {
+        let first = BufferPool::new(2);
+        let second = BufferPool::new(2);
+        let edge = first.allocate_page();
+
+        drop(second.fix_stable(&edge, unsafe { NoLatches::new(&second) }));
+    }
+
+    #[test]
+    fn frame_keeps_stable_owner_alive_until_eviction() {
+        let pool = BufferPool::new(1);
+        let edge = pool.allocate_page();
+        let frame = pool.fix_stable(&edge, unsafe { NoLatches::new(&pool) });
+        let raw = frame.raw();
+        let owner = Arc::downgrade(edge.owner());
+        drop(frame);
+        drop(edge);
+        unsafe {
+            (*raw)
+                .header
+                .core
+                .referenced
+                .store(false, Ordering::Relaxed);
+        }
+
+        assert!(owner.upgrade().is_some());
+        assert!(pool.try_evict_one());
+        assert!(
+            owner.upgrade().is_none(),
+            "eviction must release the frame's final stable-owner reference"
+        );
+    }
+
+    #[test]
+    fn hot_stable_fix_does_not_touch_owner_refcount() {
+        let pool = BufferPool::new(2);
+        let edge = pool.allocate_page();
+        drop(pool.fix_stable(&edge, unsafe { NoLatches::new(&pool) }));
+        let strong_before = Arc::strong_count(edge.owner());
+
+        for _ in 0..32 {
+            let frame = pool.fix_stable(&edge, unsafe { NoLatches::new(&pool) });
+            assert_eq!(
+                Arc::strong_count(edge.owner()),
+                strong_before,
+                "HOT fix must borrow the stable owner without cloning its Arc"
+            );
+            drop(frame);
+            assert_eq!(
+                Arc::strong_count(edge.owner()),
+                strong_before,
+                "dropping a HOT pin must not drop a stable-owner Arc"
+            );
+        }
+    }
+
+    #[test]
+    fn try_fix_stable_is_resident_only_and_refcount_neutral() {
+        let pool = BufferPool::new(1);
+        let edge = pool.allocate_page();
+
+        assert!(
+            pool.try_fix_stable(&edge).is_none(),
+            "resident-only stable fix must not fault an evicted edge"
+        );
+
+        drop(pool.fix_stable(&edge, unsafe { NoLatches::new(&pool) }));
+        let strong_before = Arc::strong_count(edge.owner());
+        let frame = pool
+            .try_fix_stable(&edge)
+            .expect("resident stable edge should pin without faulting");
+        assert_eq!(frame.pid(), edge.page_id());
+        assert_eq!(Arc::strong_count(edge.owner()), strong_before);
+        drop(frame);
+        assert_eq!(Arc::strong_count(edge.owner()), strong_before);
+    }
+
+    #[test]
+    fn concurrent_stable_edges_survive_repeated_eviction_and_reload() {
+        let pool = Arc::new(BufferPool::new(2));
+        let mut slots = Vec::new();
+        for value in 0..6u8 {
+            let mut slot = None;
+            let mut page = pool.allocate_stable(unsafe { NoLatches::new(&pool) });
+            page.page_mut()[0] = value;
+            page.mark_dirty();
+            page.install(&mut slot);
+            pool.flush().expect("stable-page setup flush failed");
+            slots.push(slot.expect("stable page must install its owner"));
+        }
+        let edges = Arc::new(slots);
+        let start = Arc::new(std::sync::Barrier::new(4));
+
+        std::thread::scope(|scope| {
+            for thread_index in 0..4usize {
+                let pool = Arc::clone(&pool);
+                let edges = Arc::clone(&edges);
+                let start = Arc::clone(&start);
+                scope.spawn(move || {
+                    start.wait();
+                    for iteration in 0..100usize {
+                        let index = (thread_index * 5 + iteration * 3) % edges.len();
+                        let frame = pool
+                            .fix_stable(&edges[index], unsafe { NoLatches::new(&pool) })
+                            .shared();
+                        assert_eq!(frame.page()[0], index as u8);
+                    }
+                });
+            }
+        });
+
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.load(Ordering::Acquire).is_evicted()),
+            "tight resident budget should evict at least one stable edge"
+        );
+    }
+
+    #[test]
+    fn pool_drop_releases_resident_stable_backlinks_before_unmap() {
+        let owner = {
+            let pool = BufferPool::new(1);
+            let edge = pool.allocate_page();
+            drop(pool.fix_stable(&edge, unsafe { NoLatches::new(&pool) }));
+            let owner = Arc::downgrade(edge.owner());
+            drop(edge);
+            assert!(owner.upgrade().is_some());
+            owner
+        };
+
+        assert!(
+            owner.upgrade().is_none(),
+            "pool teardown must clear owning backlinks before unmapping frames"
+        );
+    }
+
+    #[test]
+    fn stable_edge_surviving_pool_drop_is_evicted_before_unmap() {
+        let (edge, pid) = {
+            let pool = BufferPool::new(1);
+            let edge = pool.allocate_page();
+            let pid = edge.page_id();
+            drop(pool.fix_stable(&edge, unsafe { NoLatches::new(&pool) }));
+            (edge, pid)
+        };
+
+        let word = edge.load(Ordering::Acquire);
+        assert!(word.is_evicted());
+        assert_eq!(word.as_page_id(), pid);
+        assert_eq!(edge.page_id(), pid);
+    }
+
+    #[test]
+    fn retire_stable_consumes_owner_and_defers_page_reuse() {
+        let pool = BufferPool::new(2);
+        let edge = pool.allocate_page();
+        let pid = edge.page_id();
+        drop(pool.fix_stable(&edge, unsafe { NoLatches::new(&pool) }));
+
+        let retired = unsafe { pool.retire_stable(edge, unsafe { NoLatches::new(&pool) }) };
+
+        assert_eq!(retired, pid);
+        assert!(pool.page_table.lookup(pid).is_none());
+        assert!(
+            pool.pending_reusable_extents
+                .lock()
+                .iter()
+                .any(|extent| extent.start_page_number == physical_page_number(pid)),
+            "published stable retirement must remain checkpoint-gated"
+        );
+    }
+
+    #[test]
+    fn try_pin_resident_child_does_not_fault_an_evicted_page() {
+        let pool = BufferPool::new(4);
+        let swip = pool.allocate_page();
+        let evicted = swip.load(Ordering::Acquire);
+        assert!(evicted.is_evicted());
+
+        let pinned = unsafe { pool.try_pin_resident_child(evicted) };
+
+        assert!(
+            pinned.is_none(),
+            "resident-only pinning must restart instead of loading an evicted child"
+        );
+        assert_eq!(
+            swip.load(Ordering::Acquire),
+            evicted,
+            "resident-only pinning must not reswizzle an evicted edge"
+        );
+        assert!(
+            pool.page_table.lookup(evicted.as_page_id()).is_none(),
+            "resident-only pinning must not install a frame in the page table"
         );
     }
 
@@ -5433,7 +6097,7 @@ mod tests {
     #[test]
     fn retire_unlinked_exclusive_frame_reuses_page_id_and_frame() {
         let pool = BufferPool::new(4);
-        let (retired_pid, retired_frame) = pool.allocate_and_fix(NoLatches::new(&pool));
+        let (retired_pid, retired_frame) = pool.allocate_and_fix(unsafe { NoLatches::new(&pool) });
         let retired_raw = retired_frame.raw();
         let retired_frame = retired_frame.exclusive();
 
@@ -5448,7 +6112,8 @@ mod tests {
             0
         );
 
-        let (before_flush_pid, before_flush_frame) = pool.allocate_and_fix(NoLatches::new(&pool));
+        let (before_flush_pid, before_flush_frame) =
+            pool.allocate_and_fix(unsafe { NoLatches::new(&pool) });
         assert_ne!(
             before_flush_pid, retired_pid,
             "retired page id must not be reusable before the next flush"
@@ -5458,7 +6123,7 @@ mod tests {
         let high_water = pool.next_page_id.load(Ordering::Acquire);
         pool.flush().unwrap();
 
-        let (reused_pid, reused_frame) = pool.allocate_and_fix(NoLatches::new(&pool));
+        let (reused_pid, reused_frame) = pool.allocate_and_fix(unsafe { NoLatches::new(&pool) });
         assert_eq!(reused_pid, retired_pid);
         // Under FreeList addressing, the frame pointer is decoupled from
         // the page ID — we only assert the page ID is reused, not the frame.
@@ -5478,13 +6143,13 @@ mod tests {
     #[cfg(not(miri))]
     fn allocate_and_fix_reuses_promoted_extent() {
         let pool = BufferPool::new(32);
-        let (retired_pid, retired_bf) = pool.allocate_and_fix(NoLatches::new(&pool));
+        let (retired_pid, retired_bf) = pool.allocate_and_fix(unsafe { NoLatches::new(&pool) });
         drop(retired_bf);
         let high_water = pool.next_page_id.load(Ordering::Acquire);
 
         // With a single page class, one retired page yields one base page.
         pool.promote_reusable_extent(FreeExtent::new(physical_page_number(retired_pid), 1));
-        let (reused_pid, reused_bf) = pool.allocate_and_fix(NoLatches::new(&pool));
+        let (reused_pid, reused_bf) = pool.allocate_and_fix(unsafe { NoLatches::new(&pool) });
 
         assert_eq!(
             reused_pid, retired_pid,
@@ -5503,14 +6168,14 @@ mod tests {
         let pool = BufferPool::new(4);
         let swip = pool.allocate_page();
 
-        let bf = unsafe { pool.fix_frame(&swip, NoLatches::new(&pool)) };
+        let bf = pool.fix_stable(&swip, unsafe { NoLatches::new(&pool) });
         let raw = bf.raw();
         assert_eq!(
             unsafe { (*raw).header.core.pin_count.load(Ordering::Relaxed) },
             1
         );
 
-        let bf2 = unsafe { pool.fix_frame(&swip, NoLatches::new(&pool)) };
+        let bf2 = pool.fix_stable(&swip, unsafe { NoLatches::new(&pool) });
         assert_eq!(bf.raw(), bf2.raw());
         assert_eq!(
             unsafe { (*raw).header.core.pin_count.load(Ordering::Relaxed) },
@@ -5524,7 +6189,7 @@ mod tests {
         let swip = pool.allocate_page();
 
         unsafe {
-            let bf = pool.fix_frame(&swip, NoLatches::new(&pool));
+            let bf = pool.fix_stable(&swip, unsafe { NoLatches::new(&pool) });
             let raw = bf.raw();
             let pid = bf.pid();
             drop(bf);
@@ -5545,7 +6210,7 @@ mod tests {
                     .store(false, Ordering::Relaxed);
             }
 
-            let rescued = pool.fix_frame(&swip, NoLatches::new(&pool));
+            let rescued = pool.fix_stable(&swip, unsafe { NoLatches::new(&pool) });
             assert_eq!(
                 rescued.raw(),
                 raw,
@@ -5574,7 +6239,7 @@ mod tests {
         let swip = pool.allocate_page();
 
         unsafe {
-            let bf = pool.fix_frame(&swip, NoLatches::new(&pool));
+            let bf = pool.fix_stable(&swip, unsafe { NoLatches::new(&pool) });
             let raw = bf.raw();
             let pid = bf.pid();
             drop(bf);
@@ -5582,15 +6247,15 @@ mod tests {
             swip.store(Swip::evicted(pid), Ordering::Release);
             assert!(swip.load(Ordering::Acquire).is_evicted());
 
-            let bf2 = pool.fix_frame(&swip, NoLatches::new(&pool));
+            let bf2 = pool.fix_stable(&swip, unsafe { NoLatches::new(&pool) });
             assert_eq!(raw, bf2.raw(), "resident page should be reused");
             let current = swip.load(Ordering::Acquire);
             assert!(current.is_hot(), "stable swip should re-swizzle to HOT");
             assert_eq!(current.as_ptr::<BufferFrame>(), bf2.raw());
-            match (*bf2.raw()).header.parent_link {
+            match &(*bf2.raw()).header.parent_link {
                 ParentLink::Stable(edge) => {
                     assert!(
-                        edge.ptr_eq(&swip),
+                        Arc::ptr_eq(edge, swip.owner()),
                         "stable parent link should point back to the swip",
                     );
                 }
@@ -5605,14 +6270,14 @@ mod tests {
         struct AcceptOrphan;
 
         impl ParentFinder for AcceptOrphan {
-            fn find_and_unswizzle(&self, _child: BufferFrameRef, _child_pid: u64) -> bool {
+            fn find_and_unswizzle(&self, _child: EvictingFrame<'_>, _child_pid: u64) -> bool {
                 true
             }
         }
 
         let pool = BufferPool::new(1);
         pool.register_dt(0, Arc::new(AcceptOrphan));
-        let (pid, frame) = pool.allocate_and_fix(NoLatches::new(&pool));
+        let (pid, frame) = pool.allocate_and_fix(unsafe { NoLatches::new(&pool) });
         let raw = frame.raw();
         let mut frame = frame.exclusive();
         let page = frame.page_bytes_mut();
@@ -5632,9 +6297,9 @@ mod tests {
         assert!(pool.try_evict_one());
         pool.unregister_dt(0);
 
-        let frame = unsafe { pool.fix_orphan_frame(pid, NoLatches::new(&pool)) };
+        let frame = unsafe { pool.fix_orphan_frame(pid, unsafe { NoLatches::new(&pool) }) };
         assert!(matches!(
-            unsafe { (*frame.raw()).header.parent_link },
+            unsafe { (*frame.raw()).header.parent_link.clone() },
             ParentLink::Unswizzled
         ));
         let raw = frame.raw();
@@ -5658,7 +6323,9 @@ mod tests {
         let pool = BufferPool::new(1);
         let swip = pool.allocate_page();
 
-        let mut bf = unsafe { pool.fix_frame(&swip, NoLatches::new(&pool)) }.exclusive();
+        let mut bf = pool
+            .fix_stable(&swip, unsafe { NoLatches::new(&pool) })
+            .exclusive();
         bf.page_mut()[0] = 42;
         bf.page_mut()[4095] = 99;
         bf.mark_dirty();
@@ -5666,12 +6333,14 @@ mod tests {
 
         // Allocate another page — forces eviction of the first.
         let swip2 = pool.allocate_page();
-        let bf2 = unsafe { pool.fix_frame(&swip2, NoLatches::new(&pool)) };
+        let bf2 = pool.fix_stable(&swip2, unsafe { NoLatches::new(&pool) });
         assert!(swip.load(Ordering::Relaxed).is_evicted());
         drop(bf2);
 
         // Fix it again — should reload from store with our data.
-        let bf = unsafe { pool.fix_frame(&swip, NoLatches::new(&pool)) };
+        let bf = pool
+            .fix_stable(&swip, unsafe { NoLatches::new(&pool) })
+            .shared();
         assert_eq!(bf.page()[0], 42);
         assert_eq!(bf.page()[4095], 99);
     }
@@ -5680,7 +6349,7 @@ mod tests {
     #[cfg(not(miri))]
     fn page_frame_roundtrips_through_evict_and_reload() {
         let pool = BufferPool::new(1);
-        let (pid, bf) = pool.allocate_and_fix(NoLatches::new(&pool));
+        let (pid, bf) = pool.allocate_and_fix(unsafe { NoLatches::new(&pool) });
 
         assert_eq!(pid, 1);
         let raw = bf.raw();
@@ -5711,7 +6380,7 @@ mod tests {
             "evicting one page should return its full base-page budget"
         );
 
-        let bf = unsafe { pool.fix_orphan_frame(pid, NoLatches::new(&pool)) };
+        let bf = unsafe { pool.fix_orphan_frame(pid, unsafe { NoLatches::new(&pool) }) }.shared();
         let page = bf.page_bytes();
         assert_eq!(page[0], 11);
         assert_eq!(page[PAGE_SIZE - 1], 33);
@@ -5721,7 +6390,7 @@ mod tests {
     #[cfg(not(miri))]
     fn page_can_be_marked_dirty_with_logical_lsn() {
         let pool = BufferPool::new(1);
-        let (pid, bf) = pool.allocate_and_fix(NoLatches::new(&pool));
+        let (pid, bf) = pool.allocate_and_fix(unsafe { NoLatches::new(&pool) });
 
         let raw = bf.raw();
         let mut bf = bf.exclusive();
@@ -5755,7 +6424,7 @@ mod tests {
         );
         assert_eq!(pool.try_flush_dirty_batch(1).unwrap(), 1);
         assert!(pool.try_evict_one(), "clean page should be evictable");
-        let bf = unsafe { pool.fix_orphan_frame(pid, NoLatches::new(&pool)) };
+        let bf = unsafe { pool.fix_orphan_frame(pid, unsafe { NoLatches::new(&pool) }) }.shared();
         let page = bf.page_bytes();
         assert_eq!(page[64], 17, "page payload should survive reload");
         assert_eq!(
@@ -5769,7 +6438,7 @@ mod tests {
     #[cfg(not(miri))]
     fn dirty_betree_page_is_not_stolen_before_checkpoint_flush() {
         let pool = BufferPool::new(1);
-        let (pid, bf) = pool.allocate_and_fix(NoLatches::new(&pool));
+        let (pid, bf) = pool.allocate_and_fix(unsafe { NoLatches::new(&pool) });
 
         let raw = bf.raw();
         let mut bf = bf.exclusive();
@@ -5810,7 +6479,7 @@ mod tests {
             "checkpoint-flushed B-e pages should become evictable"
         );
 
-        let bf = unsafe { pool.fix_orphan_frame(pid, NoLatches::new(&pool)) };
+        let bf = unsafe { pool.fix_orphan_frame(pid, unsafe { NoLatches::new(&pool) }) }.shared();
         let page = bf.page_bytes();
         assert_eq!(page[64], 33, "checkpoint-flushed B-e page should reload");
         assert_eq!(page_header::read_page_lsn(page), 77);
@@ -5820,7 +6489,7 @@ mod tests {
     #[cfg(not(miri))]
     fn dirty_betree_page_flush_batch_makes_page_evictable() {
         let pool = BufferPool::new(1);
-        let (pid, bf) = pool.allocate_and_fix(NoLatches::new(&pool));
+        let (pid, bf) = pool.allocate_and_fix(unsafe { NoLatches::new(&pool) });
 
         let raw = bf.raw();
         let mut bf = bf.exclusive();
@@ -5858,7 +6527,7 @@ mod tests {
             "flushed B-e page should become evictable"
         );
 
-        let bf = unsafe { pool.fix_orphan_frame(pid, NoLatches::new(&pool)) };
+        let bf = unsafe { pool.fix_orphan_frame(pid, unsafe { NoLatches::new(&pool) }) }.shared();
         let page = bf.page_bytes();
         assert_eq!(page[64], 44, "flushed B-e page should reload");
         assert_eq!(page_header::read_page_lsn(page), 88);
@@ -5873,10 +6542,12 @@ mod tests {
         let swip = Arc::new(pool.allocate_page());
 
         let raw = {
-            let mut frame = unsafe { pool.fix_frame(&swip, NoLatches::new(&pool)) }.exclusive();
+            let mut frame = pool
+                .fix_stable(&swip, unsafe { NoLatches::new(&pool) })
+                .exclusive();
             frame.page_bytes_mut()[64] = 1;
             frame.mark_dirty_with_lsn(1);
-            frame.frame_ref().as_ptr()
+            unsafe { frame.frame_ref() }.as_ptr()
         };
 
         let flush_pool = pool.clone();
@@ -5894,9 +6565,9 @@ mod tests {
         let writer_pool = pool.clone();
         let writer_swip = swip.clone();
         let writer = std::thread::spawn(move || {
-            let mut frame =
-                unsafe { writer_pool.fix_frame(&writer_swip, NoLatches::new(&writer_pool)) }
-                    .exclusive();
+            let mut frame = writer_pool
+                .fix_stable(&writer_swip, unsafe { NoLatches::new(&writer_pool) })
+                .exclusive();
             frame.page_bytes_mut()[64] = 2;
             frame.mark_dirty_with_lsn(2);
             writer_done_tx.send(()).unwrap();
@@ -5930,7 +6601,7 @@ mod tests {
                 .store(false, Ordering::Relaxed);
         }
         assert!(pool.try_evict_one());
-        let frame = unsafe { pool.fix_orphan_frame(1, NoLatches::new(&pool)) };
+        let frame = unsafe { pool.fix_orphan_frame(1, unsafe { NoLatches::new(&pool) }) }.shared();
         assert_eq!(frame.page_bytes()[64], 2);
         assert_eq!(page_header::read_page_lsn(frame.page_bytes()), 2);
 
@@ -5946,18 +6617,16 @@ mod tests {
     #[cfg(not(miri))]
     fn stable_index_root_is_not_evicted() {
         let pool = BufferPool::new(1);
-        let root_swip = AtomicSwip::new(Swip::evicted(0));
         let swip = pool.allocate_page();
 
         unsafe {
-            let bf = pool.fix_frame(&swip, NoLatches::new(&pool));
+            let bf = pool.fix_stable(&swip, unsafe { NoLatches::new(&pool) });
             let raw = bf.raw();
             let mut bf = bf.exclusive();
             let page = bf.page_bytes_mut();
             let sp = crate::slotted_page::SlottedPage::init(page.try_into().unwrap());
             sp.set_flag(1 << 1);
             page_header::write_page_type(page, PageType::Index);
-            (*raw).header.parent_link = ParentLink::Stable(StableSwipRef::from_ref(&root_swip));
             (*raw)
                 .header
                 .core
@@ -5984,7 +6653,7 @@ mod tests {
         let swip = pool.allocate_page();
 
         unsafe {
-            let bf = pool.fix_frame(&swip, NoLatches::new(&pool));
+            let bf = pool.fix_stable(&swip, unsafe { NoLatches::new(&pool) });
             let raw = bf.raw();
             drop(bf);
             (*raw)
@@ -6010,11 +6679,11 @@ mod tests {
     #[cfg(not(miri))]
     fn try_evict_any_batch_replenishes_resident_budget() {
         let pool = BufferPool::new(2);
-        let swips: Vec<AtomicSwip> = (0..2).map(|_| pool.allocate_page()).collect();
+        let swips: Vec<StableSwip> = (0..2).map(|_| pool.allocate_page()).collect();
 
         for swip in &swips {
             unsafe {
-                let bf = pool.fix_frame(swip, NoLatches::new(&pool));
+                let bf = pool.fix_stable(swip, unsafe { NoLatches::new(&pool) });
                 let raw = bf.raw();
                 drop(bf);
                 (*raw)
@@ -6044,10 +6713,12 @@ mod tests {
     #[cfg(not(miri))]
     fn eviction_under_pressure() {
         let pool = BufferPool::new(2);
-        let swips: Vec<AtomicSwip> = (0..5).map(|_| pool.allocate_page()).collect();
+        let swips: Vec<StableSwip> = (0..5).map(|_| pool.allocate_page()).collect();
 
         for swip in &swips {
-            let mut bf = unsafe { pool.fix_frame(swip, NoLatches::new(&pool)) }.exclusive();
+            let mut bf = pool
+                .fix_stable(swip, unsafe { NoLatches::new(&pool) })
+                .exclusive();
             let pid = bf.pid();
             bf.page_mut()[0] = (pid & 0xFF) as u8;
             bf.mark_dirty();
@@ -6060,7 +6731,9 @@ mod tests {
         assert!(hot_count <= 2);
 
         for swip in &swips {
-            let bf = unsafe { pool.fix_frame(swip, NoLatches::new(&pool)) };
+            let bf = pool
+                .fix_stable(swip, unsafe { NoLatches::new(&pool) })
+                .shared();
             let pid = bf.pid();
             assert_eq!(bf.page()[0], (pid & 0xFF) as u8);
         }
@@ -6075,21 +6748,23 @@ mod tests {
         let s2 = pool.allocate_page();
         let s3 = pool.allocate_page();
 
-        let _bf1 = unsafe { pool.fix_frame(&s1, NoLatches::new(&pool)) };
-        let _bf2 = unsafe { pool.fix_frame(&s2, NoLatches::new(&pool)) };
-        let _bf3 = unsafe { pool.fix_frame(&s3, NoLatches::new(&pool)) };
+        let _bf1 = pool.fix_stable(&s1, unsafe { NoLatches::new(&pool) });
+        let _bf2 = pool.fix_stable(&s2, unsafe { NoLatches::new(&pool) });
+        let _bf3 = pool.fix_stable(&s3, unsafe { NoLatches::new(&pool) });
     }
 
     #[test]
     #[cfg(not(miri))]
     fn resident_budget_is_separate_from_slot_capacity() {
         let pool = BufferPool::new(4);
-        let swips: Vec<AtomicSwip> = (0..100).map(|_| pool.allocate_page()).collect();
+        let swips: Vec<StableSwip> = (0..100).map(|_| pool.allocate_page()).collect();
 
         assert_eq!(pool.num_frames(), 4);
 
         for swip in &swips {
-            let mut bf = unsafe { pool.fix_frame(swip, NoLatches::new(&pool)) }.exclusive();
+            let mut bf = pool
+                .fix_stable(swip, unsafe { NoLatches::new(&pool) })
+                .exclusive();
             let pid = bf.pid();
             bf.page_mut()[0] = (pid & 0xFF) as u8;
             bf.mark_dirty();
@@ -6105,10 +6780,12 @@ mod tests {
     #[cfg(not(miri))]
     fn large_eviction_churn() {
         let pool = BufferPool::new(4);
-        let swips: Vec<AtomicSwip> = (0..100).map(|_| pool.allocate_page()).collect();
+        let swips: Vec<StableSwip> = (0..100).map(|_| pool.allocate_page()).collect();
 
         for swip in &swips {
-            let mut bf = unsafe { pool.fix_frame(swip, NoLatches::new(&pool)) }.exclusive();
+            let mut bf = pool
+                .fix_stable(swip, unsafe { NoLatches::new(&pool) })
+                .exclusive();
             let pid = bf.pid();
             bf.page_mut()[0] = (pid & 0xFF) as u8;
             bf.page_mut()[1] = ((pid >> 8) & 0xFF) as u8;
@@ -6116,7 +6793,9 @@ mod tests {
         }
 
         for swip in &swips {
-            let bf = unsafe { pool.fix_frame(swip, NoLatches::new(&pool)) };
+            let bf = pool
+                .fix_stable(swip, unsafe { NoLatches::new(&pool) })
+                .shared();
             let pid = bf.pid();
             assert_eq!(bf.page()[0], (pid & 0xFF) as u8);
             assert_eq!(bf.page()[1], ((pid >> 8) & 0xFF) as u8);
@@ -6137,7 +6816,7 @@ mod tests {
     fn concurrent_fix_same_page() {
         let pool = Arc::new(BufferPool::new(4));
         let swip = pool.allocate_page();
-        drop(unsafe { pool.fix_frame(&swip, NoLatches::new(&pool)) });
+        drop(pool.fix_stable(&swip, unsafe { NoLatches::new(&pool) }));
         let swip = Arc::new(swip);
 
         let n = 8;
@@ -6149,7 +6828,7 @@ mod tests {
                 let barrier = barrier.clone();
                 thread::spawn(move || {
                     barrier.wait();
-                    let bf = unsafe { pool.fix_frame(&swip, NoLatches::new(&pool)) };
+                    let bf = pool.fix_stable(&swip, unsafe { NoLatches::new(&pool) });
                     let _pid = bf.pid();
                 })
             })
@@ -6172,7 +6851,7 @@ mod tests {
     #[cfg(not(miri))]
     fn fix_orphan_waits_through_evicting_without_recursive_retry() {
         let pool = Arc::new(BufferPool::new(4));
-        let (pid, bf) = pool.allocate_and_fix(NoLatches::new(&pool));
+        let (pid, bf) = pool.allocate_and_fix(unsafe { NoLatches::new(&pool) });
         let raw = bf.raw();
         drop(bf);
 
@@ -6203,7 +6882,7 @@ mod tests {
         });
 
         unsafe {
-            let fixed = pool.fix_orphan_frame(pid, NoLatches::new(&pool));
+            let fixed = pool.fix_orphan_frame(pid, unsafe { NoLatches::new(&pool) });
             assert_eq!(
                 fixed.pid(),
                 pid,
@@ -6280,8 +6959,9 @@ mod tests {
                 std::thread::spawn(move || {
                     for &page_id in page_ids.iter() {
                         barrier.wait();
-                        let frame =
-                            unsafe { pool.fix_orphan_frame(page_id, NoLatches::new(&pool)) };
+                        let frame = unsafe {
+                            pool.fix_orphan_frame(page_id, unsafe { NoLatches::new(&pool) })
+                        };
                         assert_eq!(frame.pid(), page_id);
                         drop(frame);
                         barrier.wait();
@@ -6399,7 +7079,7 @@ mod tests {
     fn concurrent_fix_different_pages() {
         let pool = Arc::new(BufferPool::new(16));
         let n = 8;
-        let swips: Vec<Arc<AtomicSwip>> = (0..n).map(|_| Arc::new(pool.allocate_page())).collect();
+        let swips: Vec<Arc<StableSwip>> = (0..n).map(|_| Arc::new(pool.allocate_page())).collect();
         let barrier = Arc::new(Barrier::new(n));
 
         let handles: Vec<_> = (0..n)
@@ -6409,8 +7089,9 @@ mod tests {
                 let barrier = barrier.clone();
                 thread::spawn(move || {
                     barrier.wait();
-                    let mut bf =
-                        unsafe { pool.fix_frame(&swip, NoLatches::new(&pool)) }.exclusive();
+                    let mut bf = pool
+                        .fix_stable(&swip, unsafe { NoLatches::new(&pool) })
+                        .exclusive();
                     let pid = bf.pid();
                     bf.page_mut()[0] = (pid & 0xFF) as u8;
                     bf.mark_dirty();
@@ -6423,7 +7104,9 @@ mod tests {
         }
 
         for swip in &swips {
-            let bf = unsafe { pool.fix_frame(swip, NoLatches::new(&pool)) };
+            let bf = pool
+                .fix_stable(swip, unsafe { NoLatches::new(&pool) })
+                .shared();
             let pid = bf.pid();
             assert_eq!(bf.page()[0], (pid & 0xFF) as u8);
         }
@@ -6435,7 +7118,7 @@ mod tests {
         let num_frames = 8;
         let num_pages = 32;
         let pool = Arc::new(BufferPool::new(num_frames));
-        let swips: Arc<Vec<AtomicSwip>> =
+        let swips: Arc<Vec<StableSwip>> =
             Arc::new((0..num_pages).map(|_| pool.allocate_page()).collect());
 
         let n = 4;
@@ -6451,7 +7134,8 @@ mod tests {
                     barrier.wait();
                     for i in 0..iterations {
                         let idx = (t * 7 + i * 13) % num_pages;
-                        let mut bf = unsafe { pool.fix_frame(&swips[idx], NoLatches::new(&pool)) }
+                        let mut bf = pool
+                            .fix_stable(&swips[idx], unsafe { NoLatches::new(&pool) })
                             .exclusive();
                         let pid = bf.pid();
                         bf.page_mut()[0] = (pid & 0xFF) as u8;
@@ -6466,7 +7150,9 @@ mod tests {
         }
 
         for swip in swips.iter() {
-            let bf = unsafe { pool.fix_frame(swip, NoLatches::new(&pool)) };
+            let bf = pool
+                .fix_stable(swip, unsafe { NoLatches::new(&pool) })
+                .shared();
             let pid = bf.pid();
             assert_eq!(bf.page()[0], (pid & 0xFF) as u8);
         }
@@ -6514,7 +7200,7 @@ mod tests {
         let num_frames = n + 4;
         let num_pages = 200;
         let pool = Arc::new(BufferPool::new(num_frames));
-        let swips: Arc<Vec<AtomicSwip>> =
+        let swips: Arc<Vec<StableSwip>> =
             Arc::new((0..num_pages).map(|_| pool.allocate_page()).collect());
 
         let iterations = 100;
@@ -6529,7 +7215,8 @@ mod tests {
                     barrier.wait();
                     for i in 0..iterations {
                         let idx = (t * 31 + i * 37) % num_pages;
-                        let mut bf = unsafe { pool.fix_frame(&swips[idx], NoLatches::new(&pool)) }
+                        let mut bf = pool
+                            .fix_stable(&swips[idx], unsafe { NoLatches::new(&pool) })
                             .exclusive();
                         let pid = bf.pid();
                         bf.page_mut()[0] = (pid & 0xFF) as u8;
@@ -6545,7 +7232,9 @@ mod tests {
         }
 
         for swip in swips.iter() {
-            let bf = unsafe { pool.fix_frame(swip, NoLatches::new(&pool)) };
+            let bf = pool
+                .fix_stable(swip, unsafe { NoLatches::new(&pool) })
+                .shared();
             let pid = bf.pid();
             assert_eq!(bf.page()[0], (pid & 0xFF) as u8);
             assert_eq!(bf.page()[1], ((pid >> 8) & 0xFF) as u8);
@@ -6560,7 +7249,7 @@ mod tests {
         // monotonicity guard would be a visible change.
         let pool = BufferPool::new(4);
         let swip = pool.allocate_page();
-        let bf = unsafe { pool.fix_frame(&swip, NoLatches::new(&pool)) };
+        let bf = pool.fix_stable(&swip, unsafe { NoLatches::new(&pool) });
         let exclusive = bf.exclusive();
 
         exclusive.mark_dirty_with_lsn(100);
@@ -6597,14 +7286,16 @@ mod tests {
         let swip = pool.allocate_page();
 
         // Fix and unfix — the referenced bit should be set by fix.
-        {
-            let bf = unsafe { pool.fix_frame(&swip, NoLatches::new(&pool)) };
+        let raw = {
+            let bf = pool.fix_stable(&swip, unsafe { NoLatches::new(&pool) });
             assert!(
                 unsafe { (*bf.raw()).header.core.referenced.load(Ordering::Relaxed) },
                 "fix should set referenced bit"
             );
+            let raw = bf.raw();
             drop(bf);
-        }
+            raw
+        };
 
         // The frame is now unreferenced but hot with referenced=true.
         // try_evict_one should either skip it (clearing referenced) or
@@ -6615,12 +7306,10 @@ mod tests {
         if !evicted {
             // If not evicted, referenced should have been cleared
             // (second-chance clock semantics).
-            let bf = unsafe { pool.fix_frame(&swip, NoLatches::new(&pool)) };
             assert!(
-                !unsafe { (*bf.raw()).header.core.referenced.load(Ordering::Relaxed) },
+                !unsafe { (*raw).header.core.referenced.load(Ordering::Relaxed) },
                 "referenced bit should be cleared after first failed eviction attempt"
             );
-            drop(bf);
 
             // Second attempt should now succeed.
             assert!(

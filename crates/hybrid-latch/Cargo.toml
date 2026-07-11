@@ -15,8 +15,10 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(latch_metrics
 fast-telemetry = { workspace = true, optional = true }
 parking_lot.workspace = true
 
-[dev-dependencies]
+[target.'cfg(loom)'.dependencies]
 loom.workspace = true
+
+[dev-dependencies]
 micromeasure.workspace = true
 
 [[bench]]

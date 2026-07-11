@@ -570,7 +570,7 @@ benchmark_main!(|runner| {
     let case_cooldown_ms = env_u64_or("PAGEBOX_BENCH_CASE_COOLDOWN_MS", 1_000);
 
     runner.group::<AppendBufferOnlyCtx>("wal_append", |g| {
-        g.throughput(Throughput::per_operation(WAL_BUF_RECORDS as u64, "pages"))
+        g.throughput(Throughput::per_operation(1, "pages"))
             .factory(&|| {
                 let dir = tempfile::tempdir().unwrap();
                 let wal = Wal::open_opts(&dir.path().join("wal")).unwrap();

@@ -12,7 +12,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 #[cfg(feature = "latch-metrics")]
-use fast_telemetry::{DeriveLabel, LabeledCounter, LabeledHistogram};
+use fast_telemetry::DeriveLabel;
+#[cfg(all(not(loom), feature = "latch-metrics"))]
+use fast_telemetry::{LabeledCounter, LabeledHistogram};
 
 use crate::helpers::{
     can_advance_readable_version, enter_exclusive_version, exit_exclusive_version,
@@ -1024,7 +1026,7 @@ mod tests {
     }
 }
 
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 mod loom_tests {
     use super::*;
     use loom::sync::Arc;

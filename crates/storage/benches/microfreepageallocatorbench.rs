@@ -1,3 +1,8 @@
+#![allow(
+    unused_unsafe,
+    reason = "NoLatches construction is always explicit at benchmark call sites"
+)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -11,7 +16,6 @@ use pagebox_storage::buffer_pool::{BufferPool, NoLatches};
 use pagebox_storage::free_page_allocator::{FreeExtent, FreePageAllocator};
 
 const OPS_PER_CHUNK: usize = 10_000;
-const OPS_PER_CHUNK_U64: u64 = OPS_PER_CHUNK as u64;
 
 struct FreeAllocatorCtx {
     allocator: FreePageAllocator,
@@ -147,8 +151,11 @@ fn buffer_pool_reuse_allocate_and_fix(
     for _ in 0..chunk_size {
         ctx.pool
             .promote_reusable_extent(FreeExtent::new(ctx.reusable_page_number, 1));
-        let (pid, frame) = ctx.pool.allocate_and_fix(NoLatches::new(&ctx.pool));
-        drop(frame);
+        let page = ctx
+            .pool
+            .allocate_unlinked(unsafe { NoLatches::new(&ctx.pool) });
+        let pid = page.pid();
+        drop(page);
         ctx.reusable_page_number = physical_page_number(pid);
         black_box(pid);
     }
@@ -212,7 +219,7 @@ fn concurrent_buffer_pool_monotonic_allocate_page(
 
 benchmark_main!(|runner| {
     runner.group::<FreeAllocatorCtx>("free_page_allocator", |g| {
-        g.throughput(Throughput::per_operation(OPS_PER_CHUNK_U64, "allocations"))
+        g.throughput(Throughput::per_operation(1, "allocations"))
             .factory(&|| FreeAllocatorCtx {
                 allocator: FreePageAllocator::new(1, 16),
                 next_reusable_page_number: 1_000_000,
@@ -220,7 +227,7 @@ benchmark_main!(|runner| {
             })
             .bench("monotonic", allocator_monotonic);
 
-        g.throughput(Throughput::per_operation(OPS_PER_CHUNK_U64, "allocations"))
+        g.throughput(Throughput::per_operation(1, "allocations"))
             .factory(&|| FreeAllocatorCtx {
                 allocator: FreePageAllocator::new(2_000_000, 16),
                 next_reusable_page_number: 1_000_000,
@@ -230,7 +237,7 @@ benchmark_main!(|runner| {
     });
 
     runner.group::<BufferPoolAllocCtx>("buffer_pool_allocator", |g| {
-        g.throughput(Throughput::per_operation(OPS_PER_CHUNK_U64, "allocations"))
+        g.throughput(Throughput::per_operation(1, "allocations"))
             .factory(&|| BufferPoolAllocCtx {
                 pool: Arc::new(BufferPool::new(OPS_PER_CHUNK * 2)),
                 reusable_page_number: 0,
@@ -240,7 +247,7 @@ benchmark_main!(|runner| {
                 buffer_pool_monotonic_allocate_page,
             );
 
-        g.throughput(Throughput::per_operation(OPS_PER_CHUNK_U64, "allocations"))
+        g.throughput(Throughput::per_operation(1, "allocations"))
             .factory(&|| {
                 let pool = Arc::new(BufferPool::new(OPS_PER_CHUNK * 2));
                 let swip = pool.allocate_page();
@@ -255,11 +262,12 @@ benchmark_main!(|runner| {
                 buffer_pool_reuse_allocate_page,
             );
 
-        g.throughput(Throughput::per_operation(OPS_PER_CHUNK_U64, "allocations"))
+        g.throughput(Throughput::per_operation(1, "allocations"))
             .factory(&|| {
                 let pool = Arc::new(BufferPool::new(128));
-                let (pid, frame) = pool.allocate_and_fix(NoLatches::new(&pool));
-                drop(frame);
+                let page = pool.allocate_unlinked(unsafe { NoLatches::new(&pool) });
+                let pid = page.pid();
+                drop(page);
                 BufferPoolAllocCtx {
                     pool,
                     reusable_page_number: physical_page_number(pid),

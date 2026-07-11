@@ -1,3 +1,8 @@
+#![allow(
+    unused_unsafe,
+    reason = "NoLatches construction stays explicitly unsafe inside broader unsafe operations"
+)]
+
 //! File- and memory-backed page stores: the disk half of the buffer pool.
 //!
 //! The [`PageStore`] trait abstracts the four operations the buffer pool needs
@@ -1025,7 +1030,9 @@ mod tests {
         let swips: Vec<_> = (0..20).map(|_| pool.allocate_page()).collect();
 
         for swip in &swips {
-            let mut bf = unsafe { pool.fix_frame(swip, NoLatches::new(&pool)) }.exclusive();
+            let mut bf = pool
+                .fix_stable(swip, unsafe { NoLatches::new(&pool) })
+                .exclusive();
             let pid = bf.pid();
             bf.page_mut()[0] = (pid & 0xFF) as u8;
             bf.page_mut()[1] = ((pid >> 8) & 0xFF) as u8;
@@ -1033,7 +1040,9 @@ mod tests {
         }
 
         for swip in &swips {
-            let bf = unsafe { pool.fix_frame(swip, NoLatches::new(&pool)) };
+            let bf = pool
+                .fix_stable(swip, unsafe { NoLatches::new(&pool) })
+                .shared();
             let pid = bf.pid();
             assert_eq!(bf.page()[0], (pid & 0xFF) as u8);
             assert_eq!(bf.page()[1], ((pid >> 8) & 0xFF) as u8);
@@ -1055,7 +1064,7 @@ mod tests {
             let pool = BufferPool::with_store(8, Box::new(store));
 
             for _ in 0..5u64 {
-                let (pid, bf) = pool.allocate_and_fix(NoLatches::new(&pool));
+                let (pid, bf) = pool.allocate_and_fix(unsafe { NoLatches::new(&pool) });
                 let mut bf = bf.exclusive();
                 bf.page_mut()[0] = (pid & 0xFF) as u8;
                 bf.page_mut()[1] = 0xAA;
@@ -1071,7 +1080,7 @@ mod tests {
             let store = FilePageStore::open(&path).unwrap();
             let pool = BufferPool::with_store(8, Box::new(store));
 
-            let (new_pid, bf) = pool.allocate_and_fix(NoLatches::new(&pool));
+            let (new_pid, bf) = pool.allocate_and_fix(unsafe { NoLatches::new(&pool) });
 
             // The new pid must be strictly after everything from session 1.
             assert!(
@@ -1084,10 +1093,11 @@ mod tests {
             bf.page_mut()[0] = 0xFF;
             bf.page_mut()[1] = 0xBB;
             bf.mark_dirty();
+            drop(bf);
 
             // Verify an old page is still intact by reading from the store.
             // Page 1 should still have its original data.
-            let bf = unsafe { pool.fix_orphan_frame(1, NoLatches::new(&pool)) };
+            let bf = unsafe { pool.fix_orphan_frame(1, unsafe { NoLatches::new(&pool) }) }.shared();
             assert_eq!(bf.page()[0], 1);
             assert_eq!(bf.page()[1], 0xAA);
         }

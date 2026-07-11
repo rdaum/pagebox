@@ -23,10 +23,12 @@ fast-telemetry = { workspace = true, optional = true }
 libc.workspace = true
 parking_lot.workspace = true
 
+[target.'cfg(loom)'.dependencies]
+loom.workspace = true
+
 [dev-dependencies]
 fast-telemetry.workspace = true
 criterion.workspace = true
-loom.workspace = true
 micromeasure.workspace = true
 paste.workspace = true
 proptest.workspace = true
@@ -51,4 +53,8 @@ harness = false
 
 [[bench]]
 name = "microbufferpoolevictbench"
+harness = false
+
+[[bench]]
+name = "microstableswipbench"
 harness = false

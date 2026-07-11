@@ -1,3 +1,8 @@
+#![allow(
+    unused_unsafe,
+    reason = "NoLatches construction stays explicitly unsafe inside broader unsafe operations"
+)]
+
 //! Microbenchmark for the buffer pool eviction path.
 //!
 //! Isolates eviction throughput and latency from B-tree traversal logic.
@@ -156,8 +161,9 @@ fn evict_worker_sequential(
     while !control.should_stop() {
         for &pid in pages {
             let start = std::time::Instant::now();
-            let frame = unsafe { pool.fix_orphan_frame(pid, NoLatches::new(pool)) };
-            checksum ^= u64::from_le_bytes(frame.page[0..8].try_into().expect("pid bytes"));
+            let frame =
+                unsafe { pool.fix_orphan_frame(pid, unsafe { NoLatches::new(pool) }) }.shared();
+            checksum ^= u64::from_le_bytes(frame.page()[0..8].try_into().expect("pid bytes"));
             let elapsed_us = start.elapsed().as_micros() as u64;
             if latencies_us.len() < 4096 {
                 latencies_us.push(elapsed_us);
@@ -215,8 +221,8 @@ fn evict_worker_random(ctx: &EvictCtx, control: &ConcurrentBenchControl) -> Conc
         idx = idx.wrapping_add(1);
 
         let start = std::time::Instant::now();
-        let frame = unsafe { pool.fix_orphan_frame(pid, NoLatches::new(pool)) };
-        checksum ^= u64::from_le_bytes(frame.page[0..8].try_into().expect("pid bytes"));
+        let frame = unsafe { pool.fix_orphan_frame(pid, unsafe { NoLatches::new(pool) }) }.shared();
+        checksum ^= u64::from_le_bytes(frame.page()[0..8].try_into().expect("pid bytes"));
         let elapsed_us = start.elapsed().as_micros() as u64;
         if latencies_us.len() < 4096 {
             latencies_us.push(elapsed_us);

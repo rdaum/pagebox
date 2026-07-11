@@ -1,3 +1,8 @@
+#![allow(
+    unused_unsafe,
+    reason = "NoLatches construction stays explicitly unsafe inside broader unsafe operations"
+)]
+
 use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -153,8 +158,9 @@ fn fault_worker(
 
     while !control.should_stop() {
         for &pid in pages {
-            let frame = unsafe { pool.fix_orphan_frame(pid, NoLatches::new(pool)) };
-            checksum ^= u64::from_le_bytes(frame.page[0..8].try_into().expect("pid bytes"));
+            let frame =
+                unsafe { pool.fix_orphan_frame(pid, unsafe { NoLatches::new(pool) }) }.shared();
+            checksum ^= u64::from_le_bytes(frame.page()[0..8].try_into().expect("pid bytes"));
             operations = operations.wrapping_add(1);
             drop(frame);
             if control.should_stop() {

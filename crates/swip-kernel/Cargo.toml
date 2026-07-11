@@ -9,5 +9,5 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(miri)'] }
 
 [dependencies]
 
-[dev-dependencies]
+[target.'cfg(loom)'.dependencies]
 loom.workspace = true

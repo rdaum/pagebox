@@ -83,7 +83,7 @@ benchmark_main!(|runner| {
     };
 
     runner.group::<BtreeLookupCtx>("btree_lookup", |g| {
-        g.throughput(Throughput::per_operation(1_000_000, "keys"))
+        g.throughput(Throughput::per_operation(1, "keys"))
             .factory(&{
                 let seed = Arc::clone(&lookup_seed);
                 move || BtreeLookupCtx {
@@ -96,7 +96,7 @@ benchmark_main!(|runner| {
     });
 
     runner.group::<BtreeInsertCtx>("btree_insert", |g| {
-        g.throughput(Throughput::per_operation(100_000, "keys"))
+        g.throughput(Throughput::per_operation(1, "keys"))
             .factory(&|| {
                 let pool = Arc::new(BufferPool::new(4096));
                 let tree = BTree::new(&pool, 0);

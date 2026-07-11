@@ -36,11 +36,10 @@
 //! - [`ParentLink::None`] — orphan (freshly allocated, never published).
 //! - [`ParentLink::Unswizzled`] — loaded by page ID while its owner edge
 //!   remains evicted, so eviction does not need to rewrite a parent pointer.
-//! - [`ParentLink::Stable`] — a routing edge stored outside any tree page
-//!   (e.g. `BTree::meta_swip`, a table directory `Vec` entry). The pool can
-//!   write `Swip::evicted(pid)` directly through the [`StableSwipRef`] without
-//!   needing to walk the tree. These edges must remain live for as long as any
-//!   frame refers to them through a `Stable` link — building one is `unsafe`.
+//! - [`ParentLink::Stable`] — an owned routing edge stored outside any tree
+//!   page (e.g. `BTree::meta_swip`, a table directory entry). The frame retains
+//!   an internal strong reference to the same [`StableSwipOwner`], so eviction
+//!   can publish `Swip::evicted(pid)` without a lifetime-erased raw backlink.
 //! - [`ParentLink::InnerNode`] — a cached hint pointing at a slot in a B-tree
 //!   inner page. The hint is validated during eviction; if stale, the pool
 //!   falls back to a registered [`ParentFinder`] tree walk.
@@ -62,8 +61,10 @@ pub use pagebox_frame_kernel::{
 };
 
 use pagebox_hybrid_latch::{HybridLatch, OptimisticGuard, Restart};
+use std::num::NonZeroU64;
 use std::ptr::NonNull;
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use pagebox_swip_kernel::{AtomicSwipWord as AtomicSwip, SwipWord as Swip};
 
@@ -72,7 +73,7 @@ use pagebox_swip_kernel::{AtomicSwipWord as AtomicSwip, SwipWord as Swip};
 // ---------------------------------------------------------------------------
 
 /// How this frame's routing edge in its parent can be found during eviction.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum ParentLink {
     /// No parent tracking (orphan, freshly allocated).
     None,
@@ -83,24 +84,77 @@ pub enum ParentLink {
     /// Stable routing edge that outlives the pool
     /// (e.g., BTree::meta_swip, table directory Vec entry).
     /// Eviction writes Swip::evicted(pid) directly through this edge.
-    Stable(StableSwipRef),
+    Stable(Arc<StableSwipOwner>),
     /// Child of a B-tree inner node. Cached hint for fast unswizzle.
     /// Eviction validates this hint, and falls back to a tree walk
     /// via the pool's registered ParentFinder if stale.
     InnerNode(InnerParentLink),
 }
 
-/// Identity handle for a stable, externally owned `&AtomicSwip` routing edge.
-///
-/// Stored in [`ParentLink::Stable`] so eviction can publish
-/// `Swip::evicted(pid)` directly through the edge without tree-walking. The
-/// pointed-at storage must outlive every frame that carries the link;
-/// construction is `unsafe` to encode that contract.
-///
-/// See the module-level docs and [`ParentLink::Stable`].
+/// Process-unique provenance for a buffer pool.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct StableSwipRef {
-    ptr: NonNull<AtomicSwip>,
+pub struct PoolId(NonZeroU64);
+
+impl PoolId {
+    pub(crate) fn new(raw: NonZeroU64) -> Self {
+        Self(raw)
+    }
+}
+
+/// The independently allocated owner of a stable routing edge.
+///
+/// This type is public only because [`ParentLink`] is inspectable. Its fields
+/// and constructors remain private to the storage crate. The SWIP word is
+/// deliberately kept in this compact allocation: move it to a separately
+/// aligned allocation only if measured lifecycle refcount traffic contends
+/// with readers of the word.
+#[doc(hidden)]
+pub struct StableSwipOwner {
+    word: AtomicSwip,
+    pool_id: PoolId,
+    page_id: AtomicU64,
+}
+
+/// Unique logical owner of a stable routing edge.
+///
+/// `StableSwip` intentionally does not implement `Clone`. A resident frame
+/// retains its own internal strong reference to the owner while eviction may
+/// need to rewrite the edge.
+///
+/// ```compile_fail
+/// use pagebox_storage::buffer_pool::BufferPool;
+///
+/// let pool = BufferPool::new(1);
+/// let edge = pool.allocate_page();
+/// let duplicate = edge.clone();
+/// ```
+pub struct StableSwip {
+    owner: Arc<StableSwipOwner>,
+}
+
+/// Copyable frame identity for diagnostics and equality checks.
+///
+/// Unlike [`BufferFrameRef`], this carries no dereference authority. The
+/// generation changes whenever an arena slot is claimed from the free list,
+/// so a cached identity cannot silently alias a later occupant of that slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct FrameId {
+    slot: u32,
+    generation: u32,
+}
+
+impl FrameId {
+    pub(crate) fn new(slot: u32, generation: u32) -> Self {
+        Self { slot, generation }
+    }
+
+    pub fn slot(self) -> u32 {
+        self.slot
+    }
+
+    pub fn generation(self) -> u32 {
+        self.generation
+    }
 }
 
 /// Identity handle for a [`BufferFrame`].
@@ -113,6 +167,31 @@ pub struct StableSwipRef {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BufferFrameRef {
     ptr: NonNull<BufferFrame>,
+}
+
+/// Eviction-scoped identity for a frame held under the evictor's exclusive
+/// protocol. It can compare routed SWIPs but cannot expose or copy the raw
+/// frame pointer.
+pub struct EvictingFrame<'a> {
+    frame: BufferFrameRef,
+    _marker: std::marker::PhantomData<&'a mut BufferFrame>,
+}
+
+impl<'a> EvictingFrame<'a> {
+    /// # Safety
+    /// `frame` must remain exclusively owned by the eviction protocol for
+    /// lifetime `'a`.
+    pub(crate) unsafe fn new(frame: BufferFrameRef) -> Self {
+        Self {
+            frame,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    pub fn matches_swip(&self, swip: Swip) -> bool {
+        unsafe { BufferFrameRef::from_hot_swip(swip) }
+            .is_some_and(|candidate| candidate.same_frame(self.frame))
+    }
 }
 
 /// Read view on a [`BufferFrame`] produced under a pin / shared-latch /
@@ -137,10 +216,20 @@ pub struct BufferFrameReadRef<'a> {
 /// `'a`). Exposes mutable page bytes and the parent-link mutators used by the
 /// eviction / publish-split paths. The lifetime `'a` bounds the mutable page
 /// borrow to the guard that authorizes mutation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// ```compile_fail
+/// use pagebox_storage::buffer_frame::BufferFrameWriteRef;
+///
+/// fn alias(mut write: BufferFrameWriteRef<'_>) {
+///     let mut duplicate = write;
+///     let _first = write.page_mut();
+///     let _second = duplicate.page_mut();
+/// }
+/// ```
+#[derive(Debug, Eq, PartialEq)]
 pub struct BufferFrameWriteRef<'a> {
     frame: BufferFrameRef,
-    _marker: std::marker::PhantomData<&'a ()>,
+    _marker: std::marker::PhantomData<&'a mut BufferFrame>,
 }
 
 // SAFETY: BufferFrameRef is an identity reference to a BufferFrame. The frame
@@ -152,40 +241,103 @@ unsafe impl Send for BufferFrameReadRef<'_> {}
 unsafe impl Sync for BufferFrameReadRef<'_> {}
 unsafe impl Send for BufferFrameWriteRef<'_> {}
 unsafe impl Sync for BufferFrameWriteRef<'_> {}
-// SAFETY: StableSwipRef carries identity for a caller-proven stable routing
-// edge. AtomicSwip provides its own synchronization; the lifetime invariant is
-// established at construction.
-unsafe impl Send for StableSwipRef {}
-unsafe impl Sync for StableSwipRef {}
+impl StableSwipOwner {
+    pub(crate) fn load(&self, order: Ordering) -> Swip {
+        self.word.load(order)
+    }
 
-impl StableSwipRef {
-    /// # Safety
-    /// `swip` must be a stable routing edge whose storage will not move or be
-    /// freed while any buffer frame may refer to it through `ParentLink`.
-    pub unsafe fn from_ref(swip: &AtomicSwip) -> Self {
+    pub(crate) fn store_evicted(&self, pid: PageId) {
+        self.page_id.store(pid, Ordering::Release);
+        self.word.store(Swip::evicted(pid), Ordering::Release);
+    }
+
+    pub(crate) fn word(&self) -> &AtomicSwip {
+        &self.word
+    }
+
+    pub(crate) fn pool_id(&self) -> PoolId {
+        self.pool_id
+    }
+}
+
+/// # Safety
+/// A HOT/COOL word must identify a live frame for the duration of this call.
+unsafe fn stable_word_page_id(word: Swip) -> PageId {
+    if word.is_hot() || word.is_cool() {
+        unsafe { word.as_ptr::<BufferFrame>().as_ref() }
+            .expect("stable HOT/COOL SWIP must contain a frame")
+            .header
+            .core
+            .pid
+    } else {
+        word.as_page_id()
+    }
+}
+
+impl StableSwip {
+    pub(crate) fn new(pool_id: PoolId, page_id: PageId, word: Swip) -> Self {
         Self {
-            ptr: NonNull::from(swip),
+            owner: Arc::new(StableSwipOwner {
+                word: AtomicSwip::new(word),
+                pool_id,
+                page_id: AtomicU64::new(page_id),
+            }),
         }
     }
 
-    pub fn store_evicted(self, pid: PageId) {
-        unsafe {
-            self.ptr
-                .as_ref()
-                .store(Swip::evicted(pid), Ordering::Release)
-        };
+    pub fn load(&self, order: Ordering) -> Swip {
+        self.owner.load(order)
     }
 
-    pub fn load(self, order: Ordering) -> Swip {
-        unsafe { self.ptr.as_ref().load(order) }
+    /// Replace the routing word without changing stable-edge ownership.
+    ///
+    /// # Safety
+    /// The caller must keep the frame backlinks consistent with the new word
+    /// before any affected pin is released.
+    pub unsafe fn store(&self, word: Swip, order: Ordering) {
+        let page_id = unsafe { stable_word_page_id(word) };
+        self.owner.page_id.store(page_id, Ordering::Release);
+        self.owner.word.store(word, order);
     }
 
-    pub fn ptr_eq(self, swip: &AtomicSwip) -> bool {
-        std::ptr::eq(self.ptr.as_ptr().cast_const(), swip)
+    /// Compare and replace the routing word without changing stable-edge
+    /// ownership.
+    ///
+    /// # Safety
+    /// On success the caller must transfer the stable backlink from the old
+    /// frame to the new frame before releasing either affected pin.
+    pub unsafe fn compare_exchange(
+        &self,
+        current: Swip,
+        new: Swip,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<Swip, Swip> {
+        let result = self
+            .owner
+            .word
+            .compare_exchange(current, new, success, failure);
+        if result.is_ok() {
+            let page_id = unsafe { stable_word_page_id(new) };
+            self.owner.page_id.store(page_id, Ordering::Release);
+        }
+        result
     }
 
-    pub(crate) fn as_ref(&self) -> &AtomicSwip {
-        unsafe { self.ptr.as_ref() }
+    pub fn page_id(&self) -> PageId {
+        self.owner.page_id.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn owner(&self) -> &Arc<StableSwipOwner> {
+        &self.owner
+    }
+
+    pub(crate) fn word(&self) -> &AtomicSwip {
+        self.owner.word()
+    }
+
+    pub(crate) fn pool_id(&self) -> PoolId {
+        self.owner.pool_id()
     }
 }
 
@@ -205,7 +357,12 @@ impl BufferFrameRef {
         }
     }
 
-    pub fn from_hot_swip(swip: Swip) -> Option<Self> {
+    /// # Safety
+    /// A HOT/COOL tag alone does not prove that the encoded address belongs to
+    /// a live frame. The caller must validate pool membership and keep the
+    /// frame pinned (or otherwise protected from recycling) for every use of
+    /// the returned identity.
+    pub unsafe fn from_hot_swip(swip: Swip) -> Option<Self> {
         if !(swip.is_hot() || swip.is_cool()) {
             return None;
         }
@@ -269,56 +426,65 @@ impl BufferFrameRef {
 }
 
 impl<'a> BufferFrameReadRef<'a> {
-    pub fn frame(self) -> BufferFrameRef {
+    pub fn frame(&self) -> BufferFrameRef {
         self.frame
     }
 
-    pub fn page(self) -> &'a [u8; PAGE_SIZE] {
+    pub fn page(&self) -> &'a [u8; PAGE_SIZE] {
         // SAFETY: caller of read_ref asserted the frame is pinned/protected
         // for 'a. The page bytes are stable while the frame is resident.
         unsafe { &self.frame.ptr.as_ref().page }
     }
 
-    pub fn parent_link(self) -> ParentLink {
-        unsafe { self.frame.ptr.as_ref().header.parent_link }
+    pub fn parent_link(&self) -> ParentLink {
+        unsafe { self.frame.ptr.as_ref().header.parent_link.clone() }
     }
 }
 
 impl<'a> BufferFrameWriteRef<'a> {
-    pub fn frame(self) -> BufferFrameRef {
+    pub fn frame(&self) -> BufferFrameRef {
         self.frame
     }
 
-    pub fn read_ref(self) -> BufferFrameReadRef<'a> {
+    pub fn read_ref(&self) -> BufferFrameReadRef<'_> {
         BufferFrameReadRef {
             frame: self.frame,
             _marker: std::marker::PhantomData,
         }
     }
 
-    pub fn page(self) -> &'a [u8; PAGE_SIZE] {
-        self.read_ref().page()
+    pub fn page(&self) -> &[u8; PAGE_SIZE] {
+        unsafe { &self.frame.ptr.as_ref().page }
     }
 
-    pub fn page_mut(self) -> &'a mut [u8; PAGE_SIZE] {
+    pub fn page_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
         // SAFETY: caller of write_ref asserted exclusive access for 'a.
         unsafe { &mut (*self.frame.as_ptr()).page }
     }
 
-    pub fn parent_link(self) -> ParentLink {
+    pub fn parent_link(&self) -> ParentLink {
         self.read_ref().parent_link()
     }
 
-    pub fn set_parent_link_none(self) {
+    pub fn set_parent_link_none(&mut self) {
         unsafe { (*self.frame.as_ptr()).header.parent_link = ParentLink::None };
     }
 
-    pub fn set_parent_link_stable(self, meta_swip: StableSwipRef) {
-        unsafe { (*self.frame.as_ptr()).header.parent_link = ParentLink::Stable(meta_swip) };
+    /// Install a stable backlink after the stable edge has been made the
+    /// owning route to this frame.
+    ///
+    /// # Safety
+    /// `stable_swip` must belong to this frame's pool and its word must route
+    /// to this frame for as long as this backlink remains installed.
+    pub unsafe fn set_parent_link_stable(&mut self, stable_swip: &StableSwip) {
+        unsafe {
+            (*self.frame.as_ptr()).header.parent_link =
+                ParentLink::Stable(Arc::clone(stable_swip.owner()))
+        };
     }
 
     pub fn set_parent_link_inner(
-        self,
+        &mut self,
         parent_pid: u64,
         slot_index: u16,
         is_upper: bool,
@@ -334,7 +500,7 @@ impl<'a> BufferFrameWriteRef<'a> {
         }
     }
 
-    pub fn mark_header_dirty(self) {
+    pub fn mark_header_dirty(&self) {
         unsafe {
             self.frame
                 .ptr
@@ -362,7 +528,7 @@ impl<'a> BufferFrameWriteRef<'a> {
 pub trait ParentFinder: Send + Sync {
     fn find_and_unswizzle_with_hint(
         &self,
-        _child: BufferFrameRef,
+        _child: EvictingFrame<'_>,
         _child_pid: u64,
         _parent_pid: u64,
         _slot_index: u16,
@@ -371,7 +537,7 @@ pub trait ParentFinder: Send + Sync {
         None
     }
 
-    fn find_and_unswizzle(&self, child: BufferFrameRef, child_pid: u64) -> bool;
+    fn find_and_unswizzle(&self, child: EvictingFrame<'_>, child_pid: u64) -> bool;
 }
 
 /// Callback trait for best-effort page reclamation just before eviction.
@@ -452,6 +618,9 @@ pub struct BufferFrame {
 /// the module level.
 pub struct FrameHeader {
     pub core: FrameCoreHeader,
+    /// Arena-slot incarnation used by [`FrameId`]. Advanced before a free
+    /// frame is assigned to another page.
+    pub generation: AtomicU32,
     /// How eviction can find and unswizzle the parent's routing edge
     /// that points to this frame. Only modified under exclusive latch.
     pub parent_link: ParentLink,
@@ -506,6 +675,7 @@ impl BufferFrame {
             latch: HybridLatch::new(),
             header: FrameHeader {
                 core: FrameCoreHeader::new_free(),
+                generation: AtomicU32::new(0),
                 parent_link: ParentLink::None,
             },
             _header_pad: [0u8; HEADER_PAD],
@@ -612,7 +782,7 @@ impl BufferFrame {
             if val.len() >= 8 {
                 let raw = u64::from_ne_bytes(val[..8].try_into().unwrap());
                 let swip = Swip::from_raw(raw);
-                if let Some(frame) = BufferFrameRef::from_hot_swip(swip)
+                if let Some(frame) = unsafe { BufferFrameRef::from_hot_swip(swip) }
                     && pool.contains_frame(frame)
                 {
                     let child_pid = frame.pid();
@@ -626,7 +796,7 @@ impl BufferFrame {
         let upper_off = PAGE_SIZE - 8;
         let upper_raw = u64::from_ne_bytes(buf[upper_off..].try_into().unwrap());
         let upper_swip = Swip::from_raw(upper_raw);
-        if let Some(frame) = BufferFrameRef::from_hot_swip(upper_swip)
+        if let Some(frame) = unsafe { BufferFrameRef::from_hot_swip(upper_swip) }
             && pool.contains_frame(frame)
         {
             let upper_pid = frame.pid();
