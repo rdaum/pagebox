@@ -224,7 +224,7 @@ fn run_spec_file(invocation: RunInvocation) -> std::io::Result<()> {
     let dir = create_fresh_dir(&invocation.tmpdir, &invocation.engine_name)?;
     let report = match invocation.engine_name.as_str() {
         "kvstore" => run_engine::<KvstoreAdapter>(
-            &dir,
+            dir.path(),
             &spec_file.comparison,
             invocation.iteration,
             &spec,
@@ -233,7 +233,7 @@ fn run_spec_file(invocation: RunInvocation) -> std::io::Result<()> {
         )?,
         #[cfg(feature = "fjall")]
         "fjall" => run_engine::<FjallAdapter>(
-            &dir,
+            dir.path(),
             &spec_file.comparison,
             invocation.iteration,
             &spec,
@@ -242,7 +242,7 @@ fn run_spec_file(invocation: RunInvocation) -> std::io::Result<()> {
         )?,
         #[cfg(feature = "redb")]
         "redb" => run_engine::<RedbAdapter>(
-            &dir,
+            dir.path(),
             &spec_file.comparison,
             invocation.iteration,
             &spec,
@@ -251,7 +251,7 @@ fn run_spec_file(invocation: RunInvocation) -> std::io::Result<()> {
         )?,
         #[cfg(feature = "lmdb")]
         "lmdb" => run_engine::<LmdbAdapter>(
-            &dir,
+            dir.path(),
             &spec_file.comparison,
             invocation.iteration,
             &spec,
@@ -260,7 +260,7 @@ fn run_spec_file(invocation: RunInvocation) -> std::io::Result<()> {
         )?,
         #[cfg(feature = "rocksdb")]
         "rocksdb" => run_engine::<RocksdbAdapter>(
-            &dir,
+            dir.path(),
             &spec_file.comparison,
             invocation.iteration,
             &spec,
@@ -488,13 +488,11 @@ fn validate_cache_pressure_evidence(
 fn create_fresh_dir(
     tmpdir: &std::path::Path,
     engine_name: &str,
-) -> std::io::Result<std::path::PathBuf> {
-    let dir = tmpdir.join(format!("{}-{}", engine_name, std::process::id()));
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir)?;
-    }
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
+) -> std::io::Result<tempfile::TempDir> {
+    std::fs::create_dir_all(tmpdir)?;
+    tempfile::Builder::new()
+        .prefix(&format!("{engine_name}-"))
+        .tempdir_in(tmpdir)
 }
 
 fn read_report(path: &std::path::Path) -> std::io::Result<Report> {
@@ -580,11 +578,6 @@ fn print_summary(report: &Report) {
     }
     if let Some(evictions) = stats.cache_evictions {
         eprintln!("  evictions:  {evictions}");
-    }
-    let mut extra: Vec<_> = stats.extra.iter().collect();
-    extra.sort_unstable_by_key(|(name, _)| *name);
-    for (name, value) in extra {
-        eprintln!("  {name}: {value}");
     }
 }
 

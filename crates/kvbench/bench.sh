@@ -66,6 +66,13 @@ fi
 
 mkdir -p "$RESULTS_DIR" "$LOGS_DIR"
 
+cleanup_tmp() {
+    rm -rf "$RESULTS_DIR/tmp"
+}
+cleanup_tmp
+mkdir -p "$RESULTS_DIR/tmp"
+trap cleanup_tmp EXIT
+
 if [[ "$KEEP_RESULTS" == false ]]; then
     rm -f "$RESULTS_DIR"/*.json
     rm -f "$LOGS_DIR"/*.log
@@ -122,6 +129,8 @@ run_one() {
         echo "    log: $log"
         FAILURES+=("${engine}/${spec}/${threads}t: rc=$rc")
     fi
+    cleanup_tmp
+    mkdir -p "$RESULTS_DIR/tmp"
     echo
     if [[ "$COOLDOWN_SECS" != "0" ]]; then
         sleep "$COOLDOWN_SECS"

@@ -293,6 +293,10 @@ impl Drop for KvStore {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -311,5 +315,89 @@ mod tests {
             !pool.has_registered_dt(domain_id),
             "dropping the store must break the pool/tree registration cycle"
         );
+    }
+
+    #[test]
+    #[ignore = "expensive file-backed eviction-pressure regression"]
+    fn concurrent_file_backed_growth_completes_under_eviction_pressure() {
+        const KEYS: u64 = 65_536;
+        let threads = std::env::var("PAGEBOX_KVSTORE_PRESSURE_THREADS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8usize);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(
+            KvStore::open_with(
+                dir.path(),
+                &KvStoreOptions::default()
+                    .pool_frames(1_024)
+                    .sync_mode(SyncMode::Relaxed),
+            )
+            .unwrap(),
+        );
+        let next = Arc::new(AtomicU64::new(0));
+        let in_flight = Arc::new(
+            (0..threads)
+                .map(|_| AtomicU64::new(u64::MAX))
+                .collect::<Vec<_>>(),
+        );
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handles: Vec<_> = (0..threads)
+            .map(|worker_idx| {
+                let store = store.clone();
+                let next = next.clone();
+                let in_flight = in_flight.clone();
+                let done_tx = done_tx.clone();
+                std::thread::spawn(move || {
+                    let value = [0xa5; 2_048];
+                    loop {
+                        let key = next.fetch_add(1, Ordering::Relaxed);
+                        if key >= KEYS {
+                            break;
+                        }
+                        in_flight[worker_idx].store(key, Ordering::Relaxed);
+                        assert!(store.put(&key.to_be_bytes(), &value));
+                        in_flight[worker_idx].store(u64::MAX, Ordering::Relaxed);
+                    }
+                    done_tx.send(()).unwrap();
+                })
+            })
+            .collect();
+        drop(done_tx);
+
+        let timeout_secs = std::env::var("PAGEBOX_KVSTORE_PRESSURE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(30);
+        for _ in 0..threads {
+            if done_rx
+                .recv_timeout(Duration::from_secs(timeout_secs))
+                .is_err()
+            {
+                eprintln!(
+                    "file-backed growth did not complete: next_key={} in_flight={:?} \
+                     tree={:?} pool={:?} evictions={} occupied={} unlinked={}",
+                    next.load(Ordering::Relaxed),
+                    in_flight
+                        .iter()
+                        .map(|key| key.load(Ordering::Relaxed))
+                        .collect::<Vec<_>>(),
+                    store.btree_diagnostic_stats(),
+                    store.buffer_pool_diagnostic_stats(),
+                    store.cache_evictions(),
+                    store.cache_used_pages(),
+                    store.pool.num_unlinked_resident_frames(),
+                );
+                std::process::abort();
+            }
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let mut count = 0usize;
+        store.scan_all(|_, _| count += 1);
+        assert_eq!(count, KEYS as usize);
     }
 }

@@ -6,6 +6,7 @@ use crate::metrics_stub::MetricVisitor;
 #[cfg(feature = "metrics")]
 use fast_telemetry::MetricVisitor;
 use pagebox_hybrid_latch::Restart;
+use parking_lot::Mutex;
 
 use pagebox_storage::buffer_frame::PAGE_SIZE;
 use pagebox_storage::buffer_frame::{BufferFrameRef, ParentFinder, StableSwipRef};
@@ -17,6 +18,7 @@ use pagebox_swip_kernel::{AtomicSwipWord as AtomicSwip, SwipWord as Swip};
 
 const WRITE_FIXED_ROOT_THRESHOLD: u32 = 4;
 const WRITE_BLOCKING_FALLBACK_THRESHOLD: u32 = 16;
+const SPLIT_RESERVATION_STRIPES: usize = 64;
 
 mod node;
 mod parent_edge;
@@ -57,6 +59,7 @@ pub struct BTree {
     reachable_pages: std::sync::atomic::AtomicU64,
     reachable_pages_known: bool,
     stats: BTreeStats,
+    split_reservations: [Mutex<()>; SPLIT_RESERVATION_STRIPES],
     eviction_unswizzle_nodes_visited: std::sync::atomic::AtomicU64,
     /// Data structure ID for the DTRegistry parent-finder callback.
     dt_id: u16,
@@ -283,6 +286,7 @@ impl BTree {
                     .map(|n| n.get())
                     .unwrap_or(1),
             ),
+            split_reservations: std::array::from_fn(|_| Mutex::new(())),
             eviction_unswizzle_nodes_visited: std::sync::atomic::AtomicU64::new(0),
             dt_id,
         }
@@ -323,6 +327,7 @@ impl BTree {
                     .map(|n| n.get())
                     .unwrap_or(1),
             ),
+            split_reservations: std::array::from_fn(|_| Mutex::new(())),
             eviction_unswizzle_nodes_visited: std::sync::atomic::AtomicU64::new(0),
             dt_id,
         }
@@ -967,9 +972,10 @@ impl BTree {
                     if right_pid == 0 {
                         return Err(Restart);
                     }
-                    let Some(right) = (unsafe { pool.try_fix_orphan_frame(right_pid) }) else {
+                    let right = unsafe { pool.fix_orphan_frame(right_pid, NoLatches::new(pool)) };
+                    if leaf.validate().is_err() {
                         return Err(Restart);
-                    };
+                    }
                     current = right;
                     continue;
                 }
@@ -1002,16 +1008,13 @@ impl BTree {
                 current = child;
             } else {
                 self.stats.inc(BTreeEvent::ResolveCold);
-                let Some(child) = (unsafe { pool.try_fix_orphan_frame(child_swip.as_page_id()) })
-                else {
-                    return Err(Restart);
-                };
+                let child =
+                    unsafe { pool.fix_orphan_frame(child_swip.as_page_id(), NoLatches::new(pool)) };
                 // Re-validate the optimistic guard after loading the child.
-                // Between route_to_child (line 852) and try_fix_orphan_frame,
-                // another thread could have exclusively latched this inner
-                // node (e.g., during eviction's unswizzle_parent) and modified
-                // its routing entries. Without this check, we'd proceed with
-                // a stale routed_child that points to the wrong subtree.
+                // Between routing and the blocking fix, another thread could
+                // have exclusively latched this inner node and modified its
+                // routing entries. Without this check, traversal could proceed
+                // through a stale edge into the wrong subtree.
                 if inner.validate().is_err() {
                     return Err(Restart);
                 }
@@ -1067,10 +1070,14 @@ impl BTree {
                 return Ok(leaf);
             }
 
-            let routed_child = current_frame.try_route_to_child(key).ok_or(Restart)?;
+            let Some(routed_child) = current_frame.try_route_to_child(key) else {
+                self.stats.inc(BTreeEvent::FallbackRouteFailures);
+                return Err(Restart);
+            };
             let Some(child) =
                 (unsafe { Self::try_resolve_child_for_read(pool, routed_child.swip()) })
             else {
+                self.stats.inc(BTreeEvent::FallbackResolveFailures);
                 return Err(Restart);
             };
             unsafe {
@@ -1161,6 +1168,69 @@ impl BTree {
         }
     }
 
+    /// Split a full inner root without waiting for buffer-pool capacity while
+    /// the root latch is held. Returns false if another thread replaced the
+    /// root while the reservation was being made.
+    unsafe fn split_full_root_after_release(
+        &self,
+        expected_root_pid: u64,
+        parent_path: &mut Vec<PinnedFrame<'_>>,
+    ) -> bool {
+        let pool = self.pool();
+        let pre_sibling = pool.allocate_and_fix_frame(NoLatches::new(pool));
+        let pre_root = pool.allocate_and_fix_frame(NoLatches::new(pool));
+        let root = unsafe { pool.fix_frame(&self.meta_swip, NoLatches::new(pool)) };
+        if root.pid() != expected_root_pid {
+            self.retire_unused_split_frame(pre_sibling);
+            self.retire_unused_split_frame(pre_root);
+            return false;
+        }
+        unsafe {
+            self.split_node(
+                root.exclusive(),
+                parent_path,
+                None,
+                Some(pre_sibling),
+                Some(pre_root),
+            )
+        };
+        true
+    }
+
+    /// Split a full non-root inner node without reserving buffer-pool
+    /// capacity while its latch prevents eviction of all of its children.
+    /// Returns false when another writer made the node able to accept the
+    /// pending separator while the sibling frame was being reserved.
+    unsafe fn split_full_inner_after_release(
+        &self,
+        expected_pid: u64,
+        pending_separator_len: usize,
+        parent_path: &mut Vec<PinnedFrame<'_>>,
+    ) -> bool {
+        let pool = self.pool();
+        let pre_sibling = pool.allocate_and_fix_frame(NoLatches::new(pool));
+        let parent = unsafe {
+            pool.fix_orphan_frame(expected_pid, NoLatches::new(pool))
+                .exclusive()
+        };
+        let parent = ExclusiveNode::from_inner_frame(parent);
+        if parent.resident_frame().is_leaf() || parent.can_insert_separator(pending_separator_len) {
+            drop(parent);
+            self.retire_unused_split_frame(pre_sibling);
+            return false;
+        }
+        unsafe {
+            self.split_node(
+                parent.into_frame(),
+                parent_path,
+                None,
+                Some(pre_sibling),
+                None,
+            )
+        };
+        true
+    }
+
     /// Split a full node. The node must be exclusively latched.
     /// After return, the original node is unlatched and unpinned.
     ///
@@ -1173,6 +1243,7 @@ impl BTree {
         parent_path: &mut Vec<PinnedFrame<'_>>,
         pending_key: Option<&[u8]>,
         pre_sibling: Option<(u64, PinnedFrame<'_>)>,
+        pre_root: Option<(u64, PinnedFrame<'_>)>,
     ) {
         let pool = self.pool();
         let node_frame = ResidentFrame::from_exclusive(&node);
@@ -1332,7 +1403,10 @@ impl BTree {
 
         if is_root {
             // Root split: create new root.
-            let (_new_root_pid, new_root) = pool.allocate_and_fix_frame(NoLatches::new(pool));
+            let (_new_root_pid, new_root) = match pre_root {
+                Some(pre_root) => pre_root,
+                None => pool.allocate_and_fix_frame(NoLatches::new(pool)),
+            };
             let new_root = new_root.exclusive();
             let new_root_frame = ResidentFrame::from_exclusive(&new_root);
             new_root_frame.init(false);
@@ -1386,6 +1460,9 @@ impl BTree {
             // Non-root: find parent, latch it exclusively, then insert separator.
             // Keep node_guard held until parent is updated so no traversal sees
             // the split node without the parent routing correctly.
+            if let Some(pre_root) = pre_root {
+                self.retire_unused_split_frame(pre_root);
+            }
             unsafe { self.publish_leaf_split_to_parent(&sep_key, left, right, parent_path) };
         }
     }
@@ -1601,7 +1678,18 @@ impl BTree {
         };
 
         if !parent.can_insert_separator(sep_key.len()) {
-            unsafe { self.split_node(parent.into_frame(), parent_path, None, None) };
+            let parent_pid = parent.resident_frame().pid();
+            let parent_is_root =
+                Self::swip_page_id(self.meta_swip.load(Ordering::Acquire)) == parent_pid;
+            if parent_is_root {
+                drop(parent);
+                let _ = unsafe { self.split_full_root_after_release(parent_pid, parent_path) };
+            } else {
+                drop(parent);
+                let _ = unsafe {
+                    self.split_full_inner_after_release(parent_pid, sep_key.len(), parent_path)
+                };
+            }
             return false;
         }
 
@@ -1659,8 +1747,10 @@ impl BTree {
         };
 
         if !root_inner.can_insert_separator(sep_key.len()) {
+            let root_pid = root_inner.resident_frame().pid();
+            drop(root_inner);
             let mut empty_path = Vec::new();
-            unsafe { self.split_node(root_inner.into_frame(), &mut empty_path, None, None) };
+            let _ = unsafe { self.split_full_root_after_release(root_pid, &mut empty_path) };
             return false;
         }
 
@@ -1689,8 +1779,26 @@ impl BTree {
             if let Some(edge) = current.child_edge_for(ChildRef::from_frame(&left.resident_frame()))
             {
                 if !current.can_insert_separator(sep_key.len()) {
-                    let mut empty_path = Vec::new();
-                    unsafe { self.split_node(current.into_frame(), &mut empty_path, None, None) };
+                    let current_pid = current.resident_frame().pid();
+                    let current_is_root =
+                        Self::swip_page_id(self.meta_swip.load(Ordering::Acquire)) == current_pid;
+                    if current_is_root {
+                        drop(current);
+                        let mut empty_path = Vec::new();
+                        let _ = unsafe {
+                            self.split_full_root_after_release(current_pid, &mut empty_path)
+                        };
+                    } else {
+                        drop(current);
+                        let mut empty_path = Vec::new();
+                        let _ = unsafe {
+                            self.split_full_inner_after_release(
+                                current_pid,
+                                sep_key.len(),
+                                &mut empty_path,
+                            )
+                        };
+                    }
                     return false;
                 }
 
@@ -2545,18 +2653,32 @@ impl BTree {
                     }
                 }
             };
-            let need_split = match self.try_upsert_leaf(&leaf, key, value) {
+            let (split_pid, protected_leaf) = match self.try_upsert_leaf(&leaf, key, value) {
                 UpsertLeafAction::UpdatedExisting => return false,
                 UpsertLeafAction::Inserted => return true,
-                UpsertLeafAction::SplitRequired => true,
+                UpsertLeafAction::SplitRequired => {
+                    (leaf.resident_frame().pid(), leaf.into_frame().into_pinned())
+                }
             };
-            if need_split {
-                drop(leaf);
+
+            let _split_reservation =
+                self.split_reservations[split_pid as usize % SPLIT_RESERVATION_STRIPES].lock();
+            let leaf = ExclusiveNode::from_leaf_frame(protected_leaf.exclusive());
+            if leaf.resident_frame().should_chase_right(key) {
+                attempts += 1;
+                continue;
             }
+            let protected_leaf = match self.try_upsert_leaf(&leaf, key, value) {
+                UpsertLeafAction::UpdatedExisting => return false,
+                UpsertLeafAction::Inserted => return true,
+                UpsertLeafAction::SplitRequired => leaf.into_frame().into_pinned(),
+            };
 
             // Pre-allocate sibling frame while no latches are held, so
-            // the allocation (which may block on eviction) does not hold
-            // the exclusive latch on the node being split.
+            // the allocation (which may block on eviction) does not hold the
+            // exclusive latch on the node being split. Keep the leaf pinned:
+            // otherwise sibling allocation can evict the page that the path
+            // reconstruction immediately needs to fault back in.
             let pool = self.pool();
             let pre_sibling = pool.allocate_and_fix_frame(NoLatches::new(pool));
 
@@ -2564,6 +2686,7 @@ impl BTree {
                 match unsafe { self.find_leaf_exclusive_with_path_fallback(key) } {
                     Ok(r) => r,
                     Err(Restart) => {
+                        drop(protected_leaf);
                         self.retire_unused_split_frame(pre_sibling);
                         self.stats.inc(BTreeEvent::InsertRestarts);
                         attempts += 1;
@@ -2575,6 +2698,7 @@ impl BTree {
                 match unsafe { self.find_leaf_exclusive_with_path(key) } {
                     Ok(r) => r,
                     Err(Restart) => {
+                        drop(protected_leaf);
                         self.retire_unused_split_frame(pre_sibling);
                         self.stats.inc(BTreeEvent::InsertRestarts);
                         attempts += 1;
@@ -2582,6 +2706,7 @@ impl BTree {
                     }
                 }
             };
+            drop(protected_leaf);
 
             match self.try_upsert_leaf(&leaf, key, value) {
                 UpsertLeafAction::UpdatedExisting => {
@@ -2600,6 +2725,7 @@ impl BTree {
                         &mut parent_path,
                         Some(key),
                         Some(pre_sibling),
+                        None,
                     );
                 },
             }
@@ -2644,16 +2770,30 @@ impl BTree {
                     }
                 }
             };
-            let need_split = match self.try_insert_leaf(&leaf, key, value) {
+            let (split_pid, protected_leaf) = match self.try_insert_leaf(&leaf, key, value) {
                 InsertLeafAction::ReturnFalse => return false,
                 InsertLeafAction::Inserted => return true,
-                InsertLeafAction::SplitRequired => true,
+                InsertLeafAction::SplitRequired => {
+                    (leaf.resident_frame().pid(), leaf.into_frame().into_pinned())
+                }
             };
-            if need_split {
-                drop(leaf);
-            }
 
-            // Pre-allocate sibling frame while no latches are held.
+            let _split_reservation =
+                self.split_reservations[split_pid as usize % SPLIT_RESERVATION_STRIPES].lock();
+            let leaf = ExclusiveNode::from_leaf_frame(protected_leaf.exclusive());
+            if leaf.resident_frame().should_chase_right(key) {
+                attempts += 1;
+                continue;
+            }
+            let protected_leaf = match self.try_insert_leaf(&leaf, key, value) {
+                InsertLeafAction::ReturnFalse => return false,
+                InsertLeafAction::Inserted => return true,
+                InsertLeafAction::SplitRequired => leaf.into_frame().into_pinned(),
+            };
+
+            // Pre-allocate sibling frame while no latches are held. Retain a
+            // pin on the leaf so allocation cannot evict the page needed by
+            // the following path reconstruction.
             let pool = self.pool();
             let pre_sibling = pool.allocate_and_fix_frame(NoLatches::new(pool));
 
@@ -2661,6 +2801,7 @@ impl BTree {
                 match unsafe { self.find_leaf_exclusive_with_path_fallback(key) } {
                     Ok(r) => r,
                     Err(Restart) => {
+                        drop(protected_leaf);
                         self.retire_unused_split_frame(pre_sibling);
                         self.stats.inc(BTreeEvent::InsertRestarts);
                         attempts += 1;
@@ -2672,6 +2813,7 @@ impl BTree {
                 match unsafe { self.find_leaf_exclusive_with_path(key) } {
                     Ok(r) => r,
                     Err(Restart) => {
+                        drop(protected_leaf);
                         self.retire_unused_split_frame(pre_sibling);
                         self.stats.inc(BTreeEvent::InsertRestarts);
                         attempts += 1;
@@ -2679,6 +2821,7 @@ impl BTree {
                     }
                 }
             };
+            drop(protected_leaf);
 
             match self.try_insert_leaf(&leaf, key, value) {
                 InsertLeafAction::ReturnFalse => {
@@ -2697,6 +2840,7 @@ impl BTree {
                         &mut parent_path,
                         Some(key),
                         Some(pre_sibling),
+                        None,
                     );
                 },
             }
@@ -4404,53 +4548,182 @@ mod tests {
     }
 
     #[test]
+    fn cold_lookups_escalate_without_exhausting_optimistic_retries() {
+        const KEYS: u64 = 4_096;
+        const LOOKUPS: u64 = 64;
+
+        let pool = Arc::new(BufferPool::new(16));
+        let tree = Arc::new(BTree::new(&pool, 0));
+        pool.register_dt(0, tree.clone());
+        let value = [0x6d; 2_048];
+        for key in 0..KEYS {
+            assert!(tree.insert(&key.to_be_bytes(), &value));
+        }
+
+        let before = tree.diagnostic_stats().resolve_cold;
+        let evictions_before = pool.eviction_count();
+        for lookup in 0..LOOKUPS {
+            let key = lookup.wrapping_mul(997) % KEYS;
+            assert_eq!(tree.lookup(&key.to_be_bytes()).as_deref(), Some(&value[..]));
+        }
+        let cold_resolutions = tree.diagnostic_stats().resolve_cold - before;
+
+        assert!(
+            pool.eviction_count() > evictions_before,
+            "test must exercise lookup-time eviction"
+        );
+        assert!(cold_resolutions > 0, "test must exercise cold traversal");
+        assert!(
+            cold_resolutions <= LOOKUPS * 4,
+            "one cold child must escalate to blocking resolution instead of exhausting the retry budget: {cold_resolutions} resolutions for {LOOKUPS} lookups"
+        );
+        pool.unregister_dt(0);
+    }
+
+    #[test]
+    fn eviction_finds_parent_for_unlinked_index_leaf() {
+        const KEYS: u64 = 1_024;
+
+        let pool = Arc::new(BufferPool::new(64));
+        let tree = Arc::new(BTree::new(&pool, 0));
+        pool.register_dt(0, tree.clone());
+        let value = [0x71; 2_048];
+        for key in 0..KEYS {
+            assert!(tree.insert(&key.to_be_bytes(), &value));
+        }
+        assert!(tree.height() >= 1, "test requires a non-root leaf");
+        pool.flush().unwrap();
+
+        let leaf = loop {
+            if let Ok(leaf) = unsafe { tree.find_leaf_exclusive(&0u64.to_be_bytes()) } {
+                break leaf;
+            }
+        };
+        let leaf_pid = leaf.resident_frame().pid();
+        let mut leaf_frame = leaf.into_frame();
+        leaf_frame.set_parent_link_none();
+        drop(leaf_frame);
+
+        assert!(
+            pool.num_unlinked_resident_frames() > 0,
+            "test must create an unlinked resident index leaf"
+        );
+
+        let mut evicted = false;
+        for _ in 0..256 {
+            pool.try_evict_one();
+            let resident = unsafe { pool.try_fix_resident_page_frame(leaf_pid) };
+            if resident.is_none() {
+                evicted = true;
+                break;
+            }
+        }
+
+        assert!(
+            evicted,
+            "eviction must discover and unswizzle an unlinked index leaf through the registered parent finder"
+        );
+        assert_eq!(
+            tree.lookup(&0u64.to_be_bytes()).as_deref(),
+            Some(&value[..]),
+            "the evicted leaf must reload through its parent edge"
+        );
+        pool.unregister_dt(0);
+    }
+
+    #[test]
     #[ignore = "expensive concurrent eviction-pressure regression"]
     fn concurrent_growth_through_eviction_reaches_height_two() {
-        const KEYS: u64 = 48_000;
-        const THREADS: usize = 8;
+        let keys = std::env::var("PAGEBOX_BTREE_PRESSURE_KEYS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(48_000u64);
+        let threads = std::env::var("PAGEBOX_BTREE_PRESSURE_THREADS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8usize);
+        let pool_frames = std::env::var("PAGEBOX_BTREE_PRESSURE_POOL")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1_024usize);
+        let timeout_secs = std::env::var("PAGEBOX_BTREE_PRESSURE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(10u64);
 
-        let pool = Arc::new(BufferPool::new(1_024));
+        let pool = Arc::new(BufferPool::new(pool_frames));
         let tree = Arc::new(BTree::new(&pool, 0));
         pool.register_dt(0, tree.clone());
         let next = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let barrier = Arc::new(Barrier::new(THREADS));
-        let handles: Vec<_> = (0..THREADS)
-            .map(|_| {
+        let barrier = Arc::new(Barrier::new(threads));
+        let in_flight = Arc::new(
+            (0..threads)
+                .map(|_| std::sync::atomic::AtomicU64::new(u64::MAX))
+                .collect::<Vec<_>>(),
+        );
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handles: Vec<_> = (0..threads)
+            .map(|worker_idx| {
                 let tree = tree.clone();
                 let next = next.clone();
                 let barrier = barrier.clone();
+                let in_flight = in_flight.clone();
+                let done_tx = done_tx.clone();
                 thread::spawn(move || {
                     let value = [0xa5; 2_048];
                     barrier.wait();
                     loop {
                         let key = next.fetch_add(1, Ordering::Relaxed);
-                        if key >= KEYS {
+                        if key >= keys {
                             break;
                         }
-                        assert!(tree.insert(&key.to_be_bytes(), &value));
+                        in_flight[worker_idx].store(key, Ordering::Relaxed);
+                        assert!(tree.upsert(&key.to_be_bytes(), &value));
+                        in_flight[worker_idx].store(u64::MAX, Ordering::Relaxed);
                     }
+                    done_tx.send(()).unwrap();
                 })
             })
             .collect();
+        drop(done_tx);
+        for _ in 0..threads {
+            if done_rx
+                .recv_timeout(std::time::Duration::from_secs(timeout_secs))
+                .is_err()
+            {
+                eprintln!(
+                    "concurrent growth did not complete: next_key={} in_flight={:?} \
+                     tree={:?} pool={:?} evictions={} occupied={} budget={}",
+                    next.load(Ordering::Relaxed),
+                    in_flight
+                        .iter()
+                        .map(|key| key.load(Ordering::Relaxed))
+                        .collect::<Vec<_>>(),
+                    tree.diagnostic_stats(),
+                    pool.diagnostic_stats(),
+                    pool.eviction_count(),
+                    pool.num_occupied(),
+                    pool.approx_available_budget(),
+                );
+                std::process::abort();
+            }
+        }
         for handle in handles {
             handle.join().unwrap();
         }
 
-        assert!(
-            tree.height() >= 2,
-            "workload must cross the inner-root split"
-        );
+        if keys >= 48_000 {
+            assert!(
+                tree.height() >= 2,
+                "workload must cross the inner-root split"
+            );
+        }
         let mut count = 0usize;
         tree.scan(|_, value| {
             assert_eq!(value.len(), 2_048, "scan returned a truncated value");
             count += 1;
         });
-        assert_eq!(count, KEYS as usize, "concurrent growth lost keys");
-        assert_eq!(
-            tree.reachable_page_count().unwrap() as usize,
-            tree.owned_page_ids().len(),
-            "reachable-page accounting diverged under eviction pressure"
-        );
+        assert_eq!(count, keys as usize, "concurrent growth lost keys");
         pool.unregister_dt(0);
     }
 

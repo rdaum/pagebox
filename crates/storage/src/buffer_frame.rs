@@ -416,8 +416,7 @@ const _: () = assert!(HEADER_BYTES <= PAGE_SIZE);
 ///   ┌──────────────────────────────┐  ← 4096-aligned base
 ///   │ HybridLatch                  │
 ///   │ FrameHeader (core +          │
-///   │              parent_link +   │
-///   │              next_free)      │
+///   │              parent_link)    │
 ///   │ header_pad (zeroed)          │
 ///   ├──────────────────────────────┤  ← offset PAGE_SIZE
 ///   │ page: [u8; PAGE_SIZE]        │
@@ -444,27 +443,24 @@ pub struct BufferFrame {
 /// `core` (re-exported from `pagebox-frame-kernel`) holds the atomic
 /// `FrameState`, `pin_count`, `dirty` bit, `referenced` bit, page LSN, and WAL
 /// buffer locality; `parent_link` is the eviction routing edge described at
-/// the module level; `next_free` is the intrusive free-list pointer used by
-/// the allocator.
+/// the module level.
 pub struct FrameHeader {
     pub core: FrameCoreHeader,
     /// How eviction can find and unswizzle the parent's routing edge
     /// that points to this frame. Only modified under exclusive latch.
     pub parent_link: ParentLink,
-    /// Intrusive free-list pointer.
-    pub next_free: *mut BufferFrame,
 }
 
 // SAFETY: BufferFrame is designed for concurrent access. The latch guards
 // mutable fields; pin_count, dirty, and state are atomic. Raw pointers
-// (parent_swip, next_free) are only dereferenced under appropriate
+// Parent-link raw pointers are only dereferenced under appropriate
 // synchronization.
 unsafe impl Send for BufferFrame {}
 unsafe impl Sync for BufferFrame {}
 
 impl Default for BufferFrame {
     /// ```anneal
-    /// ensures: ret.latch = HybridLatch::new() ∧ ret.header = FrameHeader::new_free() ∧ ret.next_free = null_mut()
+    /// ensures: ret.latch = HybridLatch::new() ∧ ret.header = FrameHeader::new_free()
     /// proof (h_anon):
     ///   unfold Default::default at h_returns
     ///   unfold BufferFrame::new at h_returns
@@ -472,7 +468,7 @@ impl Default for BufferFrame {
     /// proof (h_progress):
     ///   unfold Default::default
     ///   unfold BufferFrame::new
-    ///   refine ⟨BufferFrame { latch: HybridLatch::new(), header: FrameHeader::new_free(), parent_link: ParentLink::None, next_free: std::ptr::null_mut(), _header_pad: [0u8; HEADER_PAD], page: [0u8; PAGE_SIZE] }, ?_⟩
+    ///   refine ⟨BufferFrame { latch: HybridLatch::new(), header: FrameHeader::new_free(), parent_link: ParentLink::None, _header_pad: [0u8; HEADER_PAD], page: [0u8; PAGE_SIZE] }, ?_⟩
     ///   rfl
     /// ```
     fn default() -> Self {
@@ -490,14 +486,13 @@ impl BufferFrame {
     ///   ret.header.core.referenced = false ∧
     ///   ret.header.core.state = FrameState::Free ∧
     ///   ret.header.parent_link = ParentLink::None ∧
-    ///   ret.header.next_free = null_mut() ∧
     ///   ret.page = [0u8; PAGE_SIZE]
     /// proof (h_anon):
     ///   unfold BufferFrame::new at h_returns
     ///   simp_all [FrameCoreHeader::new_free, HybridLatch::new]
     /// proof (h_progress):
     ///   unfold BufferFrame::new
-    ///   refine ⟨BufferFrame { latch: HybridLatch::new(), header: FrameHeader { core: FrameCoreHeader::new_free(), parent_link: ParentLink::None, next_free: std::ptr::null_mut() }, _header_pad: [0u8; HEADER_PAD], page: [0u8; PAGE_SIZE] }, ?_⟩
+    ///   refine ⟨BufferFrame { latch: HybridLatch::new(), header: FrameHeader { core: FrameCoreHeader::new_free(), parent_link: ParentLink::None }, _header_pad: [0u8; HEADER_PAD], page: [0u8; PAGE_SIZE] }, ?_⟩
     ///   constructor <;> rfl
     /// ```
     pub fn new() -> Self {
@@ -506,7 +501,6 @@ impl BufferFrame {
             header: FrameHeader {
                 core: FrameCoreHeader::new_free(),
                 parent_link: ParentLink::None,
-                next_free: std::ptr::null_mut(),
             },
             _header_pad: [0u8; HEADER_PAD],
             page: [0u8; PAGE_SIZE],
