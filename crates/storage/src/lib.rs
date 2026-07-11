@@ -74,8 +74,9 @@
 //!   B-tree root wired through [`buffer_frame::ParentLink::Stable`]) must not
 //!   be evicted.
 //! - **Pin count**: incremented on `fix` and decremented on `unfix`/`Drop`.
-//!   When every frame is pinned and a new fix is requested, the pool panics
-//!   (`buffer pool exhausted`).
+//!   A fix that cannot make capacity progress after bounded full-pool sweeps
+//!   panics with a `buffer pool exhausted` snapshot covering pinned, dirty,
+//!   referenced, and parent-unswizzle failure state.
 //! - **Slotted-page layout**: slot array grows from the front, heap grows
 //!   from the back, [`slotted_page::SlottedPage::compactify`] reclaims the
 //!   gap, reserved suffixes survive compaction, overflow is a panic by

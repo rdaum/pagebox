@@ -106,7 +106,10 @@ fn run(
             // Eviction couldn't find clean victims — likely all resident
             // pages are dirty (no-steal). Flush dirty pages so they become
             // evictable on the next pass.
-            let _ = pool.try_flush_dirty_batch_for_provider(64);
+            pool.try_flush_dirty_batch_for_provider(64)
+                .unwrap_or_else(|error| {
+                    panic!("background page provider dirty flush failed: {error}")
+                });
             std::thread::yield_now();
         }
     }

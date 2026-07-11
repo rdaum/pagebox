@@ -50,9 +50,10 @@
 //! ## Pin count guarantee
 //!
 //! Pin count is incremented on `fix` and decremented on `unfix` / `Drop` of
-//! the [`PinnedFrame`]. When every frame is pinned and a new fix is
-//! requested, the pool panics with `buffer pool exhausted`. There is no
-//! on-demand growth; size the pool to fit the working set.
+//! the [`PinnedFrame`]. When repeated full-pool sweeps cannot release a frame
+//! because candidates remain pinned, dirty, latched, or cannot be unswizzled,
+//! a new fix panics with a detailed `buffer pool exhausted` snapshot. There is
+//! no on-demand growth; size the pool to fit the working set.
 //!
 //! ## Frame state machine
 //!
@@ -128,6 +129,7 @@ use crate::page_store::{InMemoryPageStore, PageStore};
 use pagebox_swip_kernel::{AtomicSwipWord as AtomicSwip, SwipWord as Swip};
 
 static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
+const FRAME_CAPACITY_STALL_LIMIT: u32 = 256;
 
 fn allocate_pool_id() -> PoolId {
     let raw = NEXT_POOL_ID
@@ -936,7 +938,7 @@ fn parse_eviction_policy(value: &str) -> Option<EvictionPolicy> {
 ///
 /// Starts with `yield_now` ( cooperative scheduling hint, ~0us), then
 /// doubles the sleep duration on each failed attempt: 1us, 2us, 4us, ...
-/// capped at 1ms. Resets to yield when progress is made. This lets
+/// capped at 10ms. Resets to yield when progress is made. This lets
 /// latch-holding threads release their latches and run, instead of
 /// burning CPU in a tight spin loop.
 struct Backoff {
@@ -950,10 +952,6 @@ impl Backoff {
             attempt: 0,
             sleep_us: 0,
         }
-    }
-
-    fn attempt(&self) -> u32 {
-        self.attempt
     }
 
     fn reset(&mut self) {
@@ -974,7 +972,7 @@ impl Backoff {
             std::thread::sleep(std::time::Duration::from_micros(self.sleep_us));
             #[cfg(loom)]
             loom::thread::yield_now();
-            self.sleep_us = (self.sleep_us * 2).min(1000);
+            self.sleep_us = (self.sleep_us * 2).min(10_000);
         }
     }
 }
@@ -2759,6 +2757,13 @@ impl BufferPool {
         false
     }
 
+    fn flush_dirty_for_capacity(&self, max_batch: usize) -> usize {
+        self.try_flush_dirty_batch(max_batch)
+            .unwrap_or_else(|error| {
+                panic!("buffer pool dirty flush failed while waiting for frame capacity: {error}")
+            })
+    }
+
     fn wait_for_resident_budget(&self) {
         if self.resident_base_pages_available.load(Ordering::Relaxed) >= 1 {
             return;
@@ -2774,31 +2779,26 @@ impl BufferPool {
             None
         };
 
-        let mut idle = 0u32;
+        let mut stalled_rounds = 0u32;
         loop {
             if self.resident_base_pages_available.load(Ordering::Relaxed) >= 1 {
                 return;
             }
-            idle += 1;
+            stalled_rounds += 1;
+            if stalled_rounds >= FRAME_CAPACITY_STALL_LIMIT {
+                self.panic_pool_exhausted("resident_budget", stalled_rounds);
+            }
 
             // Inline eviction (primary path when bg provider is off,
             // safety valve when it's on).
-            if self.try_evict_any_policy(1) > 0 || self.try_evict_any_batch(1) > 0 {
-                idle = 0;
-                if self.resident_base_pages_available.load(Ordering::Relaxed) >= 1 {
-                    return;
-                }
-            }
-
-            if let Ok(flushed) = self.try_flush_dirty_batch(64)
-                && flushed > 0
+            if (self.try_evict_any_policy(1) > 0 || self.try_evict_any_batch(1) > 0)
+                && self.resident_base_pages_available.load(Ordering::Relaxed) >= 1
             {
-                idle = 0;
-                continue;
+                return;
             }
 
-            if idle >= 100 {
-                self.panic_pool_exhausted();
+            if self.flush_dirty_for_capacity(64) > 0 {
+                continue;
             }
 
             if let Some(frames_available) = &frames_available {
@@ -2831,16 +2831,21 @@ impl BufferPool {
             return self.claim_free_frame(bf);
         }
         let mut backoff = Backoff::new();
+        let mut stalled_rounds = 0u32;
         loop {
             if let Some(bf) = self.state.free_list.try_pop() {
                 return self.claim_free_frame(bf);
+            }
+            stalled_rounds += 1;
+            if stalled_rounds >= FRAME_CAPACITY_STALL_LIMIT {
+                self.panic_pool_exhausted("free_frame", stalled_rounds);
             }
 
             // Notify the background page provider that we need frames.
             // It will evict clean pages and flush dirty ones in the
             // background, replenishing the free list without blocking
             // the caller.
-            if backoff.attempt() == 0 {
+            if stalled_rounds == 1 {
                 let pp = self.page_provider.lock().unwrap();
                 pp.need_frames_notify();
             }
@@ -2856,21 +2861,18 @@ impl BufferPool {
 
             let evicted = self.try_evict_any_policy(1) > 0 || self.try_evict_any_batch(1) > 0;
             if evicted {
+                // A frame was released globally, but another waiter can take
+                // it before this caller reaches the free list. Reset only the
+                // scheduling delay; this allocation request remains stalled.
                 backoff.reset();
             } else {
                 // No frame was evictable — all are referenced, pinned,
                 // or latched. Back off to let latch-holders release.
-                if let Ok(flushed) = self.try_flush_dirty_batch(64)
-                    && flushed > 0
-                {
+                if self.flush_dirty_for_capacity(64) > 0 {
                     backoff.reset();
                 } else {
                     backoff.snooze();
                 }
-            }
-
-            if backoff.attempt() >= 8192 {
-                self.panic_pool_exhausted();
             }
         }
     }
@@ -4325,13 +4327,14 @@ impl BufferPool {
     /// Panic with a detailed snapshot of slot-state distribution.
     /// Called when resident-budget waiting detects true exhaustion:
     /// no budget tokens available and no evictable resident slot.
-    fn panic_pool_exhausted(&self) -> ! {
+    fn panic_pool_exhausted(&self, waiting_for: &'static str, stalled_rounds: u32) -> ! {
         let arena = self.arena();
         let num_slots = self.allocated_slots();
         let mut pinned = 0usize;
         #[cfg_attr(miri, allow(unused_mut))]
         let mut inner = 0usize;
         let mut dirty = 0usize;
+        let mut referenced = 0usize;
         let mut resident = 0usize;
         let mut free_actual = 0usize;
         let mut evicting = 0usize;
@@ -4353,6 +4356,9 @@ impl BufferPool {
                     if unsafe { (*bf).header.core.dirty.load(Ordering::Relaxed) } {
                         dirty += 1;
                     }
+                    if unsafe { (*bf).header.core.referenced.load(Ordering::Relaxed) } {
+                        referenced += 1;
+                    }
                     #[cfg(not(miri))]
                     if page_header::is_inner_index_page(unsafe { &(*bf).page }) {
                         inner += 1;
@@ -4362,11 +4368,32 @@ impl BufferPool {
                 FrameState::Loading => loading += 1,
             }
         }
+        let parent_hint_latch_misses = self
+            .metrics
+            .unswizzle_parent_events
+            .get(UnswizzleParentEvent::FastPathLatchMisses);
+        let parent_dfs_fallbacks = self
+            .metrics
+            .unswizzle_parent_events
+            .get(UnswizzleParentEvent::DfsFallbacks);
+        let parent_dfs_failures = self
+            .metrics
+            .unswizzle_parent_events
+            .get(UnswizzleParentEvent::DfsFailures);
+        let second_chance_skips = self
+            .metrics
+            .eviction_events
+            .get(BufferPoolEvictionEvent::SecondChanceSkips);
         panic!(
-            "buffer pool exhausted: all frames pinned \
-             (total={}, allocated={}, free_counter={}, free_actual={}, resident={}, \
-             pinned={}, dirty={}, inner_idx={}, \
-             evicting={}, loading={}, eviction_budget={}, eviction_in_flight={})",
+            "buffer pool exhausted: no frame became evictable \
+             (waiting_for={}, stalled_rounds={}, total={}, allocated={}, \
+             resident_budget_available={}, free_actual={}, resident={}, \
+             pinned={}, dirty={}, referenced={}, inner_idx={}, \
+             evicting={}, loading={}, eviction_budget={}, eviction_in_flight={}, \
+             parent_hint_latch_misses={}, parent_dfs_fallbacks={}, parent_dfs_failures={}, \
+             second_chance_skips={})",
+            waiting_for,
+            stalled_rounds,
             arena.len,
             num_slots,
             self.resident_base_pages_available.load(Ordering::Relaxed),
@@ -4374,11 +4401,16 @@ impl BufferPool {
             resident,
             pinned,
             dirty,
+            referenced,
             inner,
             evicting,
             loading,
             self.eviction_budget,
             self.eviction_in_flight.load(Ordering::Relaxed),
+            parent_hint_latch_misses,
+            parent_dfs_fallbacks,
+            parent_dfs_failures,
+            second_chance_skips,
         )
     }
 
@@ -4405,6 +4437,11 @@ impl BufferPool {
         self.try_evict_any_policy(max_batch)
     }
 
+    /// Flush up to `max_batch` dirty pages for the background provider.
+    ///
+    /// Returns only pages whose dirty generation was unchanged and therefore
+    /// transitioned to clean. Pages redirtied after their writeback copy was
+    /// taken are persisted but do not count as eviction-capacity progress.
     #[cfg(not(miri))]
     pub fn try_flush_dirty_batch_for_provider(&self, max_batch: usize) -> std::io::Result<usize> {
         self.try_flush_dirty_batch(max_batch)
@@ -4616,6 +4653,7 @@ impl BufferPool {
     }
 
     #[cfg(not(miri))]
+    /// Return the number of pages that actually transitioned to clean.
     fn try_flush_dirty_batch(&self, max_batch: usize) -> std::io::Result<usize> {
         if max_batch == 0 {
             return Ok(0);
@@ -4776,7 +4814,7 @@ impl BufferPool {
             .dirty_flush_stale_pages
             .add(stale.min(isize::MAX as usize) as isize);
 
-        Ok(dirty_pages.len())
+        Ok(cleaned)
     }
 
     #[cfg(miri)]
@@ -5738,6 +5776,52 @@ mod tests {
         }
     }
 
+    #[cfg(not(miri))]
+    struct FailingWritePageStore {
+        inner: InMemoryPageStore,
+        fail_writes: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[cfg(not(miri))]
+    impl FailingWritePageStore {
+        fn new(fail_writes: Arc<std::sync::atomic::AtomicBool>) -> Self {
+            Self {
+                inner: InMemoryPageStore::new(),
+                fail_writes,
+            }
+        }
+    }
+
+    #[cfg(not(miri))]
+    impl PageStore for FailingWritePageStore {
+        fn read_page(&self, pid: PageId, buf: &mut [u8]) -> std::io::Result<bool> {
+            self.inner.read_page(pid, buf)
+        }
+
+        fn write_page(&self, pid: PageId, data: &[u8]) -> std::io::Result<()> {
+            if self.fail_writes.load(Ordering::Acquire) {
+                return Err(std::io::Error::other("injected dirty writeback failure"));
+            }
+            self.inner.write_page(pid, data)
+        }
+
+        fn allocate(&self, pid: PageId) -> std::io::Result<()> {
+            self.inner.allocate(pid)
+        }
+
+        fn sync(&self) -> std::io::Result<()> {
+            self.inner.sync()
+        }
+
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        fn next_page_id(&self) -> PageId {
+            self.inner.next_page_id()
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Single-threaded tests (verify &self API)
     // -----------------------------------------------------------------------
@@ -6577,7 +6661,11 @@ mod tests {
             writer_done_rx.recv_timeout(Duration::from_secs(1)).is_ok();
         store.release_write();
         writer.join().unwrap();
-        assert_eq!(flush.join().unwrap(), 1);
+        assert_eq!(
+            flush.join().unwrap(),
+            0,
+            "a stale writeback copy must not count as capacity progress"
+        );
         assert!(
             writer_completed_during_io,
             "page-store I/O must not retain the dirty page's exclusive latch"
@@ -6611,6 +6699,31 @@ mod tests {
         assert_eq!(diagnostics.dirty_flush_cleaned_pages, 1);
         assert_eq!(diagnostics.dirty_flush_stale_pages, 1);
         assert!(diagnostics.dirty_flush_data_write_ns > 0);
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    #[should_panic(
+        expected = "buffer pool dirty flush failed while waiting for frame capacity: injected dirty writeback failure"
+    )]
+    fn capacity_wait_reports_dirty_flush_io_error() {
+        let fail_writes = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pool = BufferPool::with_store(
+            1,
+            Box::new(FailingWritePageStore::new(Arc::clone(&fail_writes))),
+        );
+        let first = pool.allocate_page();
+        let second = pool.allocate_page();
+        {
+            let mut frame = pool
+                .fix_stable(&first, unsafe { NoLatches::new(&pool) })
+                .exclusive();
+            frame.page_mut()[0] = 1;
+            frame.mark_dirty();
+        }
+
+        fail_writes.store(true, Ordering::Release);
+        let _ = pool.fix_stable(&second, unsafe { NoLatches::new(&pool) });
     }
 
     #[test]
