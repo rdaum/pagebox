@@ -47,9 +47,10 @@
 //! - [`page_header`]: the small common prefix every page shares — page LSN,
 //!   page type discriminator, and the leaf flag. Used by recovery and
 //!   residency classification.
-//! - [`page_provider`]: optional background thread that proactively evicts
-//!   unpinned pages to keep the resident budget from going empty. Enabled by
-//!   `PAGEBOX_ENABLE_BACKGROUND_PAGE_PROVIDER=1`.
+//! - [`page_provider`]: optional background dirty-page cleaner that writes
+//!   back bounded batches before no-steal eviction runs out of candidates.
+//!   Embedders start it through
+//!   [`BufferPoolHandle::start_background_dirty_cleaner`](buffer_pool::BufferPoolHandle::start_background_dirty_cleaner).
 //!
 //! ## Key invariants
 //!

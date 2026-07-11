@@ -593,8 +593,8 @@ pub struct BufferPool {
     /// Page extents retired from data structures but not reusable until the
     /// next buffer-pool flush has made the unlink durable in the data file.
     pending_reusable_extents: parking_lot::Mutex<Vec<FreeExtent>>,
-    /// Background page provider thread handle. Disabled by default; set
-    /// `PAGEBOX_ENABLE_BACKGROUND_PAGE_PROVIDER=1` to enable it for experiments.
+    /// Background dirty-page cleaner. It is opt-in for embedders that want
+    /// writeback to get ahead of no-steal eviction pressure.
     page_provider: std::sync::Mutex<page_provider::PageProviderHandle>,
 }
 
@@ -615,12 +615,11 @@ pub struct BufferPoolHandle {
 impl BufferPoolHandle {
     pub fn new(pool: Arc<BufferPool>) -> Self {
         let _ = pool.self_weak.set(Arc::downgrade(&pool));
-        // Start the background page provider thread.
+        let handle = Self { inner: pool };
         if background_page_provider_enabled() {
-            let weak = Arc::downgrade(&pool);
-            pool.page_provider.lock().unwrap().start(weak);
+            handle.start_background_dirty_cleaner();
         }
-        Self { inner: pool }
+        handle
     }
 
     pub fn as_pool(&self) -> &BufferPool {
@@ -629,6 +628,14 @@ impl BufferPoolHandle {
 
     pub fn into_arc(self) -> Arc<BufferPool> {
         self.inner
+    }
+
+    /// Start bounded background dirty-page writeback before no-steal eviction
+    /// pressure exhausts the resident pool. The cleaner never evicts frames;
+    /// foreground workers retain the parent-unswizzle eviction protocol.
+    pub fn start_background_dirty_cleaner(&self) {
+        let weak = Arc::downgrade(&self.inner);
+        self.inner.page_provider.lock().unwrap().start(weak);
     }
 }
 
@@ -670,10 +677,9 @@ unsafe impl Sync for BufferPool {}
 fn background_page_provider_enabled() -> bool {
     static VALUE: OnceLock<bool> = OnceLock::new();
     *VALUE.get_or_init(|| {
-        // Disabled by default. The background thread competes with worker
-        // threads for CPU under high contention, reducing throughput. The
-        // inline backoff strategy in pop_free_frame handles eviction
-        // contention without a separate thread.
+        // Disabled by default. Embedders that need continuous no-steal
+        // writeback should use BufferPoolHandle::start_background_dirty_cleaner.
+        // This remains an opt-in experiment switch for standalone use.
         // Set PAGEBOX_ENABLE_BACKGROUND_PAGE_PROVIDER=1 to enable for
         // experiments.
         matches!(
@@ -2770,15 +2776,16 @@ impl BufferPool {
         if self.resident_base_pages_available.load(Ordering::Relaxed) >= 1 {
             return;
         }
-        // When the background page provider is enabled, it handles eviction
-        // and dirty-page flushing. Workers just wake it and wait.
-        // Otherwise, workers do inline eviction.
-        let frames_available = if background_page_provider_enabled() {
+        // Wake the background cleaner if present. Foreground workers retain
+        // the eviction path because it owns parent unswizzling.
+        let frames_available = {
             let pp = self.page_provider.lock().unwrap();
-            pp.need_frames_notify();
-            Some(pp.frames_available.clone())
-        } else {
-            None
+            if pp.is_running() {
+                pp.need_frames_notify();
+                Some(pp.frames_available.clone())
+            } else {
+                None
+            }
         };
 
         let mut stalled_rounds = 0u32;
@@ -2843,10 +2850,8 @@ impl BufferPool {
                 self.panic_pool_exhausted("free_frame", stalled_rounds);
             }
 
-            // Notify the background page provider that we need frames.
-            // It will evict clean pages and flush dirty ones in the
-            // background, replenishing the free list without blocking
-            // the caller.
+            // Notify the background cleaner that eviction pressure has
+            // reached the free-frame path.
             if stalled_rounds == 1 {
                 let pp = self.page_provider.lock().unwrap();
                 pp.need_frames_notify();
@@ -4422,8 +4427,8 @@ impl BufferPool {
         self.resident_base_pages_available
             .fetch_add(1, Ordering::Relaxed);
         // Notify any worker waiting in pop_free_frame/wait_for_resident_budget.
-        if background_page_provider_enabled()
-            && let Ok(pp) = self.page_provider.lock()
+        if let Ok(pp) = self.page_provider.lock()
+            && pp.is_running()
         {
             pp.frames_available_notify();
         }
@@ -4435,28 +4440,27 @@ impl BufferPool {
         self.resident_base_pages_available.load(Ordering::Relaxed)
     }
 
-    pub fn try_evict_any_policy_for_provider(&self, max_batch: usize) -> usize {
-        self.try_evict_any_policy(max_batch)
-    }
-
     /// Flush up to `max_batch` dirty pages for the background provider.
     ///
     /// Returns only pages whose dirty generation was unchanged and therefore
     /// transitioned to clean. Pages redirtied after their writeback copy was
     /// taken are persisted but do not count as eviction-capacity progress.
     #[cfg(not(miri))]
-    pub fn try_flush_dirty_batch_for_provider(&self, max_batch: usize) -> std::io::Result<usize> {
+    pub(crate) fn try_flush_dirty_batch_for_provider(
+        &self,
+        max_batch: usize,
+    ) -> std::io::Result<usize> {
         self.try_flush_dirty_batch(max_batch)
     }
 
     #[cfg(miri)]
-    pub fn try_flush_dirty_batch_for_provider(&self, _max_batch: usize) -> std::io::Result<usize> {
+    pub(crate) fn try_flush_dirty_batch_for_provider(
+        &self,
+        _max_batch: usize,
+    ) -> std::io::Result<usize> {
         Ok(0)
     }
 
-    /// Try to evict one randomly-selected frame. Returns true if a frame
-    /// was evicted and released a resident-budget token. Used by the
-    /// page provider thread to proactively replenish available budget.
     /// Try to evict one frame using a sequential clock-hand scan.
     ///
     /// Advances a shared clock hand through the frame array. On each probe:
@@ -6763,6 +6767,42 @@ mod tests {
                     && !unsafe { (*frame).header.core.dirty.load(Ordering::Acquire) }
             }),
             "the second batch must make a different dirty frame clean"
+        );
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn background_dirty_cleaner_cleans_without_evicting() {
+        let pool = Arc::new(BufferPool::new(16));
+        let handle = BufferPoolHandle::from(Arc::clone(&pool));
+        let edges = (0..12).map(|_| pool.allocate_page()).collect::<Vec<_>>();
+
+        for edge in &edges {
+            let mut frame = pool
+                .fix_stable(edge, unsafe { NoLatches::new(&pool) })
+                .exclusive();
+            frame.page_mut()[0] = 1;
+            frame.mark_dirty();
+        }
+
+        handle.start_background_dirty_cleaner();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while pool.diagnostic_stats().dirty_flush_cleaned_pages < edges.len() as u64
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let diagnostics = pool.diagnostic_stats();
+        assert_eq!(
+            diagnostics.dirty_flush_cleaned_pages,
+            edges.len() as u64,
+            "the cleaner must make the dirty resident pages evictable before capacity is exhausted"
+        );
+        assert_eq!(
+            diagnostics.resident_frames,
+            edges.len() as u64,
+            "the cleaner must leave eviction to the foreground parent-unswizzle path"
         );
     }
 

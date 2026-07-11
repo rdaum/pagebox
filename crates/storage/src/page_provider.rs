@@ -1,12 +1,12 @@
-//! Background page provider thread — proactively evicts clean pages and
-//! flushes dirty pages so they become evictable.
+//! Background dirty-page cleaner — flushes dirty pages before workers need
+//! them as eviction candidates.
 //!
 //! The provider runs a continuous loop:
 //! 1. If budget is sufficient, sleep until woken by a worker.
-//! 2. Try to evict clean pages (non-blocking `try_evict_policy`).
-//! 3. If eviction found only dirty pages (no-steal), flush them via
-//!    `try_flush_dirty_batch` so the next pass can evict them.
-//! 4. Notify waiting workers when frames become available.
+//! 2. Flush a bounded batch of dirty pages so the workers' regular eviction
+//!    path has clean candidates before the pool is exhausted.
+//! 3. Sleep briefly to bound writeback bandwidth; workers retain ownership of
+//!    eviction and the associated parent-unswizzle protocol.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -15,6 +15,13 @@ use std::time::Duration;
 use pagebox_threading as threading;
 
 use crate::buffer_pool::BufferPool;
+
+const MIN_IDLE_WAIT: Duration = Duration::from_millis(1);
+const MAX_IDLE_WAIT: Duration = Duration::from_millis(100);
+
+fn target_free_frames(num_frames: usize) -> usize {
+    ((num_frames / 10).max(16)).min(num_frames)
+}
 
 pub struct PageProviderHandle {
     thread: Option<std::thread::JoinHandle<()>>,
@@ -40,6 +47,13 @@ impl PageProviderHandle {
     }
 
     pub fn start(&mut self, pool: Weak<BufferPool>) {
+        if self.is_running() {
+            return;
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        self.shutdown.store(false, Ordering::Release);
         let shutdown = self.shutdown.clone();
         let need_frames = self.need_frames.clone();
         let frames_available = self.frames_available.clone();
@@ -60,7 +74,9 @@ impl PageProviderHandle {
     }
 
     pub fn is_running(&self) -> bool {
-        self.thread.is_some()
+        self.thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
     }
 
     pub fn frames_available_notify(&self) {
@@ -82,35 +98,82 @@ fn run(
     pool: Weak<BufferPool>,
     shutdown: &AtomicBool,
     need_frames: &(Mutex<()>, Condvar),
-    frames_available: &(Mutex<()>, Condvar),
+    _frames_available: &(Mutex<()>, Condvar),
 ) {
+    let mut idle_wait = MIN_IDLE_WAIT;
     while !shutdown.load(Ordering::Relaxed) {
         let Some(pool) = pool.upgrade() else {
             return;
         };
-        let target_free = (pool.num_frames() / 10).max(16);
+        let target_free = target_free_frames(pool.num_frames());
         let available = pool.approx_available_budget();
         if available >= target_free {
             // Budget sufficient — sleep until a worker signals need.
             let guard = need_frames.0.lock().unwrap();
             let _ = need_frames.1.wait_timeout(guard, Duration::from_millis(10));
+            idle_wait = MIN_IDLE_WAIT;
             continue;
         }
 
-        let want = (target_free - available).min(64);
-        let evicted = pool.try_evict_any_policy_for_provider(want);
-
-        if evicted > 0 {
-            frames_available.1.notify_all();
+        let cleaned = pool
+            .try_flush_dirty_batch_for_provider(64)
+            .unwrap_or_else(|error| panic!("background page provider dirty flush failed: {error}"));
+        if cleaned == 0 {
+            // Cleaning does not replenish resident-budget tokens. Once the
+            // worker eviction path has caught up, wait for a new pressure
+            // signal instead of repeatedly rescanning an all-clean arena.
+            let guard = need_frames.0.lock().unwrap();
+            let _ = need_frames.1.wait_timeout(guard, idle_wait);
+            idle_wait = idle_wait.saturating_mul(2).min(MAX_IDLE_WAIT);
         } else {
-            // Eviction couldn't find clean victims — likely all resident
-            // pages are dirty (no-steal). Flush dirty pages so they become
-            // evictable on the next pass.
-            pool.try_flush_dirty_batch_for_provider(64)
-                .unwrap_or_else(|error| {
-                    panic!("background page provider dirty flush failed: {error}")
-                });
+            idle_wait = MIN_IDLE_WAIT;
+            std::thread::sleep(MIN_IDLE_WAIT);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::{PageProviderHandle, target_free_frames};
+    use crate::buffer_pool::BufferPool;
+
+    #[test]
+    fn target_free_frames_never_exceeds_pool_capacity() {
+        assert_eq!(target_free_frames(1), 1);
+        assert_eq!(target_free_frames(15), 15);
+        assert_eq!(target_free_frames(16), 16);
+        assert_eq!(target_free_frames(160), 16);
+        assert_eq!(target_free_frames(1_000), 100);
+    }
+
+    #[test]
+    fn finished_cleaner_is_reaped_before_restart() {
+        let pool = Arc::new(BufferPool::new(32));
+        let mut cleaner = PageProviderHandle::new();
+        cleaner.thread = Some(std::thread::spawn(|| {}));
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while cleaner
+            .thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+            && Instant::now() < deadline
+        {
             std::thread::yield_now();
         }
+
+        assert!(
+            !cleaner.is_running(),
+            "a finished cleaner thread must not be reported as running"
+        );
+        cleaner.start(Arc::downgrade(&pool));
+        assert!(
+            cleaner.is_running(),
+            "starting after a finished cleaner must replace the stale handle"
+        );
+        cleaner.stop();
     }
 }
