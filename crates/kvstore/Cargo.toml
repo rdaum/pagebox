@@ -22,6 +22,12 @@ clap.workspace = true
 [features]
 default = ["metrics"]
 metrics = ["pagebox-storage/metrics", "pagebox-wal/metrics", "pagebox-btree/metrics"]
+page-4k = [
+    "pagebox-frame-kernel/page-4k",
+    "pagebox-wal/page-4k",
+    "pagebox-storage/page-4k",
+    "pagebox-btree/page-4k",
+]
 
 [dev-dependencies]
 tempfile.workspace = true

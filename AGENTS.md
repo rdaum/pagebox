@@ -12,7 +12,7 @@ Extracted from an unpublished OLTP database ("Boxter"). `kvstore` is the referen
 crates + `clap`), proving the substrate composes with no database-level types in scope.
 
 Substrate components: swizzled-pointer buffer pool (anonymous-`mmap` `MAP_NORESERVE` reservation, resident-budget
-eviction); file-backed page store (sharded free-page allocator, one unified 64 KiB page size, header-resident
+eviction); file-backed page store (sharded free-page allocator, one unified compile-time page size, header-resident
 user-meta slots);
 WAL (group commit, configurable sync backends, relaxed/strict commit modes, streaming replay, crash recovery);
 concurrent B+tree (swizzled references, hybrid latching, B-link right-sibling chase, ordered/prefix scans, reopen
@@ -154,6 +154,7 @@ Tests, runs, and benchmarks:
 
 ```bash
 cargo test -p <crate>                     # any pagebox-* crate
+cargo test --workspace --features page-4k # complete 4 KiB build/test cycle
 cargo run -p kvstore -- put hello world   # full recovery sequence on open
 cargo run -p kvstore -- get hello
 
@@ -200,7 +201,7 @@ The B+tree traversal, buffer pool fix/evict, slotted-page insert/scan, free-page
 paths are all hot. Prefer low or zero-copy solutions (page bytes are accessed in place through buffer-frame slices;
 do not copy them out unless an API boundary requires ownership — the B+tree `lookup_with` callback variant exists
 specifically to avoid allocating on the read path). Avoid unnecessary allocations. Follow cache-friendly patterns
-(slotted pages keep the slot array and key/value heap on the same 64 KiB page; do not introduce indirection that
+(slotted pages keep the slot array and key/value heap on the same compile-time-sized page; do not introduce indirection that
 defeats this). Use benchmark evidence for optimization claims; measure before and after.
 
 Key patterns and invariants (preserved across changes):

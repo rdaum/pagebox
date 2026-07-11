@@ -1,5 +1,5 @@
 //! Slotted-page container: a sorted key/value byte layout that fits in one
-//! unified 64 KiB Pagebox page.
+//! unified compile-time Pagebox page.
 //!
 //! [`SlottedPage`] is the in-memory page format used by the B+tree. It is
 //! `#[repr(transparent)]` over a

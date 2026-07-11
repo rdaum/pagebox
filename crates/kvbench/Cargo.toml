@@ -18,6 +18,7 @@ tempfile.workspace = true
 
 [features]
 default = []
+page-4k = ["kvstore/page-4k"]
 # Phase 1: external comparison engines (off by default).
 fjall = ["dep:fjall"]
 redb = ["dep:redb"]

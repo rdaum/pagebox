@@ -20,7 +20,7 @@
 //! - [`buffer_frame`]: the per-page in-memory slot — a 4096-aligned frame
 //!   combining a [`buffer_frame::BufferFrame`]'s latch (a
 //!   `pagebox_hybrid_latch::HybridLatch`), a frame header, and the page bytes
-//!   themselves. Page bytes use the workspace's unified 64 KiB
+//!   themselves. Page bytes use the workspace's unified compile-time
 //!   `pagebox_frame_kernel::PAGE_SIZE`; the frame is the unit of pinning,
 //!   latching, and eviction.
 //! - [`buffer_pool`]: the [`buffer_pool::BufferPool`] owns an array of frames.

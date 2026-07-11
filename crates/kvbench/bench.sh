@@ -8,11 +8,14 @@
 #   ./bench.sh resident_ycsb_c_small 8  # one scenario, one thread count
 #   ./bench.sh --keep                 # don't clear old results first
 #   ./bench.sh --cooldown-secs 2      # pause between engine processes
+#   ./bench.sh --page-size 4k          # build kvstore with 4 KiB pages
+#   ./bench.sh --page-4k               # shorthand for --page-size 4k
 #   ./bench.sh --wal-backend io_uring  # override WAL backend (kvstore only)
 #   ./bench.sh --wal-backend io_uring fillrandom 8
 #   ./bench.sh direct_io_cache_pressure_ycsb_c 2  # opt-in diagnostic
 #
-# Reports are written to ./bench-results/ as JSON.
+# Reports are written to ./bench-results/ as JSON. The 4 KiB build writes to
+# ./bench-results/page-4k/ so `--keep` cannot mix incompatible configurations.
 # Output files are named: ${engine}_${spec}_${threads}t.json
 
 set -euo pipefail
@@ -20,22 +23,29 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SPECS_DIR="$SCRIPT_DIR/specs"
 RESULTS_DIR="$SCRIPT_DIR/bench-results"
-LOGS_DIR="$RESULTS_DIR/logs"
 THREAD_COUNTS=(2 4 8 16)
 
 # Parse args: separate --keep, --wal-backend, scenario names, and thread counts.
 KEEP_RESULTS=false
 WAL_BACKEND=""
 COOLDOWN_SECS=1
+PAGE_SIZE_CONFIG="64k"
 SCENARIO_FILTER=()
 THREAD_FILTER=()
 FAILURES=()
+
+timestamp() {
+    date '+%Y-%m-%dT%H:%M:%S%z'
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --keep) KEEP_RESULTS=true; shift ;;
         --cooldown-secs) COOLDOWN_SECS="$2"; shift 2 ;;
         --cooldown-secs=*) COOLDOWN_SECS="${1#--cooldown-secs=}"; shift ;;
+        --page-size) PAGE_SIZE_CONFIG="$2"; shift 2 ;;
+        --page-size=*) PAGE_SIZE_CONFIG="${1#--page-size=}"; shift ;;
+        --page-4k) PAGE_SIZE_CONFIG="4k"; shift ;;
         --wal-backend) WAL_BACKEND="$2"; shift 2 ;;
         --wal-backend=*) WAL_BACKEND="${1#--wal-backend=}"; shift ;;
         *[0-9]*) THREAD_FILTER+=("$1"); shift ;;
@@ -63,6 +73,17 @@ if [[ ! "$COOLDOWN_SECS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     echo "ERROR: --cooldown-secs must be a non-negative number" >&2
     exit 2
 fi
+if [[ "$PAGE_SIZE_CONFIG" != "64k" && "$PAGE_SIZE_CONFIG" != "4k" ]]; then
+    echo "ERROR: --page-size must be 64k or 4k" >&2
+    exit 2
+fi
+
+KV_BENCH_FEATURES="fjall,redb,rocksdb,lmdb"
+if [[ "$PAGE_SIZE_CONFIG" == "4k" ]]; then
+    KV_BENCH_FEATURES+=",page-4k"
+    RESULTS_DIR="$RESULTS_DIR/page-4k"
+fi
+LOGS_DIR="$RESULTS_DIR/logs"
 
 mkdir -p "$RESULTS_DIR" "$LOGS_DIR"
 
@@ -78,8 +99,8 @@ if [[ "$KEEP_RESULTS" == false ]]; then
     rm -f "$LOGS_DIR"/*.log
 fi
 
-echo "=== Building kvbench (release, --all-features) ==="
-cargo build -p kvbench --release --all-features
+echo "=== [$(timestamp)] Building kvbench (release, ${PAGE_SIZE_CONFIG} pages) ==="
+cargo build -p kvbench --release --features "$KV_BENCH_FEATURES"
 echo
 if [[ -n "$WAL_BACKEND" ]]; then
     echo "=== WAL backend: $WAL_BACKEND ==="
@@ -106,7 +127,7 @@ run_one() {
         wal_arg=(--wal-backend "$WAL_BACKEND")
     fi
 
-    echo "  [$engine] $spec @ ${threads}t ..."
+    echo "  [$(timestamp)] [$engine] $spec @ ${threads}t ..."
     local rc=0
     local statuses=()
     if ! timeout 300 "$BIN" run \
@@ -139,7 +160,7 @@ run_one() {
 
 scenario_index=0
 for spec in "${SCENARIOS[@]}"; do
-    echo "=== Scenario: $spec ==="
+    echo "=== [$(timestamp)] Scenario: $spec ==="
     spec_path="$SPECS_DIR/${spec}.toml"
     if [[ ! -f "$spec_path" ]]; then
         echo "  ERROR: spec file not found: $spec_path"
@@ -152,7 +173,7 @@ for spec in "${SCENARIOS[@]}"; do
     fi
     thread_index=0
     for threads in "${THREAD_COUNTS[@]}"; do
-        echo "--- ${threads} threads ---"
+        echo "--- [$(timestamp)] ${threads} threads ---"
         # Rotate the declared cohort deterministically across scenario/thread
         # configurations. Runs remain wholly sequential.
         shift_by=$(((scenario_index + thread_index) % ${#cohort[@]}))

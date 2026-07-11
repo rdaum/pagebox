@@ -1,5 +1,9 @@
-/// Configurable page size. Change this to adjust the B+tree data page size.
-/// Must be a power of two and at least 4096 (the hardware page size).
+/// Page size selected by the `page-4k` feature.
+#[cfg(feature = "page-4k")]
+pub const PAGE_SIZE: usize = 4 * 1024;
+
+/// Default Pagebox page size when the `page-4k` feature is disabled.
+#[cfg(not(feature = "page-4k"))]
 pub const PAGE_SIZE: usize = 64 * 1024;
 
 pub type PageId = u64;

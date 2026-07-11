@@ -1623,7 +1623,7 @@ impl BTree {
             if unsafe { self.try_publish_leaf_split_via_root_blocking(sep_key, left, right) } {
                 return;
             }
-            if unsafe { self.try_publish_leaf_split_via_blocking_search(sep_key, left, right) } {
+            if unsafe { self.try_publish_leaf_split_via_nonblocking_search(sep_key, left, right) } {
                 return;
             }
             self.stats.inc(BTreeEvent::ParentPublishRestarts);
@@ -1760,7 +1760,7 @@ impl BTree {
         true
     }
 
-    unsafe fn try_publish_leaf_split_via_blocking_search(
+    unsafe fn try_publish_leaf_split_via_nonblocking_search(
         &self,
         sep_key: &[u8],
         left: SplitChild<'_, '_>,
@@ -1771,11 +1771,21 @@ impl BTree {
         let mut stack = vec![unsafe { pool.fix_frame(&self.meta_swip, NoLatches::new(pool)) }];
 
         while let Some(current) = stack.pop() {
-            let current = ExclusiveNode::from_inner_frame(current.exclusive());
-
-            if current.resident_frame().is_leaf() {
+            // Split publication retains exclusive latches on both children.
+            // Never block on an unrelated node while holding them: another
+            // publisher may hold that node as its split child and be searching
+            // through ours, forming a latch cycle. A contended branch is safe
+            // to skip because the outer publication loop retries from the root.
+            let Ok(current) = current.optimistic() else {
+                continue;
+            };
+            if BTreeNode::is_leaf(current.read_ref()) {
                 continue;
             }
+            let Ok(current) = current.try_upgrade_to_exclusive() else {
+                continue;
+            };
+            let current = ExclusiveNode::from_inner_frame(current);
 
             if let Some(edge) = current.child_edge_for(ChildRef::from_frame(&left.resident_frame()))
             {
@@ -3754,6 +3764,10 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
+    const FAT_VALUE_SIZE: usize = PAGE_SIZE / 2 - 128;
+    const SINGLE_ENTRY_VALUE_SIZE: usize = PAGE_SIZE - 128;
+    const PRESSURE_VALUE_SIZE: usize = PAGE_SIZE / 32;
+
     fn collect_all(tree: &BTree) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut out = Vec::new();
         tree.scan(|k, v| out.push((k.to_vec(), v.to_vec())));
@@ -3894,17 +3908,15 @@ mod tests {
 
     #[test]
     fn multi_level_splits() {
-        // 64K leaves hold ~2 entries of a ~32 KiB value (4-byte key + 12-byte
-        // slot overhead). To overflow the root inner node (≈2729 children) and
-        // reach height 2, we need ≈2729 leaves, i.e. ≈5458 entries. Use 6000
-        // with margin. Large values keep the entry count tractable for a test.
+        // Half-page values keep roughly two records per leaf. Six thousand
+        // records overflow the inner root under both supported page sizes.
         let pool = std::sync::Arc::new(BufferPool::new(4096));
         let tree = BTree::new(&pool, 0);
 
         let n = 6000;
         for i in 0..n as u32 {
             let key = i.to_be_bytes();
-            let mut val = [0u8; 32000];
+            let mut val = [0u8; FAT_VALUE_SIZE];
             val[0] = (i & 0xFF) as u8;
             val[1] = ((i >> 8) & 0xFF) as u8;
             assert!(tree.insert(&key, &val), "insert {i} failed");
@@ -4036,7 +4048,7 @@ mod tests {
 
         for i in 0..6000u32 {
             let key = i.to_be_bytes();
-            let mut val = [0u8; 32000];
+            let mut val = [0u8; FAT_VALUE_SIZE];
             val[0] = (i & 0xFF) as u8;
             val[1] = ((i >> 8) & 0xFF) as u8;
             assert!(tree.insert(&key, &val), "insert {i} failed");
@@ -4264,7 +4276,7 @@ mod tests {
     fn reachable_page_count_tracks_splits_and_merges() {
         let pool = std::sync::Arc::new(BufferPool::new(1_024));
         let tree = BTree::new(&pool, 0);
-        let value = [0x3c; 2_048];
+        let value = [0x3c; PRESSURE_VALUE_SIZE];
 
         for i in 0..4_096u32 {
             assert!(tree.insert(&i.to_be_bytes(), &value));
@@ -4325,7 +4337,7 @@ mod tests {
 
         for i in 0..6000u32 {
             let key = i.to_be_bytes();
-            let mut val = [0u8; 32000];
+            let mut val = [0u8; FAT_VALUE_SIZE];
             val[0] = (i & 0xFF) as u8;
             val[1] = ((i >> 8) & 0xFF) as u8;
             assert!(tree.insert(&key, &val), "insert {i} failed");
@@ -4377,7 +4389,7 @@ mod tests {
 
         for i in 0..6000u32 {
             let key = i.to_be_bytes();
-            let mut val = [0u8; 32000];
+            let mut val = [0u8; FAT_VALUE_SIZE];
             val[0] = (i & 0xFF) as u8;
             val[1] = ((i >> 8) & 0xFF) as u8;
             assert!(tree.insert(&key, &val), "insert {i} failed");
@@ -4511,7 +4523,7 @@ mod tests {
                 let next = next.clone();
                 let barrier = barrier.clone();
                 thread::spawn(move || {
-                    let value = [0x5a; 2_048];
+                    let value = [0x5a; PRESSURE_VALUE_SIZE];
                     barrier.wait();
                     loop {
                         let key = next.fetch_add(1, Ordering::Relaxed);
@@ -4556,7 +4568,7 @@ mod tests {
         let pool = Arc::new(BufferPool::new(16));
         let tree = Arc::new(BTree::new(&pool, 0));
         pool.register_dt(0, tree.clone());
-        let value = [0x6d; 2_048];
+        let value = [0x6d; PRESSURE_VALUE_SIZE];
         for key in 0..KEYS {
             assert!(tree.insert(&key.to_be_bytes(), &value));
         }
@@ -4588,7 +4600,7 @@ mod tests {
         let pool = Arc::new(BufferPool::new(64));
         let tree = Arc::new(BTree::new(&pool, 0));
         pool.register_dt(0, tree.clone());
-        let value = [0x71; 2_048];
+        let value = [0x71; PRESSURE_VALUE_SIZE];
         for key in 0..KEYS {
             assert!(tree.insert(&key.to_be_bytes(), &value));
         }
@@ -4671,7 +4683,7 @@ mod tests {
                 let in_flight = in_flight.clone();
                 let done_tx = done_tx.clone();
                 thread::spawn(move || {
-                    let value = [0xa5; 2_048];
+                    let value = [0xa5; PRESSURE_VALUE_SIZE];
                     barrier.wait();
                     loop {
                         let key = next.fetch_add(1, Ordering::Relaxed);
@@ -4721,7 +4733,11 @@ mod tests {
         }
         let mut count = 0usize;
         tree.scan(|_, value| {
-            assert_eq!(value.len(), 2_048, "scan returned a truncated value");
+            assert_eq!(
+                value.len(),
+                PRESSURE_VALUE_SIZE,
+                "scan returned a truncated value"
+            );
             count += 1;
         });
         assert_eq!(count, keys as usize, "concurrent growth lost keys");
@@ -5658,20 +5674,18 @@ mod tests {
         let pool = Arc::new(BufferPool::new(4096));
         let tree = BTree::new(&pool, 0);
 
-        // 64K leaves hold ~2 entries of a ~32 KiB value. The root inner node
-        // holds ≈2729 children, so ≈6000 entries force a root-inner split and
-        // reach height 2. Height 3 would need ≈2729*2729 leaves — impractical
-        // for a unit test, so we assert height 2.
+        // Half-page values keep roughly two records per leaf, so this forces
+        // a root-inner split under both supported page sizes.
         let n = 6_000u32;
         for i in 0..n {
             let key = i.to_be_bytes();
-            let val = [i as u8; 32000];
+            let val = [i as u8; FAT_VALUE_SIZE];
             tree.insert(&key, &val);
         }
 
         assert!(
             tree.height() >= 2,
-            "expected height >= 2 with {n} 32000-byte values, got {}",
+            "expected height >= 2 with {n} half-page values, got {}",
             tree.height()
         );
 
@@ -5679,7 +5693,7 @@ mod tests {
             let key = i.to_be_bytes();
             let result = tree.lookup(&key);
             assert!(result.is_some(), "key {i} not found");
-            assert_eq!(result.as_ref().unwrap().len(), 32000);
+            assert_eq!(result.as_ref().unwrap().len(), FAT_VALUE_SIZE);
         }
     }
 
@@ -5688,9 +5702,16 @@ mod tests {
         let pool = Arc::new(BufferPool::new(64));
         let tree = BTree::new(&pool, 0);
 
-        // Values large enough that only 1-2 fit per 64K leaf, including
-        // values near the page limit that exercise the single-entry split path.
-        let val_sizes = [8000, 16000, 24000, 32000, 48000, 60000];
+        // Exercise progressively larger fractions of the selected page size,
+        // including the single-entry split path near the page boundary.
+        let val_sizes = [
+            PAGE_SIZE / 8,
+            PAGE_SIZE / 4,
+            PAGE_SIZE * 3 / 8,
+            PAGE_SIZE / 2,
+            PAGE_SIZE * 3 / 4,
+            SINGLE_ENTRY_VALUE_SIZE,
+        ];
         for (i, &vs) in val_sizes.iter().enumerate() {
             let key = (i as u32).to_be_bytes();
             let val = vec![i as u8; vs];
@@ -5765,15 +5786,15 @@ mod tests {
 
     #[test]
     fn single_large_value_per_leaf_does_not_hang() {
-        // Regression test: inserting values large enough that only 1 entry
-        // fits per 64K leaf previously caused an infinite loop in split_node
+        // Regression test: inserting values large enough that only one entry
+        // fits per leaf previously caused an infinite loop in split_node
         // (count < 2 early return + insert retry loop).
         let pool = Arc::new(BufferPool::new(64));
         let tree = BTree::new(&pool, 0);
 
         for i in 0..6u32 {
             let key = i.to_be_bytes();
-            let val = vec![i as u8; 60000];
+            let val = vec![i as u8; SINGLE_ENTRY_VALUE_SIZE];
             assert!(tree.insert(&key, &val), "insert {i} should succeed");
         }
 
@@ -5783,8 +5804,8 @@ mod tests {
             let result = tree.lookup(&key);
             assert_eq!(
                 result.as_ref().map(|v| v.len()),
-                Some(60000),
-                "key {i} should be findable with 60000-byte value"
+                Some(SINGLE_ENTRY_VALUE_SIZE),
+                "key {i} should be findable with a near-page-sized value"
             );
             assert_eq!(result.unwrap()[0], i as u8);
         }
@@ -5800,7 +5821,7 @@ mod tests {
 
         for i in (0..6u32).rev() {
             let key = i.to_be_bytes();
-            let val = vec![i as u8; 60000];
+            let val = vec![i as u8; SINGLE_ENTRY_VALUE_SIZE];
             assert!(tree.insert(&key, &val), "insert {i} should succeed");
         }
 
@@ -5809,7 +5830,7 @@ mod tests {
             let result = tree.lookup(&key);
             assert_eq!(
                 result.as_ref().map(|v| v.len()),
-                Some(60000),
+                Some(SINGLE_ENTRY_VALUE_SIZE),
                 "key {i} should be findable"
             );
         }

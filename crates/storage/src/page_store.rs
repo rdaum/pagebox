@@ -349,9 +349,12 @@ impl RecoveryPageStore for InMemoryPageStore {
 //   bytes 24..32:  user_meta_0        (u64 LE) — user meta slot 0 (0 = unset)
 //   bytes 32..40:  user_meta_1        (u64 LE) — user meta slot 1 (0 = unset)
 //   bytes 40..48:  user_meta_2        (u64 LE) — user meta slot 2 (0 = unset)
+//   bytes 48..52:  page_size          (u32 LE) — compile-time data page size
 
 pub(crate) const HEADER_MAGIC: u32 = 0x424F5854; // "BOXT"
-pub(crate) const HEADER_VERSION: u16 = 1;
+pub(crate) const HEADER_VERSION: u16 = 2;
+pub(crate) const HEADER_BOOTSTRAP_SIZE: usize = 4 * 1024;
+const _: () = assert!(HEADER_BOOTSTRAP_SIZE <= PAGE_SIZE);
 pub(crate) const HEADER_MAGIC_OFF: usize = 0;
 pub(crate) const HEADER_VERSION_OFF: usize = 4;
 pub(crate) const HEADER_PAGE_COUNT_OFF: usize = 8;
@@ -359,6 +362,7 @@ pub(crate) const HEADER_CHECKPOINT_LSN_OFF: usize = 16;
 pub(crate) const HEADER_USER_META_0_OFF: usize = 24;
 pub(crate) const HEADER_USER_META_1_OFF: usize = 32;
 pub(crate) const HEADER_USER_META_2_OFF: usize = 40;
+pub(crate) const HEADER_PAGE_SIZE_OFF: usize = 48;
 
 pub(crate) fn build_header(
     page_count: u64,
@@ -375,6 +379,7 @@ pub(crate) fn build_header(
     hdr[HEADER_USER_META_0_OFF..32].copy_from_slice(&user_meta_0.to_le_bytes());
     hdr[HEADER_USER_META_1_OFF..40].copy_from_slice(&user_meta_1.to_le_bytes());
     hdr[HEADER_USER_META_2_OFF..48].copy_from_slice(&user_meta_2.to_le_bytes());
+    hdr[HEADER_PAGE_SIZE_OFF..52].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
     hdr
 }
 
@@ -391,6 +396,16 @@ pub(crate) fn validate_header(hdr: &[u8; PAGE_SIZE]) -> io::Result<(u64, u64, u6
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported version: expected {HEADER_VERSION}, got {version}"),
+        ));
+    }
+    let stored_page_size =
+        u32::from_le_bytes(hdr[HEADER_PAGE_SIZE_OFF..52].try_into().unwrap()) as usize;
+    if stored_page_size != PAGE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "page size mismatch: file uses {stored_page_size} bytes, build uses {PAGE_SIZE} bytes"
+            ),
         ));
     }
     let pc = u64::from_le_bytes(hdr[HEADER_PAGE_COUNT_OFF..16].try_into().unwrap());
@@ -517,27 +532,37 @@ impl FilePageStore {
             stat.st_size as u64
         };
 
-        let (page_count, checkpoint_lsn, user_meta_0, user_meta_1, user_meta_2) =
-            if file_size >= PAGE_SIZE as u64 {
-                // Read and validate header page (aligned for O_DIRECT).
-                let mut hdr_buf = AlignedPage([0u8; PAGE_SIZE]);
-                pread_exact(fd, &mut hdr_buf.0, 0).inspect_err(|_| {
-                    unsafe { libc::close(fd) };
-                })?;
+        let (page_count, checkpoint_lsn, user_meta_0, user_meta_1, user_meta_2) = if file_size > 0 {
+            if file_size < HEADER_BOOTSTRAP_SIZE as u64 {
+                unsafe { libc::close(fd) };
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "page-store header is truncated: {file_size} bytes, expected at least {HEADER_BOOTSTRAP_SIZE}"
+                    ),
+                ));
+            }
+            // The format identity lives in the first 4 KiB so either build
+            // can reject a store written with the other page size before
+            // applying page-size-dependent offsets.
+            let mut hdr_buf = AlignedPage([0u8; PAGE_SIZE]);
+            pread_exact(fd, &mut hdr_buf.0[..HEADER_BOOTSTRAP_SIZE], 0).inspect_err(|_| {
+                unsafe { libc::close(fd) };
+            })?;
 
-                validate_header(&hdr_buf.0).inspect_err(|_| {
-                    unsafe { libc::close(fd) };
-                })?
-            } else {
-                // Fresh file — write initial header (aligned for O_DIRECT).
-                let hdr_data = Self::build_header(0, 0, 0, 0, 0);
-                let mut hdr = AlignedPage([0u8; PAGE_SIZE]);
-                hdr.0.copy_from_slice(&hdr_data);
-                pwrite_exact(fd, &hdr.0, 0).inspect_err(|_| {
-                    unsafe { libc::close(fd) };
-                })?;
-                (0, 0, 0, 0, 0)
-            };
+            validate_header(&hdr_buf.0).inspect_err(|_| {
+                unsafe { libc::close(fd) };
+            })?
+        } else {
+            // Fresh file — write initial header (aligned for O_DIRECT).
+            let hdr_data = Self::build_header(0, 0, 0, 0, 0);
+            let mut hdr = AlignedPage([0u8; PAGE_SIZE]);
+            hdr.0.copy_from_slice(&hdr_data);
+            pwrite_exact(fd, &hdr.0, 0).inspect_err(|_| {
+                unsafe { libc::close(fd) };
+            })?;
+            (0, 0, 0, 0, 0)
+        };
 
         Ok(FilePageStore {
             fd,
@@ -909,6 +934,39 @@ mod tests {
         let err = FilePageStore::open(&path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("bad magic"));
+    }
+
+    #[test]
+    fn mismatched_page_size_rejected_before_page_offsets_are_used() {
+        let path = tmp_path("page_size_mismatch");
+        let _c = Cleanup(path.clone());
+
+        let mut header = build_header(0, 0, 0, 0, 0);
+        let other_page_size = if PAGE_SIZE == 4 * 1024 {
+            64 * 1024
+        } else {
+            4 * 1024
+        };
+        header[HEADER_PAGE_SIZE_OFF..52].copy_from_slice(&(other_page_size as u32).to_le_bytes());
+        std::fs::write(&path, &header[..HEADER_BOOTSTRAP_SIZE]).unwrap();
+
+        let err = FilePageStore::open(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("page size mismatch"),
+            "wrong error for mismatched page-size format: {err}"
+        );
+    }
+
+    #[test]
+    fn truncated_header_is_not_reinitialised() {
+        let path = tmp_path("truncated_header");
+        let _c = Cleanup(path.clone());
+        std::fs::write(&path, [0xa5; 128]).unwrap();
+
+        let err = FilePageStore::open(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 128);
     }
 
     #[test]

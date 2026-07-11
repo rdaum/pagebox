@@ -15,7 +15,7 @@ struct Cli {
     #[arg(long)]
     sync: bool,
 
-    /// Buffer-pool frame count.
+    /// Buffer-pool frame count (defaults to a 64 MiB data-page budget).
     #[arg(long, default_value_t = kvstore::DEFAULT_POOL_FRAMES)]
     pool_frames: usize,
 

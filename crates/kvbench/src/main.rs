@@ -325,15 +325,9 @@ fn run_engine<E: KvEngine>(
         eprintln!("  Loading {} records...", spec.record_count);
         let load_ops = generate_load_ops(spec);
         let load_stats = if verify {
-            driver::run_phase_verify(
-                &engine,
-                &load_ops,
-                spec.threads.max(1),
-                Duration::ZERO,
-                &shadow,
-            )
+            driver::run_load_phase_verify(&engine, &load_ops, spec.threads.max(1), &shadow)
         } else {
-            run_phase(&engine, &load_ops, spec.threads.max(1), Duration::ZERO)
+            driver::run_load_phase(&engine, &load_ops, spec.threads.max(1))
         };
         eprintln!(
             "  Load: {:.0} ops/sec, {:.2}ms",

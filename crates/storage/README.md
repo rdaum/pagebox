@@ -5,7 +5,7 @@ Low-level page, frame, buffer-pool, and page-store substrate.
 ## Role
 
 `pagebox-storage` manages page residency, buffer frames, page stores, the
-unified 64 KiB page format, free-page allocation, and the page-level operations
+unified compile-time page format, free-page allocation, and the page-level operations
 that higher layers compose into indexes or other data structures.
 
 ## Major Pieces

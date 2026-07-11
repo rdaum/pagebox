@@ -7,6 +7,7 @@ license.workspace = true
 [features]
 default = ["metrics"]
 metrics = ["dep:fast-telemetry"]
+page-4k = ["pagebox-storage/page-4k"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(miri)', 'cfg(metrics)'] }

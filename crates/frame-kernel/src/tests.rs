@@ -26,3 +26,12 @@ fn all_pages_are_same_size() {
         assert_eq!(page_end_base_page(pid), pid);
     }
 }
+
+#[test]
+fn build_uses_selected_page_size() {
+    #[cfg(feature = "page-4k")]
+    assert_eq!(PAGE_SIZE, 4 * 1024);
+
+    #[cfg(not(feature = "page-4k"))]
+    assert_eq!(PAGE_SIZE, 64 * 1024);
+}

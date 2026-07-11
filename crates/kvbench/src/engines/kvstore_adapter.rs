@@ -2,11 +2,9 @@
 
 use std::path::Path;
 
-use kvstore::{KvStore, KvStoreOptions, SyncMode as KvSyncMode, TreeBackend};
+use kvstore::{KvStore, KvStoreOptions, PAGE_SIZE, SyncMode as KvSyncMode, TreeBackend};
 
 use crate::engine::{CacheControl, EngineOpts, EngineStats, KvEngine, SyncMode};
-
-const PAGE_SIZE: usize = 65_536;
 
 pub struct KvstoreAdapter {
     inner: KvStore,

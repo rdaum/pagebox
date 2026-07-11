@@ -16,8 +16,13 @@ use pagebox_storage::page_header::read_page_lsn;
 use pagebox_storage::page_store::{FilePageStore, PageStore};
 use pagebox_wal::Wal;
 
-/// Default buffer-pool frame count.
-pub const DEFAULT_POOL_FRAMES: usize = 1024;
+pub use pagebox_frame_kernel::PAGE_SIZE;
+
+/// Default buffer-pool data-page budget.
+pub const DEFAULT_POOL_BYTES: usize = 64 * 1024 * 1024;
+
+/// Default buffer-pool frame count for the selected compile-time page size.
+pub const DEFAULT_POOL_FRAMES: usize = DEFAULT_POOL_BYTES / PAGE_SIZE;
 
 /// Default domain ID for the B+tree data-structure registry.
 pub const DEFAULT_DOMAIN_ID: u16 = 1;
@@ -239,7 +244,7 @@ impl KvStore {
         self.tree.height()
     }
 
-    /// Configured buffer-pool capacity in 64 KiB pages.
+    /// Configured buffer-pool capacity in pages.
     pub fn cache_capacity_pages(&self) -> usize {
         self.pool.num_frames()
     }
@@ -337,7 +342,7 @@ mod tests {
         );
         assert!(
             after.dirty_wal_page_patch_bytes - before.dirty_wal_page_patch_bytes < 4_096,
-            "a 2 KiB value replacement must not log a 64 KiB page image"
+            "an equal-length value replacement must not log a full page image"
         );
         store.checkpoint().unwrap();
         drop(store);

@@ -61,8 +61,9 @@ that possible:
   replay, and crash recovery.
 - A **file-backed page store** with a free-page allocator, header-resident user
   meta slots, and sync/fsync control.
-- A single **64 KiB page size** shared by the page store, buffer frames, WAL
-  records, slotted pages, and B+tree nodes.
+- A single compile-time page size shared by the page store, buffer frames, WAL
+  records, slotted pages, and B+tree nodes. Builds use 64 KiB by default;
+  enable `page-4k` to build the complete workspace with 4 KiB pages.
 
 ## Crates
 
@@ -165,6 +166,10 @@ These two papers are of importance for what I'm trying to do:
 ## Testing and Benchmarks
 
 ```bash
+# Complete 64 KiB and 4 KiB test cycles
+cargo test --workspace
+cargo test --workspace --features page-4k
+
 # Substrate unit tests
 cargo test -p pagebox-storage
 cargo test -p pagebox-wal
@@ -173,6 +178,7 @@ cargo test -p pagebox-hybrid-latch
 
 # Lint
 cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets --features page-4k
 cargo fmt --all
 
 # Microbenchmarks

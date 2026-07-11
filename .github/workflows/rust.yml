@@ -11,12 +11,18 @@ env:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - page_size: 64k
+            feature_args: ""
+          - page_size: 4k
+            feature_args: "--features page-4k"
 
     steps:
     - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+    - name: Build (${{ matrix.page_size }})
+      run: cargo build --workspace --verbose ${{ matrix.feature_args }}
+    - name: Run tests (${{ matrix.page_size }})
+      run: cargo test --workspace --verbose ${{ matrix.feature_args }}

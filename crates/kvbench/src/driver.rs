@@ -14,6 +14,9 @@ use crate::engine::KvEngine;
 use crate::stats::{OpKind, PhaseStats};
 use crate::workload::{WorkloadOp, scan_end_key};
 
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+const PROGRESS_FLUSH_OPS: u64 = 256;
+
 /// Run a phase (load or run) against the given engine.
 ///
 /// The `ops` slice is partitioned across `threads` worker threads; each
@@ -25,7 +28,25 @@ pub fn run_phase<E: KvEngine + Sync>(
     minimum_duration: Duration,
 ) -> PhaseStats {
     let shadow = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    run_phase_inner(engine, ops, threads, minimum_duration, false, &shadow)
+    run_phase_inner(engine, ops, threads, minimum_duration, false, &shadow, None)
+}
+
+/// Run a finite load phase and emit periodic progress to stderr.
+pub fn run_load_phase<E: KvEngine + Sync>(
+    engine: &E,
+    ops: &[WorkloadOp],
+    threads: usize,
+) -> PhaseStats {
+    let shadow = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    run_phase_inner(
+        engine,
+        ops,
+        threads,
+        Duration::ZERO,
+        false,
+        &shadow,
+        Some("Load"),
+    )
 }
 
 /// Run a phase with verification against a shadow HashMap.
@@ -41,7 +62,25 @@ pub fn run_phase_verify<E: KvEngine + Sync>(
     minimum_duration: Duration,
     shadow: &Arc<std::sync::Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
 ) -> PhaseStats {
-    run_phase_inner(engine, ops, threads, minimum_duration, true, shadow)
+    run_phase_inner(engine, ops, threads, minimum_duration, true, shadow, None)
+}
+
+/// Run a verified finite load phase and emit periodic progress to stderr.
+pub fn run_load_phase_verify<E: KvEngine + Sync>(
+    engine: &E,
+    ops: &[WorkloadOp],
+    threads: usize,
+    shadow: &Arc<std::sync::Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
+) -> PhaseStats {
+    run_phase_inner(
+        engine,
+        ops,
+        threads,
+        Duration::ZERO,
+        true,
+        shadow,
+        Some("Load"),
+    )
 }
 
 fn run_phase_inner<E: KvEngine + Sync>(
@@ -51,6 +90,7 @@ fn run_phase_inner<E: KvEngine + Sync>(
     minimum_duration: Duration,
     verify: bool,
     shadow: &Arc<std::sync::Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
+    progress_label: Option<&'static str>,
 ) -> PhaseStats {
     let threads = threads.max(1);
     let next_idx = Arc::new(AtomicU64::new(0));
@@ -58,20 +98,53 @@ fn run_phase_inner<E: KvEngine + Sync>(
     assert!(total > 0, "benchmark phase requires at least one operation");
 
     let errors = Arc::new(AtomicU64::new(0));
+    let completed = progress_label.map(|_| Arc::new(AtomicU64::new(0)));
 
     let start = Instant::now();
     let deadline = start + minimum_duration;
     let mut combined = PhaseStats::new();
 
     std::thread::scope(|s| {
+        let (progress_stop_tx, progress_stop_rx) = std::sync::mpsc::channel();
+        let progress_handle = progress_label.map(|label| {
+            let completed = Arc::clone(completed.as_ref().unwrap());
+            s.spawn(move || {
+                let mut last_completed = 0_u64;
+                let mut last_tick = start;
+                loop {
+                    match progress_stop_rx.recv_timeout(PROGRESS_INTERVAL) {
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            let now = Instant::now();
+                            let current = completed.load(Ordering::Relaxed).min(total);
+                            let elapsed = now.duration_since(start).as_secs_f64();
+                            let recent_elapsed = now.duration_since(last_tick).as_secs_f64();
+                            let average_rate = current as f64 / elapsed.max(f64::EPSILON);
+                            let recent_rate = current.saturating_sub(last_completed) as f64
+                                / recent_elapsed.max(f64::EPSILON);
+                            let percentage = current as f64 * 100.0 / total as f64;
+                            eprintln!(
+                                "  {label} progress: {current}/{total} ({percentage:.1}%), \
+                                 elapsed={elapsed:.1}s, avg={average_rate:.0}/s, recent={recent_rate:.0}/s"
+                            );
+                            last_completed = current;
+                            last_tick = now;
+                        }
+                    }
+                }
+            })
+        });
+
         let mut handles = Vec::with_capacity(threads);
         for _ in 0..threads {
             let next_idx = Arc::clone(&next_idx);
             let shadow = Arc::clone(shadow);
             let errors = Arc::clone(&errors);
+            let completed = completed.clone();
             handles.push(s.spawn(move || {
                 let mut local = PhaseStats::new();
                 let mut deadline_check_countdown = 0_u16;
+                let mut unreported_completions = 0_u64;
                 loop {
                     let idx = next_idx.fetch_add(1, Ordering::Relaxed);
                     if idx >= total {
@@ -92,6 +165,18 @@ fn run_phase_inner<E: KvEngine + Sync>(
                     let kind = execute_op(engine, op, verify, &shadow, &errors, idx);
                     let elapsed = op_start.elapsed().as_nanos() as u64;
                     local.record(elapsed, kind);
+                    if let Some(completed) = &completed {
+                        unreported_completions += 1;
+                        if unreported_completions == PROGRESS_FLUSH_OPS {
+                            completed.fetch_add(unreported_completions, Ordering::Relaxed);
+                            unreported_completions = 0;
+                        }
+                    }
+                }
+                if let Some(completed) = &completed
+                    && unreported_completions > 0
+                {
+                    completed.fetch_add(unreported_completions, Ordering::Relaxed);
                 }
                 local
             }));
@@ -99,6 +184,10 @@ fn run_phase_inner<E: KvEngine + Sync>(
         for handle in handles {
             let local = handle.join().expect("worker thread panicked");
             combined.merge(&local);
+        }
+        let _ = progress_stop_tx.send(());
+        if let Some(handle) = progress_handle {
+            handle.join().expect("progress thread panicked");
         }
     });
 
@@ -377,5 +466,23 @@ mod tests {
             "duration-bound phase should repeat its operation trace"
         );
         assert!(stats.duration >= Duration::from_millis(5));
+    }
+
+    #[test]
+    fn short_load_progress_run_stops_reporter_immediately() {
+        let engine = MockEngine::new();
+        let ops = vec![WorkloadOp::Put {
+            key: b"key".to_vec(),
+            value: b"value".to_vec(),
+        }];
+        let wall_start = Instant::now();
+
+        let stats = run_load_phase(&engine, &ops, 1);
+
+        assert_eq!(stats.operations, 1);
+        assert!(
+            wall_start.elapsed() < PROGRESS_INTERVAL,
+            "a completed load must wake the progress reporter instead of waiting for its interval"
+        );
     }
 }
