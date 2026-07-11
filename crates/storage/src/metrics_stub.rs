@@ -22,6 +22,11 @@ impl Counter {
 
     #[inline]
     pub fn add(&self, _delta: isize) {}
+
+    #[inline]
+    pub fn sum(&self) -> isize {
+        0
+    }
 }
 
 pub struct Gauge;

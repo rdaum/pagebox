@@ -171,6 +171,49 @@ fn recover_applies_page_patch_after_base_image() {
 }
 
 #[test]
+fn recover_applies_explicit_page_patch_ranges() {
+    let path = tmp_path("recover_explicit_page_patch_ranges");
+    let _cleanup = Cleanup(path.clone());
+    let wal = Wal::open(&path).unwrap();
+
+    let page_id = 1;
+    let mut expected = [0u8; PAGE_SIZE];
+    let base_lsn = wal.claim_lsn();
+    wal.append_page_image_with_lsn(base_lsn, page_id, |lsn, page| {
+        write_test_page_lsn(page, lsn);
+        page[100] = 1;
+        expected.copy_from_slice(page);
+    })
+    .unwrap();
+
+    let patch_lsn = wal.claim_lsn();
+    let lsn_bytes = patch_lsn.to_le_bytes();
+    let replacement = [7u8; 32];
+    assert!(
+        wal.append_page_patch_ranges_with_lsn(
+            patch_lsn,
+            page_id,
+            &[(0, &lsn_bytes), (200, &replacement)],
+        )
+        .unwrap()
+        .is_some(),
+        "ordered page-local ranges should use compact patch encoding"
+    );
+    expected[..8].copy_from_slice(&lsn_bytes);
+    expected[200..232].copy_from_slice(&replacement);
+    wal.flush();
+
+    let store = TestRecoveryStore::default();
+    let report = wal.recover(&store, 0, read_test_page_lsn).unwrap();
+    assert_eq!(report.records_applied, 2);
+    assert_eq!(
+        store.pages.lock().unwrap().get(&page_id).map(Vec::as_slice),
+        Some(expected.as_slice()),
+        "recovery must apply both explicit ranges to the base image"
+    );
+}
+
+#[test]
 fn sharded_recovery_applies_records_in_lsn_order() {
     let path = tmp_path("sharded_recovery_order");
     let _cleanup = Cleanup(path.clone());

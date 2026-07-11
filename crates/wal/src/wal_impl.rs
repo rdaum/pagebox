@@ -730,7 +730,7 @@ fn encode_page_patch_payload(
     before: &[u8; PAGE_SIZE],
     after: &[u8; PAGE_SIZE],
 ) -> Option<Vec<u8>> {
-    let mut ranges = Vec::<(usize, usize)>::new();
+    let mut changed_ranges = Vec::<(usize, usize)>::new();
     let mut offset = 0usize;
     while offset < PAGE_SIZE {
         if before[offset] == after[offset] {
@@ -742,18 +742,36 @@ fn encode_page_patch_payload(
         while offset < PAGE_SIZE && before[offset] != after[offset] {
             offset += 1;
         }
-        ranges.push((start, offset - start));
+        changed_ranges.push((start, offset - start));
     }
 
-    if ranges.is_empty() {
+    let ranges = changed_ranges
+        .iter()
+        .map(|(start, len)| (*start, &after[*start..*start + *len]))
+        .collect::<Vec<_>>();
+    encode_page_patch_ranges_payload(page_id, &ranges)
+}
+
+fn encode_page_patch_ranges_payload(page_id: PageId, ranges: &[(usize, &[u8])]) -> Option<Vec<u8>> {
+    if page_size(page_id) != PAGE_SIZE || ranges.is_empty() {
         return None;
     }
 
-    let payload_len = PAGE_PATCH_HEADER_LEN
-        + ranges
-            .iter()
-            .map(|(_, len)| PAGE_PATCH_RANGE_HEADER_LEN + *len)
-            .sum::<usize>();
+    let mut payload_len = PAGE_PATCH_HEADER_LEN;
+    let mut previous_end = 0usize;
+    for &(start, data) in ranges {
+        if data.is_empty() || start < previous_end {
+            return None;
+        }
+        let end = start.checked_add(data.len())?;
+        if end > PAGE_SIZE {
+            return None;
+        }
+        payload_len = payload_len
+            .checked_add(PAGE_PATCH_RANGE_HEADER_LEN)?
+            .checked_add(data.len())?;
+        previous_end = end;
+    }
     if payload_len >= PAGE_SIZE {
         return None;
     }
@@ -763,12 +781,12 @@ fn encode_page_patch_payload(
     payload.extend_from_slice(&page_id.to_le_bytes());
     payload.extend_from_slice(&range_count.to_le_bytes());
     payload.extend_from_slice(&0u32.to_le_bytes());
-    for (start, len) in ranges {
+    for &(start, data) in ranges {
         let start = u32::try_from(start).ok()?;
-        let len = u32::try_from(len).ok()?;
+        let len = u32::try_from(data.len()).ok()?;
         payload.extend_from_slice(&start.to_le_bytes());
         payload.extend_from_slice(&len.to_le_bytes());
-        payload.extend_from_slice(&after[start as usize..start as usize + len as usize]);
+        payload.extend_from_slice(data);
     }
     Some(payload)
 }
@@ -1677,6 +1695,31 @@ impl Wal {
         );
         self.append_logical_with_lsn(lsn, LOGICAL_KIND_PAGE_PATCH, &payload)?;
         Ok(true)
+    }
+
+    /// Append explicit changed byte ranges for one page. Ranges must be
+    /// non-empty, ordered, non-overlapping, and contained within the page.
+    /// Returns the encoded payload length, or `Ok(None)` when the ranges
+    /// cannot use the compact patch encoding, allowing callers to fall back
+    /// to a full page image.
+    pub fn append_page_patch_ranges_with_lsn(
+        &self,
+        lsn: Lsn,
+        page_id: PageId,
+        ranges: &[(usize, &[u8])],
+    ) -> io::Result<Option<usize>> {
+        let Some(payload) = encode_page_patch_ranges_payload(page_id, ranges) else {
+            return Ok(None);
+        };
+        let payload_len = payload.len();
+        let inner = self.inner_for_lsn(lsn);
+        inner.stats.events.inc(WalEvent::LogicalRecords);
+        inner.stats.events.add(
+            WalEvent::LogicalBytes,
+            payload.len().min(isize::MAX as usize) as isize,
+        );
+        self.append_logical_with_lsn(lsn, LOGICAL_KIND_PAGE_PATCH, &payload)?;
+        Ok(Some(payload_len))
     }
 
     /// Append a logical record (caller-defined `kind`, opaque `payload`)

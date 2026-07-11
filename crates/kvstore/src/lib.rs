@@ -318,6 +318,35 @@ mod tests {
     }
 
     #[test]
+    fn equal_length_update_uses_compact_wal_patch_and_reopens() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = KvStore::open(dir.path()).unwrap();
+        let initial = [0x31; 2_048];
+        let updated = [0x72; 2_048];
+
+        assert!(store.put(b"key", &initial));
+        store.checkpoint().unwrap();
+        let before = store.buffer_pool_diagnostic_stats();
+        assert!(!store.put(b"key", &updated));
+        let after = store.buffer_pool_diagnostic_stats();
+
+        assert_eq!(
+            after.dirty_wal_page_patch_records - before.dirty_wal_page_patch_records,
+            1,
+            "same-length value replacement must append one compact page patch"
+        );
+        assert!(
+            after.dirty_wal_page_patch_bytes - before.dirty_wal_page_patch_bytes < 4_096,
+            "a 2 KiB value replacement must not log a 64 KiB page image"
+        );
+        store.checkpoint().unwrap();
+        drop(store);
+
+        let reopened = KvStore::open(dir.path()).unwrap();
+        assert_eq!(reopened.get(b"key").as_deref(), Some(&updated[..]));
+    }
+
+    #[test]
     #[ignore = "expensive file-backed eviction-pressure regression"]
     fn concurrent_file_backed_growth_completes_under_eviction_pressure() {
         const KEYS: u64 = 65_536;

@@ -666,6 +666,13 @@ impl SlottedPage {
         self.data[start..start + value.len()].copy_from_slice(value);
         true
     }
+
+    /// Byte range occupied by a slot's value in the underlying page.
+    pub fn value_range(&self, slot_id: u16) -> std::ops::Range<usize> {
+        let s = self.slot(slot_id);
+        let start = s.offset as usize + s.key_len as usize;
+        start..start + s.val_len as usize
+    }
 }
 
 // ---------------------------------------------------------------------------

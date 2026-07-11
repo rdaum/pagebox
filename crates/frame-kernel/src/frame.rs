@@ -191,6 +191,10 @@ pub struct FrameCoreHeader {
     pub pid: PageId,
     /// Set when the page has been modified since last write-back.
     pub dirty: AtomicBool,
+    /// In-memory mutation generation. Incremented on every dirty mark so a
+    /// writeback copy can detect a newer mutation even when no WAL/LSN is
+    /// attached to the frame.
+    pub dirty_generation: AtomicU64,
     /// Clock-style second-chance bit. Set on page touches and cleared by
     /// the evictor before a page becomes a real victim candidate.
     pub referenced: AtomicBool,
@@ -210,6 +214,7 @@ impl FrameCoreHeader {
             pin_count: PaddedAtomicU32::new(0),
             pid: 0,
             dirty: AtomicBool::new(false),
+            dirty_generation: AtomicU64::new(0),
             referenced: AtomicBool::new(false),
             state: AtomicFrameState::new(FrameState::Free),
             page_lsn: AtomicU64::new(0),

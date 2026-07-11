@@ -752,6 +752,10 @@ impl<'a, Kind> ExclusiveNode<'a, Kind> {
         self.frame.mark_dirty();
     }
 
+    pub(crate) fn mark_dirty_patch(&self, offset: usize, data: &[u8]) {
+        self.frame.mark_dirty_patch(offset, data);
+    }
+
     pub(crate) fn into_frame(self) -> ExclusiveFrame<'a> {
         let this = std::mem::ManuallyDrop::new(self);
         unsafe { std::ptr::read(&this.frame) }

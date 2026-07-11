@@ -127,6 +127,26 @@ impl KvEngine for KvstoreAdapter {
                 buffer.resident_budget_available,
             ),
             ("eviction_in_flight", buffer.eviction_in_flight),
+            ("dirty_flush_batches", buffer.dirty_flush_batches),
+            ("dirty_flush_pages", buffer.dirty_flush_pages),
+            ("dirty_flush_wal_wait_ns", buffer.dirty_flush_wal_wait_ns),
+            (
+                "dirty_flush_data_write_ns",
+                buffer.dirty_flush_data_write_ns,
+            ),
+            (
+                "dirty_flush_cleaned_pages",
+                buffer.dirty_flush_cleaned_pages,
+            ),
+            ("dirty_flush_stale_pages", buffer.dirty_flush_stale_pages),
+            (
+                "dirty_wal_page_patch_records",
+                buffer.dirty_wal_page_patch_records,
+            ),
+            (
+                "dirty_wal_page_patch_bytes",
+                buffer.dirty_wal_page_patch_bytes,
+            ),
             ("insert_restarts", btree.insert_restarts),
             ("leaf_descent_restarts", btree.leaf_descent_restarts),
             ("leaf_upgrade_restarts", btree.leaf_upgrade_restarts),

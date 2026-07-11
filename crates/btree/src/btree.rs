@@ -501,9 +501,10 @@ impl BTree {
         if exact {
             let old_val_len = leaf.value_at(pos).len();
             if old_val_len == value.len() {
+                let value_range = leaf.resident_frame().sp().value_range(pos);
                 let updated = leaf.update_value_if_same_length(pos, value);
                 debug_assert!(updated, "equal-length update must succeed");
-                leaf.mark_dirty();
+                leaf.mark_dirty_patch(value_range.start, value);
                 return UpsertLeafAction::UpdatedExisting;
             }
 

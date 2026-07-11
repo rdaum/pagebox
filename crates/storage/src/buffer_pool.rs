@@ -437,13 +437,6 @@ fn prepare_page_copy_for_writeback(page: &mut [u8], pool: &BufferPool) {
     BufferFrame::convert_swips_in_buf(head, pool);
 }
 
-fn is_no_steal_page(page: &[u8]) -> bool {
-    matches!(
-        page_header::read_page_type(page),
-        PageType::BeTreeInternal | PageType::BeTreeLeaf
-    )
-}
-
 fn is_stable_index_root(page: &[u8], parent_link: ParentLink) -> bool {
     if !matches!(parent_link, ParentLink::Stable(_)) {
         return false;
@@ -568,6 +561,10 @@ pub struct BufferPool {
     /// Free or reverts to Resident.
     eviction_budget: usize,
     eviction_in_flight: AtomicUsize,
+    /// Page IDs currently owned by dirty-page cleaning batches. Claims avoid
+    /// duplicate writes while allowing concurrent batches to clean disjoint
+    /// pages.
+    dirty_flush_inflight: parking_lot::Mutex<HashSet<PageId>>,
     /// Best-effort reclaim callbacks keyed by owning page ID.
     page_reclaimers: parking_lot::Mutex<HashMap<u64, Arc<dyn PageReclaimer>>>,
     /// Page-image preparation callbacks keyed by common page type.
@@ -790,6 +787,34 @@ struct BufferPoolMetrics {
     dirty_wal_page_image_pages: LabeledCounter<BufferPoolLoadedPageKind>,
     #[cfg_attr(feature = "metrics", help = "Dirty WAL page image relogs by page kind")]
     dirty_wal_page_image_relog_pages: LabeledCounter<BufferPoolLoadedPageKind>,
+    #[cfg_attr(feature = "metrics", help = "Compact dirty WAL page-patch records")]
+    dirty_wal_page_patch_records: Counter,
+    #[cfg_attr(feature = "metrics", help = "Encoded bytes in dirty WAL page patches")]
+    dirty_wal_page_patch_bytes: Counter,
+    #[cfg_attr(feature = "metrics", help = "Dirty writeback batches")]
+    dirty_flush_batches: Counter,
+    #[cfg_attr(feature = "metrics", help = "Pages copied for dirty writeback")]
+    dirty_flush_pages: Counter,
+    #[cfg_attr(
+        feature = "metrics",
+        help = "Nanoseconds spent waiting for WAL durability during dirty writeback"
+    )]
+    dirty_flush_wal_wait_ns: Counter,
+    #[cfg_attr(
+        feature = "metrics",
+        help = "Nanoseconds spent writing dirty pages to the page store"
+    )]
+    dirty_flush_data_write_ns: Counter,
+    #[cfg_attr(
+        feature = "metrics",
+        help = "Dirty pages cleaned at their copied mutation generation"
+    )]
+    dirty_flush_cleaned_pages: Counter,
+    #[cfg_attr(
+        feature = "metrics",
+        help = "Dirty-page copies stale after writeback I/O"
+    )]
+    dirty_flush_stale_pages: Counter,
     #[cfg_attr(
         feature = "metrics",
         help = "Hot frame transition wait latency in nanoseconds"
@@ -833,6 +858,14 @@ impl BufferPoolMetrics {
             fix_swip_sync_load_pages: LabeledCounter::new(shards),
             dirty_wal_page_image_pages: LabeledCounter::new(shards),
             dirty_wal_page_image_relog_pages: LabeledCounter::new(shards),
+            dirty_wal_page_patch_records: Counter::new(shards),
+            dirty_wal_page_patch_bytes: Counter::new(shards),
+            dirty_flush_batches: Counter::new(shards),
+            dirty_flush_pages: Counter::new(shards),
+            dirty_flush_wal_wait_ns: Counter::new(shards),
+            dirty_flush_data_write_ns: Counter::new(shards),
+            dirty_flush_cleaned_pages: Counter::new(shards),
+            dirty_flush_stale_pages: Counter::new(shards),
             hot_frame_transition_wait_latency: Histogram::new(
                 &buffer_pool_latency_bounds_ns(),
                 shards,
@@ -1900,6 +1933,14 @@ impl<'a> ExclusiveFrame<'a> {
         self.pinned.mark_dirty_with_lsn(lsn);
     }
 
+    pub fn mark_dirty_patch(&self, offset: usize, data: &[u8]) {
+        unsafe {
+            self.pinned
+                .pool
+                .mark_dirty_patch_raw(self.raw(), offset, data)
+        };
+    }
+
     pub fn into_pinned(self) -> PinnedFrame<'a> {
         let this = std::mem::ManuallyDrop::new(self);
         let _guard = unsafe { std::ptr::read(&this.guard) };
@@ -2759,6 +2800,7 @@ impl BufferPool {
             eviction_writer_pending: AtomicUsize::new(0),
             eviction_budget: (num_frames / 4).max(1),
             eviction_in_flight: AtomicUsize::new(0),
+            dirty_flush_inflight: parking_lot::Mutex::new(HashSet::new()),
             page_reclaimers: parking_lot::Mutex::new(HashMap::new()),
             page_writeback_preparers: parking_lot::Mutex::new(HashMap::new()),
             pending_reusable_extents: parking_lot::Mutex::new(Vec::new()),
@@ -3803,7 +3845,96 @@ impl BufferPool {
                 };
             }
         }
-        unsafe { (*bf).header.core.dirty.store(true, Ordering::Release) };
+        unsafe {
+            (*bf)
+                .header
+                .core
+                .dirty_generation
+                .fetch_add(1, Ordering::Relaxed);
+            (*bf).header.core.dirty.store(true, Ordering::Release);
+        };
+    }
+
+    /// Mark a page dirty after an in-place byte-range update and log only the
+    /// page LSN plus the changed range. The caller must hold the frame's
+    /// exclusive latch and `data` must already match the page at `offset`.
+    unsafe fn mark_dirty_patch_raw(&self, bf: *mut BufferFrame, offset: usize, data: &[u8]) {
+        #[cfg(not(miri))]
+        let Some(wal) = self.wal.as_ref() else {
+            unsafe { self.mark_dirty_raw(bf) };
+            return;
+        };
+        #[cfg(miri)]
+        {
+            let _ = (offset, data);
+            unsafe { self.mark_dirty_raw(bf) };
+            return;
+        }
+
+        #[cfg(not(miri))]
+        {
+            debug_assert!(
+                unsafe { (*bf).header.core.pin_count.load(Ordering::Relaxed) } > 0,
+                "must be pinned to mark dirty"
+            );
+            assert!(offset >= std::mem::size_of::<Lsn>());
+            let end = offset
+                .checked_add(data.len())
+                .expect("dirty patch range overflow");
+            assert!(end <= PAGE_SIZE, "dirty patch extends beyond page");
+            let page = unsafe { (*bf).page_bytes_mut() };
+            assert_eq!(
+                &page[offset..end],
+                data,
+                "dirty patch bytes must already be installed in the page"
+            );
+
+            self.metrics
+                .eviction_events
+                .inc(BufferPoolEvictionEvent::DirtyMarks);
+            if unsafe { (*bf).header.core.dirty.load(Ordering::Relaxed) } {
+                self.metrics
+                    .eviction_events
+                    .inc(BufferPoolEvictionEvent::DirtyRelogs);
+            }
+            self.mark_referenced(bf);
+
+            let pid = unsafe { (*bf).header.core.pid };
+            let lsn = wal.claim_lsn();
+            let lsn_bytes = lsn.to_le_bytes();
+            let encoded_bytes = if data.is_empty() {
+                wal.append_page_patch_ranges_with_lsn(lsn, pid, &[(0, &lsn_bytes)])
+            } else {
+                wal.append_page_patch_ranges_with_lsn(lsn, pid, &[(0, &lsn_bytes), (offset, data)])
+            }
+            .expect("WAL page-patch append failed")
+            .expect("valid page-local ranges must use patch encoding");
+
+            page_header::write_page_lsn(page, lsn);
+            unsafe {
+                (*bf).header.core.page_lsn.store(lsn, Ordering::Relaxed);
+                (*bf)
+                    .header
+                    .core
+                    .wal_buffer_epoch
+                    .store(0, Ordering::Relaxed);
+                (*bf)
+                    .header
+                    .core
+                    .wal_buffer_offset
+                    .store(0, Ordering::Relaxed);
+                (*bf)
+                    .header
+                    .core
+                    .dirty_generation
+                    .fetch_add(1, Ordering::Relaxed);
+                (*bf).header.core.dirty.store(true, Ordering::Release);
+            }
+            self.metrics.dirty_wal_page_patch_records.inc();
+            self.metrics
+                .dirty_wal_page_patch_bytes
+                .add(encoded_bytes.min(isize::MAX as usize) as isize);
+        }
     }
 
     /// Mark a frame dirty after the caller has appended an equivalent logical
@@ -3845,6 +3976,11 @@ impl BufferPool {
                 .core
                 .wal_buffer_offset
                 .store(0, Ordering::Relaxed);
+            (*bf)
+                .header
+                .core
+                .dirty_generation
+                .fetch_add(1, Ordering::Relaxed);
             (*bf).header.core.dirty.store(true, Ordering::Release);
         }
     }
@@ -3971,10 +4107,7 @@ impl BufferPool {
             }
             let bf = self.raw_frame(idx);
             if self
-                .with_single_evict_candidate(bf, |pid| {
-                    self.writeback_evicting_frame_if_dirty(bf, pid);
-                    self.finish_latched_evicting_frame(bf, pid)
-                })
+                .with_single_evict_candidate(bf, |pid| self.finish_latched_evicting_frame(bf, pid))
                 .is_some()
             {
                 return true;
@@ -4043,6 +4176,9 @@ impl BufferPool {
                 .inc(BufferPoolEvictionEvent::SecondChanceSkips);
             return None;
         }
+        if unsafe { (*bf).header.core.dirty.load(Ordering::Acquire) } {
+            return None;
+        }
 
         // Acquire eviction permit before transitioning to Evicting.
         // This bounds the number of frames simultaneously in Evicting to
@@ -4072,38 +4208,12 @@ impl BufferPool {
         }
 
         let pid = unsafe { (*bf).header.core.pid };
-        if unsafe { (*bf).header.core.dirty.load(Ordering::Relaxed) }
-            && is_no_steal_page(unsafe { (*bf).page_bytes() })
-        {
-            Self::revert_frame_to_resident(bf);
-            return None;
-        }
 
         if page_header::read_page_type(unsafe { (*bf).page_bytes() }) == PageType::Delta {
             self.try_reclaim_before_evict(pid, bf);
         }
 
         Some(f(pid))
-    }
-
-    #[cfg(not(miri))]
-    fn writeback_evicting_frame_if_dirty(&self, bf: *mut BufferFrame, pid: u64) {
-        if !unsafe { (*bf).header.core.dirty.load(Ordering::Relaxed) } {
-            return;
-        }
-
-        if let Some(ref wal) = self.wal {
-            let page_lsn = unsafe { (*bf).header.core.page_lsn.load(Ordering::Relaxed) };
-            if page_lsn > 0 {
-                wal.flush_at_least(page_lsn);
-            }
-        }
-        let mut disk_page = AlignedPageCopy::copy_from(unsafe { (*bf).page_bytes() });
-        prepare_page_copy_for_writeback(disk_page.as_mut_slice(), self);
-        self.page_store
-            .write_page(pid, disk_page.as_slice())
-            .expect("page store write failed");
-        Self::clear_frame_dirty_metadata(bf);
     }
 
     #[cfg(not(miri))]
@@ -4170,47 +4280,39 @@ impl BufferPool {
 
     #[cfg(not(miri))]
     fn try_flush_dirty_batch(&self, max_batch: usize) -> std::io::Result<usize> {
-        use pagebox_hybrid_latch::ExclusiveGuard;
-
         if max_batch == 0 {
             return Ok(0);
         }
 
-        struct DirtyPage {
-            bf: *mut BufferFrame,
+        struct DirtyFlushClaim<'a> {
+            pool: &'a BufferPool,
+            pid: PageId,
+        }
+
+        impl Drop for DirtyFlushClaim<'_> {
+            fn drop(&mut self) {
+                self.pool.dirty_flush_inflight.lock().remove(&self.pid);
+            }
+        }
+
+        struct DirtyPage<'a> {
+            _claim: DirtyFlushClaim<'a>,
+            pinned: PinnedFrame<'a>,
             pid: u64,
             page_lsn: u64,
+            dirty_generation: u64,
             copy_idx: usize,
         }
 
-        impl DirtyPage {
-            fn still_dirty_at_lsn(&self) -> bool {
-                (unsafe { (*self.bf).header.core.state.load(Ordering::Acquire) })
-                    == FrameState::Resident
-                    && unsafe { (*self.bf).header.core.dirty.load(Ordering::Relaxed) }
-                    && (unsafe { (*self.bf).header.core.page_lsn.load(Ordering::Relaxed) })
-                        == self.page_lsn
-            }
-
-            fn clear_dirty(&self) {
-                BufferPool::clear_frame_dirty_metadata(self.bf);
-            }
-        }
-
-        struct DirtyPageCopy {
-            latched: LatchedDirtyPage,
+        struct DirtyPageCopy<'a> {
+            page: DirtyPage<'a>,
             copy: AlignedPageCopy,
         }
 
-        struct LatchedDirtyPage {
-            page: DirtyPage,
-            _guard: ExclusiveGuard<'static>,
-        }
-
-        fn try_copy_dirty_resident_page(
-            pool: &BufferPool,
+        fn try_copy_dirty_resident_page<'a>(
+            pool: &'a BufferPool,
             bf: *mut BufferFrame,
-        ) -> Option<DirtyPageCopy> {
+        ) -> Option<DirtyPageCopy<'a>> {
             if unsafe { (*bf).header.core.state.load(Ordering::Acquire) } != FrameState::Resident {
                 return None;
             }
@@ -4218,34 +4320,38 @@ impl BufferPool {
                 return None;
             }
 
-            let guard = unsafe { (*bf).latch.try_lock_exclusive() }?;
+            let _guard = unsafe { (*bf).latch.try_lock_exclusive() }?;
             if unsafe { (*bf).header.core.state.load(Ordering::Acquire) } != FrameState::Resident
                 || !unsafe { (*bf).header.core.dirty.load(Ordering::Relaxed) }
             {
                 return None;
             }
 
+            let pid = unsafe { (*bf).header.core.pid };
+            if !pool.dirty_flush_inflight.lock().insert(pid) {
+                return None;
+            }
+            let claim = DirtyFlushClaim { pool, pid };
+            unsafe { (*bf).header.core.pin_count.fetch_add(1, Ordering::Relaxed) };
+            let pinned = unsafe { PinnedFrame::new(pool, bf) };
             let page_lsn = unsafe { (*bf).header.core.page_lsn.load(Ordering::Relaxed) };
+            let dirty_generation =
+                unsafe { (*bf).header.core.dirty_generation.load(Ordering::Relaxed) };
             let mut copy = AlignedPageCopy::copy_from(unsafe { (*bf).page_bytes() });
             prepare_page_copy_for_writeback(copy.as_mut_slice(), pool);
 
             let page = DirtyPage {
-                bf,
-                pid: unsafe { (*bf).header.core.pid },
+                _claim: claim,
+                pinned,
+                pid,
                 page_lsn,
+                dirty_generation,
                 copy_idx: 0,
             };
-            // SAFETY: frame latches live for the buffer pool lifetime.
-            let guard = unsafe { extend_exclusive_guard(guard) };
-
-            let latched = LatchedDirtyPage {
-                page,
-                _guard: guard,
-            };
-            Some(DirtyPageCopy { latched, copy })
+            Some(DirtyPageCopy { page, copy })
         }
 
-        let mut dirty_pages: Vec<LatchedDirtyPage> = Vec::with_capacity(max_batch);
+        let mut dirty_pages: Vec<DirtyPage<'_>> = Vec::with_capacity(max_batch);
         let mut copies: Vec<AlignedPageCopy> = Vec::with_capacity(max_batch);
         let mut max_lsn = 0u64;
 
@@ -4263,11 +4369,11 @@ impl BufferPool {
                 continue;
             };
 
-            max_lsn = max_lsn.max(dirty_copy.latched.page.page_lsn);
+            max_lsn = max_lsn.max(dirty_copy.page.page_lsn);
             let copy_idx = copies.len();
-            dirty_copy.latched.page.copy_idx = copy_idx;
+            dirty_copy.page.copy_idx = copy_idx;
             copies.push(dirty_copy.copy);
-            dirty_pages.push(dirty_copy.latched);
+            dirty_pages.push(dirty_copy.page);
             if dirty_pages.len() >= max_batch {
                 break;
             }
@@ -4277,28 +4383,61 @@ impl BufferPool {
             return Ok(0);
         }
 
+        self.metrics.dirty_flush_batches.inc();
+        self.metrics.dirty_flush_pages.add(
+            dirty_pages
+                .len()
+                .min(isize::MAX as usize)
+                .try_into()
+                .unwrap_or(isize::MAX),
+        );
+
         #[cfg(not(miri))]
         if max_lsn > 0
             && let Some(ref wal) = self.wal
         {
+            let started = Instant::now();
             wal.flush_at_least(max_lsn);
+            self.metrics
+                .dirty_flush_wal_wait_ns
+                .add(saturating_duration_nanos(started.elapsed()).min(isize::MAX as u64) as isize);
         }
 
         let pages = dirty_pages
             .iter()
-            .map(|latched| (latched.page.pid, copies[latched.page.copy_idx].as_slice()))
+            .map(|page| (page.pid, copies[page.copy_idx].as_slice()))
             .collect::<Vec<_>>();
         // WAL is durable through max_lsn before these data-file writes. This
         // cleaning pass only needs pages to be readable for a subsequent
         // eviction fault; checkpoint/flush owns the data-file sync boundary.
+        let write_started = Instant::now();
         self.page_store.write_pages(&pages)?;
+        self.metrics.dirty_flush_data_write_ns.add(
+            saturating_duration_nanos(write_started.elapsed()).min(isize::MAX as u64) as isize,
+        );
 
-        for latched in &dirty_pages {
-            if !latched.page.still_dirty_at_lsn() {
-                continue;
+        let mut cleaned = 0usize;
+        for page in &dirty_pages {
+            let bf = page.pinned.raw();
+            let _guard = unsafe { (*bf).latch.lock_exclusive() };
+            let unchanged_since_copy = unsafe { (*bf).header.core.state.load(Ordering::Acquire) }
+                == FrameState::Resident
+                && unsafe { (*bf).header.core.pid } == page.pid
+                && unsafe { (*bf).header.core.dirty.load(Ordering::Relaxed) }
+                && unsafe { (*bf).header.core.dirty_generation.load(Ordering::Relaxed) }
+                    == page.dirty_generation;
+            if unchanged_since_copy {
+                Self::clear_frame_dirty_metadata(bf);
+                cleaned += 1;
             }
-            latched.page.clear_dirty();
         }
+        let stale = dirty_pages.len() - cleaned;
+        self.metrics
+            .dirty_flush_cleaned_pages
+            .add(cleaned.min(isize::MAX as usize) as isize);
+        self.metrics
+            .dirty_flush_stale_pages
+            .add(stale.min(isize::MAX as usize) as isize);
 
         Ok(dirty_pages.len())
     }
@@ -4315,8 +4454,10 @@ impl BufferPool {
     }
 
     /// Batch eviction: scan frames sequentially from a clock-hand position,
-    /// collect up to `max_batch` evictable candidates, batch-write dirty
-    /// pages, unswizzle parents, and release resident-budget tokens.
+    /// collect up to `max_batch` clean candidates, unswizzle their parents,
+    /// and release resident-budget tokens. Dirty pages remain Resident and
+    /// are cleaned separately by `try_flush_dirty_batch` so page-store I/O
+    /// never strands readers behind an Evicting frame.
     /// Returns the number of slots successfully evicted.
     #[cfg(not(miri))]
     pub fn try_evict_batch(&self, max_batch: usize) -> usize {
@@ -4332,14 +4473,10 @@ impl BufferPool {
             .fetch_add(max_batch * 2, Ordering::Relaxed)
             % num_slots;
 
-        // Phase 1: Scan and collect candidates.
-        // Each candidate holds an exclusive latch to prevent concurrent
-        // pins during the batch write.
+        // Scan and collect clean candidates under their exclusive latches.
         struct Candidate {
             bf: *mut BufferFrame,
             pid: u64,
-            page_lsn: u64,
-            dirty_buf_idx: Option<usize>,
         }
 
         struct LatchedCandidate {
@@ -4371,16 +4508,12 @@ impl BufferPool {
             fn release(self) -> Candidate {
                 self.candidate
             }
-
-            fn revert(self) {
-                BufferPool::revert_frame_to_resident(self.candidate.bf);
-            }
         }
 
         fn try_select_evict_candidate(
             pool: &BufferPool,
             bf: *mut BufferFrame,
-        ) -> Option<(LatchedCandidate, bool)> {
+        ) -> Option<LatchedCandidate> {
             if unsafe { (*bf).header.core.state.load(Ordering::Relaxed) } != FrameState::Resident {
                 return None;
             }
@@ -4402,8 +4535,7 @@ impl BufferPool {
                 return None;
             }
 
-            let is_dirty = unsafe { (*bf).header.core.dirty.load(Ordering::Relaxed) };
-            if is_dirty && is_no_steal_page(unsafe { (*bf).page_bytes() }) {
+            if unsafe { (*bf).header.core.dirty.load(Ordering::Acquire) } {
                 return None;
             }
 
@@ -4425,22 +4557,8 @@ impl BufferPool {
             if page_header::read_page_type(unsafe { (*bf).page_bytes() }) == PageType::Delta {
                 pool.try_reclaim_before_evict(pid, bf);
             }
-            let page_lsn = if is_dirty {
-                unsafe { (*bf).header.core.page_lsn.load(Ordering::Relaxed) }
-            } else {
-                0
-            };
-
-            let candidate = Candidate {
-                bf,
-                pid,
-                page_lsn,
-                dirty_buf_idx: None,
-            };
-            Some((
-                unsafe { LatchedCandidate::new(candidate, guard, permit) },
-                is_dirty,
-            ))
+            let candidate = Candidate { bf, pid };
+            Some(unsafe { LatchedCandidate::new(candidate, guard, permit) })
         }
 
         fn try_finalize_evicting_candidate(pool: &BufferPool, candidate: &Candidate) -> bool {
@@ -4455,10 +4573,6 @@ impl BufferPool {
                 return false;
             }
 
-            let dirty_changed =
-                unsafe { (*candidate.bf).header.core.dirty.load(Ordering::Relaxed) }
-                    && unsafe { (*candidate.bf).header.core.page_lsn.load(Ordering::Relaxed) }
-                        != candidate.page_lsn;
             if unsafe {
                 (*candidate.bf)
                     .header
@@ -4466,28 +4580,19 @@ impl BufferPool {
                     .pin_count
                     .load(Ordering::Acquire)
             } != 0
-                || dirty_changed
+                || unsafe { (*candidate.bf).header.core.dirty.load(Ordering::Acquire) }
             {
                 BufferPool::revert_frame_to_resident(candidate.bf);
                 return false;
             }
 
-            if candidate.dirty_buf_idx.is_some()
-                && unsafe { (*candidate.bf).header.core.dirty.load(Ordering::Relaxed) }
-            {
-                BufferPool::clear_frame_dirty_metadata(candidate.bf);
-            }
-
             pool.unswizzle_and_free(candidate.bf, candidate.pid)
         }
 
-        let mut clean_pending: Vec<LatchedCandidate> = Vec::with_capacity(max_batch);
-        let mut dirty_pending: Vec<LatchedCandidate> = Vec::with_capacity(max_batch);
         let mut candidates: Vec<Candidate> = Vec::with_capacity(max_batch);
-        let mut dirty_bufs: Vec<AlignedPageCopy> = Vec::new();
 
         for i in 0..num_slots {
-            if clean_pending.len() >= max_batch {
+            if candidates.len() >= max_batch {
                 break;
             }
             let idx = (start + i) % num_slots;
@@ -4495,83 +4600,16 @@ impl BufferPool {
                 continue;
             }
             let bf = self.raw_frame(idx);
-            let Some((latched, is_dirty)) = try_select_evict_candidate(self, bf) else {
+            let Some(latched) = try_select_evict_candidate(self, bf) else {
                 continue;
             };
-
-            if is_dirty {
-                if dirty_pending.len() < max_batch {
-                    dirty_pending.push(latched);
-                } else {
-                    latched.revert();
-                }
-            } else {
-                clean_pending.push(latched);
-            }
-        }
-
-        let dirty_needed = max_batch.saturating_sub(clean_pending.len());
-        let chosen_dirty = dirty_pending.len().min(dirty_needed);
-        dirty_pending.sort_by_key(|latched| latched.candidate.page_lsn);
-
-        for latched in clean_pending {
             candidates.push(latched.release());
-        }
-
-        let mut max_lsn: u64 = 0;
-        for mut latched in dirty_pending.drain(..chosen_dirty) {
-            let candidate = &mut latched.candidate;
-            if candidate.page_lsn > max_lsn {
-                max_lsn = candidate.page_lsn;
-            }
-            let mut page_copy = AlignedPageCopy::copy_from(unsafe { (*candidate.bf).page_bytes() });
-            prepare_page_copy_for_writeback(page_copy.as_mut_slice(), self);
-            let idx = dirty_bufs.len();
-            dirty_bufs.push(page_copy);
-            candidate.dirty_buf_idx = Some(idx);
-            candidates.push(latched.release());
-        }
-
-        for latched in dirty_pending {
-            latched.revert();
         }
 
         if candidates.is_empty() {
             return 0;
         }
 
-        // Do not hold candidate latches while batch writeback runs.
-        // Clean pages need no phase-2 I/O, and dirty pages already have
-        // stable page copies in `dirty_bufs`. Holding the exclusive
-        // latches through WAL flush and disk write strands fix_orphan/fix
-        // on hot pages behind the page-provider.
-        // Phase 2: Batch WAL flush + disk write for dirty pages.
-        //
-        // WAL already provides durability. Eviction only needs the data
-        // file to be readable when the page is faulted back in, so avoid
-        // forcing an fsync here; checkpoint remains the durable data-file
-        // boundary.
-        #[cfg(not(miri))]
-        if max_lsn > 0
-            && let Some(ref wal) = self.wal
-        {
-            wal.flush_at_least(max_lsn);
-        }
-
-        if !dirty_bufs.is_empty() {
-            let write_list: Vec<(u64, &[u8])> = candidates
-                .iter()
-                .filter_map(|c| {
-                    c.dirty_buf_idx
-                        .map(|idx| (c.pid, dirty_bufs[idx].as_slice()))
-                })
-                .collect();
-            self.page_store
-                .write_pages(&write_list)
-                .expect("batch page write failed");
-        }
-
-        // Phase 3: unswizzle parents and release resident-budget tokens.
         let mut evicted = 0usize;
         for c in &candidates {
             if try_finalize_evicting_candidate(self, c) {
@@ -5081,6 +5119,15 @@ impl BufferPool {
             resident_budget_available: self.resident_base_pages_available.load(Ordering::Relaxed)
                 as u64,
             eviction_in_flight: self.eviction_in_flight.load(Ordering::Relaxed) as u64,
+            dirty_flush_batches: self.metrics.dirty_flush_batches.sum().max(0) as u64,
+            dirty_flush_pages: self.metrics.dirty_flush_pages.sum().max(0) as u64,
+            dirty_flush_wal_wait_ns: self.metrics.dirty_flush_wal_wait_ns.sum().max(0) as u64,
+            dirty_flush_data_write_ns: self.metrics.dirty_flush_data_write_ns.sum().max(0) as u64,
+            dirty_flush_cleaned_pages: self.metrics.dirty_flush_cleaned_pages.sum().max(0) as u64,
+            dirty_flush_stale_pages: self.metrics.dirty_flush_stale_pages.sum().max(0) as u64,
+            dirty_wal_page_patch_records: self.metrics.dirty_wal_page_patch_records.sum().max(0)
+                as u64,
+            dirty_wal_page_patch_bytes: self.metrics.dirty_wal_page_patch_bytes.sum().max(0) as u64,
         }
     }
 
@@ -5226,6 +5273,14 @@ pub struct BufferPoolDiagnosticStats {
     pub free_list_frames: u64,
     pub resident_budget_available: u64,
     pub eviction_in_flight: u64,
+    pub dirty_flush_batches: u64,
+    pub dirty_flush_pages: u64,
+    pub dirty_flush_wal_wait_ns: u64,
+    pub dirty_flush_data_write_ns: u64,
+    pub dirty_flush_cleaned_pages: u64,
+    pub dirty_flush_stale_pages: u64,
+    pub dirty_wal_page_patch_records: u64,
+    pub dirty_wal_page_patch_bytes: u64,
 }
 
 fn buffer_pool_latency_bounds_ns() -> [u64; 13] {
@@ -5269,6 +5324,63 @@ mod tests {
     use super::*;
 
     use crate::buffer_frame::physical_page_number;
+
+    #[cfg(not(miri))]
+    struct BlockingPageStore {
+        inner: InMemoryPageStore,
+        write_started: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        release: (std::sync::Mutex<bool>, std::sync::Condvar),
+    }
+
+    #[cfg(not(miri))]
+    impl BlockingPageStore {
+        fn new(write_started: std::sync::mpsc::Sender<()>) -> Self {
+            Self {
+                inner: InMemoryPageStore::new(),
+                write_started: std::sync::Mutex::new(Some(write_started)),
+                release: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+            }
+        }
+
+        fn release_write(&self) {
+            *self.release.0.lock().unwrap() = true;
+            self.release.1.notify_all();
+        }
+    }
+
+    #[cfg(not(miri))]
+    impl PageStore for BlockingPageStore {
+        fn read_page(&self, pid: PageId, buf: &mut [u8]) -> std::io::Result<bool> {
+            self.inner.read_page(pid, buf)
+        }
+
+        fn write_page(&self, pid: PageId, data: &[u8]) -> std::io::Result<()> {
+            if let Some(started) = self.write_started.lock().unwrap().take() {
+                started.send(()).unwrap();
+                let mut released = self.release.0.lock().unwrap();
+                while !*released {
+                    released = self.release.1.wait(released).unwrap();
+                }
+            }
+            self.inner.write_page(pid, data)
+        }
+
+        fn allocate(&self, pid: PageId) -> std::io::Result<()> {
+            self.inner.allocate(pid)
+        }
+
+        fn sync(&self) -> std::io::Result<()> {
+            self.inner.sync()
+        }
+
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        fn next_page_id(&self) -> PageId {
+            self.inner.next_page_id()
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Single-threaded tests (verify &self API)
@@ -5534,9 +5646,11 @@ mod tests {
         }
 
         assert!(
-            pool.try_evict_one(),
-            "page should evict as one frame-sized unit"
+            !pool.try_evict_one(),
+            "dirty pages must be cleaned before eviction"
         );
+        assert_eq!(pool.try_flush_dirty_batch(1).unwrap(), 1);
+        assert!(pool.try_evict_one(), "clean page should be evictable");
         assert_eq!(
             pool.approx_available_budget(),
             1,
@@ -5582,9 +5696,11 @@ mod tests {
         }
 
         assert!(
-            pool.try_evict_one(),
-            "logically logged page should remain evictable"
+            !pool.try_evict_one(),
+            "logically logged dirty pages must be cleaned before eviction"
         );
+        assert_eq!(pool.try_flush_dirty_batch(1).unwrap(), 1);
+        assert!(pool.try_evict_one(), "clean page should be evictable");
         let bf = unsafe { pool.fix_orphan_frame(pid, NoLatches::new(&pool)) };
         let page = bf.page_bytes();
         assert_eq!(page[64], 17, "page payload should survive reload");
@@ -5692,6 +5808,84 @@ mod tests {
         let page = bf.page_bytes();
         assert_eq!(page[64], 44, "flushed B-e page should reload");
         assert_eq!(page_header::read_page_lsn(page), 88);
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn dirty_flush_releases_page_latch_during_store_io() {
+        let (write_started_tx, write_started_rx) = std::sync::mpsc::channel();
+        let store = Arc::new(BlockingPageStore::new(write_started_tx));
+        let pool = Arc::new(BufferPool::with_store(1, Box::new(store.clone())));
+        let swip = Arc::new(pool.allocate_page());
+
+        let raw = {
+            let mut frame = unsafe { pool.fix_frame(&swip, NoLatches::new(&pool)) }.exclusive();
+            frame.page_bytes_mut()[64] = 1;
+            frame.mark_dirty_with_lsn(1);
+            frame.frame_ref().as_ptr()
+        };
+
+        let flush_pool = pool.clone();
+        let flush = std::thread::spawn(move || flush_pool.try_flush_dirty_batch(1).unwrap());
+        write_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("dirty flush must reach page-store I/O");
+        assert_eq!(
+            pool.try_flush_dirty_batch(1).unwrap(),
+            0,
+            "a concurrent caller must not duplicate an in-flight cleaning batch"
+        );
+
+        let (writer_done_tx, writer_done_rx) = std::sync::mpsc::channel();
+        let writer_pool = pool.clone();
+        let writer_swip = swip.clone();
+        let writer = std::thread::spawn(move || {
+            let mut frame =
+                unsafe { writer_pool.fix_frame(&writer_swip, NoLatches::new(&writer_pool)) }
+                    .exclusive();
+            frame.page_bytes_mut()[64] = 2;
+            frame.mark_dirty_with_lsn(2);
+            writer_done_tx.send(()).unwrap();
+        });
+
+        let writer_completed_during_io =
+            writer_done_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        store.release_write();
+        writer.join().unwrap();
+        assert_eq!(flush.join().unwrap(), 1);
+        assert!(
+            writer_completed_during_io,
+            "page-store I/O must not retain the dirty page's exclusive latch"
+        );
+        assert!(
+            unsafe { (*raw).header.core.dirty.load(Ordering::Acquire) },
+            "a page modified after its copy was taken must remain dirty"
+        );
+        assert_eq!(
+            unsafe { (*raw).header.core.page_lsn.load(Ordering::Acquire) },
+            2,
+            "cleaning an older copy must preserve the newer page LSN"
+        );
+
+        assert_eq!(pool.try_flush_dirty_batch(1).unwrap(), 1);
+        unsafe {
+            (*raw)
+                .header
+                .core
+                .referenced
+                .store(false, Ordering::Relaxed);
+        }
+        assert!(pool.try_evict_one());
+        let frame = unsafe { pool.fix_orphan_frame(1, NoLatches::new(&pool)) };
+        assert_eq!(frame.page_bytes()[64], 2);
+        assert_eq!(page_header::read_page_lsn(frame.page_bytes()), 2);
+
+        let diagnostics = pool.diagnostic_stats();
+        assert_eq!(diagnostics.dirty_flush_batches, 2);
+        assert_eq!(diagnostics.dirty_flush_pages, 2);
+        assert_eq!(diagnostics.dirty_flush_cleaned_pages, 1);
+        assert_eq!(diagnostics.dirty_flush_stale_pages, 1);
+        assert!(diagnostics.dirty_flush_data_write_ns > 0);
     }
 
     #[test]
