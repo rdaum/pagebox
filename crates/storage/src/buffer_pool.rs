@@ -515,6 +515,7 @@ struct PoolState {
     slot_init: Box<[AtomicU8]>,
     free_list: FreeList,
     eviction_hand: AtomicUsize,
+    dirty_flush_hand: AtomicUsize,
 }
 
 // ---------------------------------------------------------------------------
@@ -1692,6 +1693,7 @@ impl PoolState {
             slot_init,
             free_list: FreeList::new(slot_capacity),
             eviction_hand: AtomicUsize::new(0),
+            dirty_flush_hand: AtomicUsize::new(0),
         }
     }
 }
@@ -4731,15 +4733,22 @@ impl BufferPool {
         let mut max_lsn = 0u64;
 
         let num_slots = self.allocated_slots();
-        for i in 0..num_slots {
+        if num_slots == 0 {
+            return Ok(0);
+        }
+        let start = self.state.dirty_flush_hand.fetch_add(1, Ordering::Relaxed) % num_slots;
+        let mut scanned = 0usize;
+        for offset in 0..num_slots {
             if dirty_pages.len() >= max_batch {
                 break;
             }
-            if !self.is_slot_initialized(i) {
+            scanned = offset + 1;
+            let idx = (start + offset) % num_slots;
+            if !self.is_slot_initialized(idx) {
                 continue;
             }
 
-            let bf = self.raw_frame(i);
+            let bf = self.raw_frame(idx);
             let Some(mut dirty_copy) = try_copy_dirty_resident_page(self, bf) else {
                 continue;
             };
@@ -4753,6 +4762,14 @@ impl BufferPool {
                 break;
             }
         }
+        // The initial fetch_add reserves the first slot. Advance by the rest
+        // of this scan so a stale/hot batch cannot be selected again from the
+        // same arena prefix. Concurrent flushers may over-advance, but their
+        // in-flight claims already prevent duplicate selection and the cursor
+        // remains fair modulo the arena length.
+        self.state
+            .dirty_flush_hand
+            .fetch_add(scanned.saturating_sub(1), Ordering::Relaxed);
 
         if dirty_pages.is_empty() {
             return Ok(0);
@@ -6699,6 +6716,54 @@ mod tests {
         assert_eq!(diagnostics.dirty_flush_cleaned_pages, 1);
         assert_eq!(diagnostics.dirty_flush_stale_pages, 1);
         assert!(diagnostics.dirty_flush_data_write_ns > 0);
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn dirty_flush_cursor_rotates_past_redirtied_early_frame() {
+        let pool = BufferPool::new(3);
+        let edges = (0..3).map(|_| pool.allocate_page()).collect::<Vec<_>>();
+        let mut frames = Vec::with_capacity(edges.len());
+        for (value, edge) in edges.iter().enumerate() {
+            let mut frame = pool
+                .fix_stable(edge, unsafe { NoLatches::new(&pool) })
+                .exclusive();
+            frame.page_mut()[0] = value as u8;
+            frame.mark_dirty();
+            frames.push(unsafe { frame.frame_ref() }.as_ptr());
+        }
+
+        assert_eq!(pool.try_flush_dirty_batch(1).unwrap(), 1);
+        let first_cleaned = frames
+            .iter()
+            .position(|&frame| !unsafe { (*frame).header.core.dirty.load(Ordering::Acquire) })
+            .expect("one frame must be cleaned by the first batch");
+        {
+            let mut frame = pool
+                .fix_stable(&edges[first_cleaned], unsafe { NoLatches::new(&pool) })
+                .exclusive();
+            frame.page_mut()[1] = 1;
+            frame.mark_dirty();
+        }
+
+        assert_eq!(pool.try_flush_dirty_batch(1).unwrap(), 1);
+        assert!(
+            unsafe {
+                (*frames[first_cleaned])
+                    .header
+                    .core
+                    .dirty
+                    .load(Ordering::Acquire)
+            },
+            "the second batch must rotate instead of immediately reselecting the redirtied frame"
+        );
+        assert!(
+            frames.iter().enumerate().any(|(idx, &frame)| {
+                idx != first_cleaned
+                    && !unsafe { (*frame).header.core.dirty.load(Ordering::Acquire) }
+            }),
+            "the second batch must make a different dirty frame clean"
+        );
     }
 
     #[test]
