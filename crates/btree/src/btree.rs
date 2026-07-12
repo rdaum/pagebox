@@ -23,7 +23,6 @@ use pagebox_swip_kernel::SwipWord as Swip;
 
 const WRITE_FIXED_ROOT_THRESHOLD: u32 = 4;
 const WRITE_BLOCKING_FALLBACK_THRESHOLD: u32 = 16;
-const SPLIT_RESERVATION_STRIPES: usize = 64;
 
 mod node;
 mod parent_edge;
@@ -71,7 +70,11 @@ pub struct BTree {
     reachable_pages: std::sync::atomic::AtomicU64,
     reachable_pages_known: bool,
     stats: BTreeStats,
-    split_reservations: [Mutex<()>; SPLIT_RESERVATION_STRIPES],
+    /// Serializes structural splits and merges. A leaf can be reached through
+    /// a B-link before its parent separator is installed, so per-leaf locking
+    /// cannot prevent a concurrent split from trying to publish that
+    /// temporarily unparented sibling.
+    structural_lock: Mutex<()>,
     eviction_unswizzle_nodes_visited: std::sync::atomic::AtomicU64,
     /// Data structure ID for the DTRegistry parent-finder callback.
     dt_id: u16,
@@ -385,7 +388,7 @@ impl BTree {
                     .map(|n| n.get())
                     .unwrap_or(1),
             ),
-            split_reservations: std::array::from_fn(|_| Mutex::new(())),
+            structural_lock: Mutex::new(()),
             eviction_unswizzle_nodes_visited: std::sync::atomic::AtomicU64::new(0),
             dt_id,
         }
@@ -426,7 +429,7 @@ impl BTree {
                     .map(|n| n.get())
                     .unwrap_or(1),
             ),
-            split_reservations: std::array::from_fn(|_| Mutex::new(())),
+            structural_lock: Mutex::new(()),
             eviction_unswizzle_nodes_visited: std::sync::atomic::AtomicU64::new(0),
             dt_id,
         }
@@ -2720,16 +2723,13 @@ impl BTree {
                     }
                 }
             };
-            let (split_pid, protected_leaf) = match self.try_upsert_leaf(&mut leaf, key, value) {
+            let protected_leaf = match self.try_upsert_leaf(&mut leaf, key, value) {
                 UpsertLeafAction::UpdatedExisting => return false,
                 UpsertLeafAction::Inserted => return true,
-                UpsertLeafAction::SplitRequired => {
-                    (leaf.resident_frame().pid(), leaf.into_frame().into_pinned())
-                }
+                UpsertLeafAction::SplitRequired => leaf.into_frame().into_pinned(),
             };
 
-            let _split_reservation =
-                self.split_reservations[split_pid as usize % SPLIT_RESERVATION_STRIPES].lock();
+            let _structural_guard = self.structural_lock.lock();
             let mut leaf = ExclusiveNode::from_leaf_frame(protected_leaf.exclusive());
             if leaf.resident_frame().should_chase_right(key) {
                 attempts += 1;
@@ -2837,16 +2837,13 @@ impl BTree {
                     }
                 }
             };
-            let (split_pid, protected_leaf) = match self.try_insert_leaf(&mut leaf, key, value) {
+            let protected_leaf = match self.try_insert_leaf(&mut leaf, key, value) {
                 InsertLeafAction::ReturnFalse => return false,
                 InsertLeafAction::Inserted => return true,
-                InsertLeafAction::SplitRequired => {
-                    (leaf.resident_frame().pid(), leaf.into_frame().into_pinned())
-                }
+                InsertLeafAction::SplitRequired => leaf.into_frame().into_pinned(),
             };
 
-            let _split_reservation =
-                self.split_reservations[split_pid as usize % SPLIT_RESERVATION_STRIPES].lock();
+            let _structural_guard = self.structural_lock.lock();
             let mut leaf = ExclusiveNode::from_leaf_frame(protected_leaf.exclusive());
             if leaf.resident_frame().should_chase_right(key) {
                 attempts += 1;
@@ -3306,6 +3303,7 @@ impl BTree {
             };
 
             let leaf = leaf.into_pinned();
+            let _structural_guard = should_merge.then(|| self.structural_lock.lock());
 
             unsafe {
                 self.rebalance_delete_path(
@@ -4636,7 +4634,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_split_retries_retire_unused_preallocations() {
+    fn concurrent_split_retries_preserve_reachability() {
         const KEYS: u64 = 8_192;
         const THREADS: usize = 4;
 
@@ -4669,6 +4667,15 @@ mod tests {
             .collect();
         for handle in handles {
             handle.join().unwrap();
+        }
+
+        let expected_value = [0x5a; PRESSURE_VALUE_SIZE];
+        for key in 0..KEYS {
+            assert_eq!(
+                tree.lookup(&key.to_be_bytes()).as_deref(),
+                Some(&expected_value[..]),
+                "concurrent split publication lost key {key}"
+            );
         }
 
         assert!(

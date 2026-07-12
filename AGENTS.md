@@ -147,7 +147,8 @@ WAL runtime configuration (environment variables, read in `pagebox-wal`):
 - `PAGEBOX_WAL_DIRECT_IO=1`: open WAL segments with `O_DIRECT` and aligned writes (Linux-gated).
 - `PAGEBOX_WAL_SYNC_BACKEND=fdatasync|pwritev2_dsync|io_uring`: select the durable-sync backend (`io_uring` is
   Linux-only).
-- `PAGEBOX_WAL_SHARDS=N`: select WAL shards for the synchronous backends; `io_uring` currently forces one shard.
+- `PAGEBOX_WAL_SHARDS=N`: select WAL shards for the synchronous backends; the default is one because page-image
+  overwrite coalescing is shard-local. `io_uring` currently forces one shard.
 - `PAGEBOX_WAL_GROUP_COMMIT_DELAY_MAX_US`, `PAGEBOX_WAL_GROUP_COMMIT_TARGET_RECORDS`: group-commit batching knobs.
 
 Tests, runs, and benchmarks:

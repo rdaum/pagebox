@@ -13,6 +13,7 @@ use crate::format::{
     WAL_RECORD_SIZE, batch_meta_count, finalize_batch_meta, init_batch_meta, page_crc,
     set_batch_meta_count, write_batch_entry,
 };
+use crate::wal_impl::configured_wal_shard_count;
 use crate::{CommitMode, RecoveryPageStore, Wal, WalReplayRecord};
 
 const TEST_PAGE_LSN_OFF: usize = 8;
@@ -130,6 +131,23 @@ impl Drop for Cleanup {
             let _ = std::fs::remove_file(PathBuf::from(shard));
         }
     }
+}
+
+#[test]
+fn wal_shard_configuration_defaults_to_one_and_clamps_overrides() {
+    assert_eq!(
+        configured_wal_shard_count(None),
+        1,
+        "physical WAL should default to one shard so page-image overwrites remain coalescible"
+    );
+    assert_eq!(configured_wal_shard_count(Some("4")), 4);
+    assert_eq!(configured_wal_shard_count(Some("0")), 1);
+    assert_eq!(configured_wal_shard_count(Some("999")), 256);
+    assert_eq!(
+        configured_wal_shard_count(Some("not-a-number")),
+        1,
+        "invalid overrides should retain the safe default"
+    );
 }
 
 #[test]

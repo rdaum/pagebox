@@ -1010,18 +1010,17 @@ fn align_lsn_to_shard(lsn: Lsn, shard_idx: usize, shard_count: usize) -> Lsn {
 }
 
 fn wal_shard_count() -> usize {
-    std::env::var("PAGEBOX_WAL_SHARDS")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or_else(|| {
-            if cfg!(test) {
-                1
-            } else {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1)
-            }
-        })
+    configured_wal_shard_count(std::env::var("PAGEBOX_WAL_SHARDS").ok().as_deref())
+}
+
+pub(crate) fn configured_wal_shard_count(raw: Option<&str>) -> usize {
+    // Page-image overwrite handles are shard-local. Assigning shards by
+    // appending thread therefore fragments repeated images of a shared page
+    // across shards and can increase physical WAL volume enough to overwhelm
+    // durability and dirty-page writeback. Keep the safe physical-WAL default
+    // single-shard until page images have stable page-based shard ownership.
+    raw.and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1)
         .clamp(1, 256)
 }
 
