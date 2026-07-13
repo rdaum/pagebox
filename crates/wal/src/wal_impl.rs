@@ -135,6 +135,8 @@ pub enum WalEvent {
     FlushWait,
     /// Background writer completed one `pwrite` syscall.
     WriteCall,
+    /// The writer waited because the backend's submitted-write window was full.
+    WriteBackpressure,
     /// Background writer bytes written (sum across `WriteCall`s).
     WriteBytes,
     /// Background syncer invoked a sync syscall.
@@ -479,12 +481,16 @@ fn should_submit_sync(
     pending_sync && (!sync_in_flight || written_lsn > sync_target)
 }
 
+fn can_submit_write(writes_in_progress: usize, max_in_flight_writes: usize) -> bool {
+    writes_in_progress < max_in_flight_writes
+}
+
 #[cfg(test)]
 mod submitted_writes_tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use super::{SubmittedWrites, Wal, should_submit_sync};
+    use super::{SubmittedWrites, Wal, can_submit_write, should_submit_sync};
 
     #[test]
     fn written_progress_waits_for_the_submitted_extent_prefix() {
@@ -504,6 +510,14 @@ mod submitted_writes_tests {
         assert!(should_submit_sync(true, true, 20, 10));
         assert!(!should_submit_sync(true, true, 10, 10));
         assert!(!should_submit_sync(false, false, 10, 0));
+    }
+
+    #[test]
+    fn write_submission_window_stops_at_the_backend_limit() {
+        assert!(can_submit_write(0, 32));
+        assert!(can_submit_write(31, 32));
+        assert!(!can_submit_write(32, 32));
+        assert!(!can_submit_write(33, 32));
     }
 
     #[test]
@@ -2084,6 +2098,15 @@ impl Wal {
         self.max_lsn(|inner| inner.durable_lsn.load(Ordering::Acquire))
     }
 
+    /// Return whether the shard owning `lsn` has made that record durable.
+    ///
+    /// Unlike [`Wal::durable_lsn`], this remains meaningful when LSNs are
+    /// distributed across multiple shards: a high durable LSN on one shard
+    /// does not imply that an earlier LSN owned by another shard is durable.
+    pub fn is_lsn_durable(&self, lsn: Lsn) -> bool {
+        lsn == 0 || self.inner_for_lsn(lsn).durable_lsn.load(Ordering::Acquire) >= lsn
+    }
+
     fn max_lsn(&self, load: impl Fn(&WalInner) -> Lsn) -> Lsn {
         let mut max_lsn = 0;
         self.for_each_inner_with_index(|_, inner| {
@@ -2628,10 +2651,19 @@ impl WalInner {
                 let written = self.written_lsn.load(Ordering::Acquire);
                 let requested_write = self.requested_write_lsn.load(Ordering::Acquire);
 
-                let pending_write = !state.pending_writes.is_empty()
+                let write_ready = !state.pending_writes.is_empty()
                     || requested_write > written
                     || (relaxed_mode && self.should_write_relaxed(&state, last_write))
                     || (state.shutdown && state.active.used > 0);
+                let write_submission_available = can_submit_write(
+                    state.writes_in_progress,
+                    self.backend.max_in_flight_writes(),
+                );
+                if write_ready && !write_submission_available {
+                    self.stats.events.inc(WalEvent::WriteBackpressure);
+                }
+
+                let pending_write = write_ready && write_submission_available;
 
                 if state.crash_shutdown {
                     return;
@@ -2735,10 +2767,13 @@ impl WalInner {
 
             let requested_write = self.requested_write_lsn.load(Ordering::Acquire);
             let written = self.written_lsn.load(Ordering::Acquire);
-            let should_write = requested_write > written
+            let should_write = can_submit_write(
+                state.writes_in_progress,
+                self.backend.max_in_flight_writes(),
+            ) && (requested_write > written
                 || !state.pending_writes.is_empty()
                 || (relaxed_mode && self.should_write_relaxed(&state, last_write))
-                || (state.shutdown && state.active.used > 0);
+                || (state.shutdown && state.active.used > 0));
             if should_write
                 && state.pending_writes.is_empty()
                 && state.active.used > 0

@@ -630,6 +630,11 @@ use crate::wal_impl::{WalEvent, WalInner, WalStats, finalize_buffer_records};
 use pagebox_frame_kernel::Lsn;
 use pagebox_threading as threading;
 
+/// Keep drained fsync barriers from sitting behind the entire SQ ring worth
+/// of WAL writes. Pending buffers remain in userspace until completions make
+/// room, which also bounds the kernel-owned write working set.
+const MAX_IN_FLIGHT_WRITES: usize = 32;
+
 /// Shared ring state: one io_uring ring + slab + fd→WalInner registry.
 ///
 /// All shards in a multi-shard WAL share one `IoUringShared` so that only one
@@ -1049,6 +1054,10 @@ impl WalIoBackend for IoUringBackend {
     fn has_in_flight(&self) -> bool {
         self.shared.in_flight.lock().iter().any(|s| s.is_some())
             || self.shared.sync_barrier.lock().in_flight.is_some()
+    }
+
+    fn max_in_flight_writes(&self) -> usize {
+        MAX_IN_FLIGHT_WRITES
     }
 
     fn needs_syncer_thread(&self) -> bool {

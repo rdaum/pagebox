@@ -360,6 +360,21 @@ fn concurrent_strict_flushes_advance_durable_lsn() {
 }
 
 #[test]
+fn lsn_durability_check_tracks_flushed_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal = Wal::open_with_shards_for_test(&dir.path().join("wal"), 2).unwrap();
+    let first = wal.append_logical(1, b"first").unwrap();
+    let second = wal.append_logical(1, b"second").unwrap();
+
+    assert!(!wal.is_lsn_durable(first));
+    assert!(!wal.is_lsn_durable(second));
+    wal.flush_at_least(first);
+    assert!(wal.is_lsn_durable(first));
+    wal.flush_at_least(second);
+    assert!(wal.is_lsn_durable(second));
+}
+
+#[test]
 fn replay_in_order() {
     let path = tmp_path("replay");
     let _cleanup = Cleanup(path.clone());

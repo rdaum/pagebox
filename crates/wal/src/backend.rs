@@ -148,6 +148,12 @@ pub(crate) trait WalIoBackend: Send + Sync {
         false
     }
 
+    /// Maximum number of write buffers submitted to the backend at once.
+    /// Synchronous backends complete inline and therefore need no limit.
+    fn max_in_flight_writes(&self) -> usize {
+        usize::MAX
+    }
+
     /// Whether the backend spawns its own syncer thread (only `fdatasync`).
     fn needs_syncer_thread(&self) -> bool;
 

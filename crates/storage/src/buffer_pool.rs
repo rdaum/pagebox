@@ -352,6 +352,12 @@ struct AlignedPageCopy {
     len: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirtyFlushMode {
+    ForceWal,
+    AlreadyDurable,
+}
+
 impl AlignedPageCopy {
     fn copy_from(page: &[u8]) -> Self {
         let layout = std::alloc::Layout::from_size_align(page.len(), PAGE_SIZE).unwrap();
@@ -4450,7 +4456,36 @@ impl BufferPool {
         &self,
         max_batch: usize,
     ) -> std::io::Result<usize> {
-        self.try_flush_dirty_batch(max_batch)
+        self.try_flush_dirty_batch_inner(max_batch, DirtyFlushMode::AlreadyDurable)
+    }
+
+    /// Force the current WAL snapshot durable once before a provider sweep.
+    /// Subsequent batches can write every page covered by that snapshot
+    /// without introducing another durability barrier per batch.
+    #[cfg(not(miri))]
+    pub(crate) fn begin_dirty_flush_epoch_for_provider(&self) {
+        let Some(wal) = self.wal.as_ref() else {
+            return;
+        };
+        let started = Instant::now();
+        wal.flush();
+        self.metrics
+            .dirty_flush_wal_wait_ns
+            .add(saturating_duration_nanos(started.elapsed()).min(isize::MAX as u64) as isize);
+    }
+
+    #[cfg(miri)]
+    pub(crate) fn begin_dirty_flush_epoch_for_provider(&self) {}
+
+    pub(crate) fn has_dirty_resident_pages_for_provider(&self) -> bool {
+        (0..self.allocated_slots()).any(|idx| {
+            if !self.is_slot_initialized(idx) {
+                return false;
+            }
+            let bf = self.raw_frame(idx);
+            (unsafe { (*bf).header.core.state.load(Ordering::Acquire) }) == FrameState::Resident
+                && (unsafe { (*bf).header.core.dirty.load(Ordering::Acquire) })
+        })
     }
 
     #[cfg(miri)]
@@ -4661,6 +4696,15 @@ impl BufferPool {
     #[cfg(not(miri))]
     /// Return the number of pages that actually transitioned to clean.
     fn try_flush_dirty_batch(&self, max_batch: usize) -> std::io::Result<usize> {
+        self.try_flush_dirty_batch_inner(max_batch, DirtyFlushMode::ForceWal)
+    }
+
+    #[cfg(not(miri))]
+    fn try_flush_dirty_batch_inner(
+        &self,
+        max_batch: usize,
+        mode: DirtyFlushMode,
+    ) -> std::io::Result<usize> {
         if max_batch == 0 {
             return Ok(0);
         }
@@ -4693,6 +4737,7 @@ impl BufferPool {
         fn try_copy_dirty_resident_page<'a>(
             pool: &'a BufferPool,
             bf: *mut BufferFrame,
+            mode: DirtyFlushMode,
         ) -> Option<DirtyPageCopy<'a>> {
             if unsafe { (*bf).header.core.state.load(Ordering::Acquire) } != FrameState::Resident {
                 return None;
@@ -4709,13 +4754,21 @@ impl BufferPool {
             }
 
             let pid = unsafe { (*bf).header.core.pid };
+            let page_lsn = unsafe { (*bf).header.core.page_lsn.load(Ordering::Relaxed) };
+            if mode == DirtyFlushMode::AlreadyDurable
+                && pool
+                    .wal
+                    .as_ref()
+                    .is_some_and(|wal| !wal.is_lsn_durable(page_lsn))
+            {
+                return None;
+            }
             if !pool.dirty_flush_inflight.lock().insert(pid) {
                 return None;
             }
             let claim = DirtyFlushClaim { pool, pid };
             unsafe { (*bf).header.core.pin_count.fetch_add(1, Ordering::Relaxed) };
             let pinned = unsafe { PinnedFrame::new(pool, bf) };
-            let page_lsn = unsafe { (*bf).header.core.page_lsn.load(Ordering::Relaxed) };
             let dirty_generation =
                 unsafe { (*bf).header.core.dirty_generation.load(Ordering::Relaxed) };
             let mut copy = AlignedPageCopy::copy_from(unsafe { (*bf).page_bytes() });
@@ -4753,7 +4806,7 @@ impl BufferPool {
             }
 
             let bf = self.raw_frame(idx);
-            let Some(mut dirty_copy) = try_copy_dirty_resident_page(self, bf) else {
+            let Some(mut dirty_copy) = try_copy_dirty_resident_page(self, bf, mode) else {
                 continue;
             };
 
@@ -4789,7 +4842,8 @@ impl BufferPool {
         );
 
         #[cfg(not(miri))]
-        if max_lsn > 0
+        if mode == DirtyFlushMode::ForceWal
+            && max_lsn > 0
             && let Some(ref wal) = self.wal
         {
             let started = Instant::now();
@@ -5737,6 +5791,9 @@ fn num_cpus() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(miri))]
+    use pagebox_wal::CommitMode;
 
     use crate::buffer_frame::physical_page_number;
 
@@ -6804,6 +6861,47 @@ mod tests {
             edges.len() as u64,
             "the cleaner must leave eviction to the foreground parent-unswizzle path"
         );
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn provider_flush_epoch_cleans_multiple_batches_after_one_wal_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = Arc::new(Wal::open(&dir.path().join("wal")).unwrap());
+        wal.set_commit_mode(CommitMode::Relaxed);
+        let mut pool = BufferPool::new(4);
+        pool.set_wal(Arc::clone(&wal));
+        let pool = Arc::new(pool);
+        let edges = (0..3).map(|_| pool.allocate_page()).collect::<Vec<_>>();
+
+        for (value, edge) in edges.iter().enumerate() {
+            let mut frame = pool
+                .fix_stable(edge, unsafe { NoLatches::new(&pool) })
+                .exclusive();
+            frame.page_mut()[64] = value as u8;
+            frame.mark_dirty();
+        }
+
+        assert_eq!(
+            pool.try_flush_dirty_batch_for_provider(1).unwrap(),
+            0,
+            "the provider must not write pages whose WAL records are not durable"
+        );
+
+        pool.begin_dirty_flush_epoch_for_provider();
+        for remaining in (1..=3).rev() {
+            assert_eq!(
+                pool.try_flush_dirty_batch_for_provider(1).unwrap(),
+                1,
+                "one durable epoch must cover every batch in the sweep"
+            );
+            assert_eq!(
+                pool.diagnostic_stats().dirty_frames,
+                remaining - 1,
+                "each provider batch should clean exactly one durable page"
+            );
+        }
+        assert_eq!(pool.try_flush_dirty_batch_for_provider(1).unwrap(), 0);
     }
 
     #[test]
