@@ -3,8 +3,9 @@
 //!
 //! The provider runs a continuous loop:
 //! 1. If budget is sufficient, sleep until woken by a worker.
-//! 2. Flush a bounded batch of dirty pages so the workers' regular eviction
-//!    path has clean candidates before the pool is exhausted.
+//! 2. Flush a bounded batch of dirty pages already covered by durable WAL so
+//!    the workers' regular eviction path has clean candidates before the pool
+//!    is exhausted.
 //! 3. Sleep briefly to bound writeback bandwidth; workers retain ownership of
 //!    eviction and the associated parent-unswizzle protocol.
 
@@ -101,7 +102,6 @@ fn run(
     _frames_available: &(Mutex<()>, Condvar),
 ) {
     let mut idle_wait = MIN_IDLE_WAIT;
-    let mut flush_epoch_active = false;
     while !shutdown.load(Ordering::Relaxed) {
         let Some(pool) = pool.upgrade() else {
             return;
@@ -113,7 +113,6 @@ fn run(
             let guard = need_frames.0.lock().unwrap();
             let _ = need_frames.1.wait_timeout(guard, Duration::from_millis(10));
             idle_wait = MIN_IDLE_WAIT;
-            flush_epoch_active = false;
             continue;
         }
 
@@ -121,13 +120,7 @@ fn run(
             let guard = need_frames.0.lock().unwrap();
             let _ = need_frames.1.wait_timeout(guard, idle_wait);
             idle_wait = idle_wait.saturating_mul(2).min(MAX_IDLE_WAIT);
-            flush_epoch_active = false;
             continue;
-        }
-
-        if !flush_epoch_active {
-            pool.begin_dirty_flush_epoch_for_provider();
-            flush_epoch_active = true;
         }
 
         let cleaned = pool
@@ -140,7 +133,6 @@ fn run(
             let guard = need_frames.0.lock().unwrap();
             let _ = need_frames.1.wait_timeout(guard, idle_wait);
             idle_wait = idle_wait.saturating_mul(2).min(MAX_IDLE_WAIT);
-            flush_epoch_active = false;
         } else {
             idle_wait = MIN_IDLE_WAIT;
             std::thread::sleep(MIN_IDLE_WAIT);

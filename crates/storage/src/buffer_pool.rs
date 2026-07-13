@@ -118,8 +118,8 @@ use crate::metrics_stub::{Counter, Gauge, Histogram, LabeledCounter, LabeledGaug
 use crate::buffer_frame::PAGE_SIZE;
 use crate::buffer_frame::{
     BufferFrame, BufferFrameReadRef, BufferFrameRef, BufferFrameWriteRef, EvictingFrame, FrameId,
-    FrameState, PageReclaimer, PageWritebackPreparer, ParentFinder, ParentLink, PoolId, StableSwip,
-    StableSwipOwner, physical_page_number,
+    FrameState, InnerParentLink, PageReclaimer, PageWritebackPreparer, ParentFinder, ParentLink,
+    PoolId, StableSwip, StableSwipOwner, physical_page_number,
 };
 use crate::buffer_frame::{Lsn, PageId};
 use crate::free_page_allocator::{FreeExtent, FreePageAllocator};
@@ -4352,6 +4352,20 @@ impl BufferPool {
         let mut free_actual = 0usize;
         let mut evicting = 0usize;
         let mut loading = 0usize;
+        #[cfg_attr(miri, allow(unused_mut))]
+        let mut eviction_allowed = 0usize;
+        #[cfg_attr(miri, allow(unused_mut))]
+        let mut clean_eviction_allowed = 0usize;
+        #[cfg_attr(miri, allow(unused_mut))]
+        let mut ready_for_selection = 0usize;
+        #[cfg_attr(miri, allow(unused_mut))]
+        let mut ready_stable = 0usize;
+        #[cfg_attr(miri, allow(unused_mut))]
+        let mut ready_inner_node = 0usize;
+        #[cfg_attr(miri, allow(unused_mut))]
+        let mut ready_unswizzled = 0usize;
+        #[cfg_attr(miri, allow(unused_mut))]
+        let mut ready_unlinked = 0usize;
         for i in 0..num_slots {
             if !self.is_slot_initialized(i) {
                 free_actual += 1;
@@ -4363,18 +4377,37 @@ impl BufferPool {
                 FrameState::Free => free_actual += 1,
                 FrameState::Resident => {
                     resident += 1;
-                    if unsafe { (*bf).header.core.pin_count.load(Ordering::Relaxed) } > 0 {
+                    let is_pinned =
+                        unsafe { (*bf).header.core.pin_count.load(Ordering::Relaxed) } > 0;
+                    let is_dirty = unsafe { (*bf).header.core.dirty.load(Ordering::Relaxed) };
+                    let is_referenced =
+                        unsafe { (*bf).header.core.referenced.load(Ordering::Relaxed) };
+                    if is_pinned {
                         pinned += 1;
                     }
-                    if unsafe { (*bf).header.core.dirty.load(Ordering::Relaxed) } {
+                    if is_dirty {
                         dirty += 1;
                     }
-                    if unsafe { (*bf).header.core.referenced.load(Ordering::Relaxed) } {
+                    if is_referenced {
                         referenced += 1;
                     }
                     #[cfg(not(miri))]
-                    if page_header::is_inner_index_page(unsafe { &(*bf).page }) {
-                        inner += 1;
+                    {
+                        if page_header::is_inner_index_page(unsafe { &(*bf).page }) {
+                            inner += 1;
+                        }
+                        let allowed = Self::frame_page_allows_eviction(bf);
+                        eviction_allowed += usize::from(allowed);
+                        clean_eviction_allowed += usize::from(allowed && !is_dirty);
+                        if allowed && !is_dirty && !is_pinned && !is_referenced {
+                            ready_for_selection += 1;
+                            match unsafe { &(*bf).header.parent_link } {
+                                ParentLink::Stable(_) => ready_stable += 1,
+                                ParentLink::InnerNode(_) => ready_inner_node += 1,
+                                ParentLink::Unswizzled => ready_unswizzled += 1,
+                                ParentLink::None => ready_unlinked += 1,
+                            }
+                        }
                     }
                 }
                 FrameState::Evicting => evicting += 1,
@@ -4402,6 +4435,8 @@ impl BufferPool {
              (waiting_for={}, stalled_rounds={}, total={}, allocated={}, \
              resident_budget_available={}, free_actual={}, resident={}, \
              pinned={}, dirty={}, referenced={}, inner_idx={}, \
+             eviction_allowed={}, clean_eviction_allowed={}, ready_for_selection={}, \
+             ready_parents=stable:{}:inner:{}:unswizzled:{}:unlinked:{}, \
              evicting={}, loading={}, eviction_budget={}, eviction_in_flight={}, \
              parent_hint_latch_misses={}, parent_dfs_fallbacks={}, parent_dfs_failures={}, \
              second_chance_skips={})",
@@ -4416,6 +4451,13 @@ impl BufferPool {
             dirty,
             referenced,
             inner,
+            eviction_allowed,
+            clean_eviction_allowed,
+            ready_for_selection,
+            ready_stable,
+            ready_inner_node,
+            ready_unswizzled,
+            ready_unlinked,
             evicting,
             loading,
             self.eviction_budget,
@@ -4459,24 +4501,6 @@ impl BufferPool {
         self.try_flush_dirty_batch_inner(max_batch, DirtyFlushMode::AlreadyDurable)
     }
 
-    /// Force the current WAL snapshot durable once before a provider sweep.
-    /// Subsequent batches can write every page covered by that snapshot
-    /// without introducing another durability barrier per batch.
-    #[cfg(not(miri))]
-    pub(crate) fn begin_dirty_flush_epoch_for_provider(&self) {
-        let Some(wal) = self.wal.as_ref() else {
-            return;
-        };
-        let started = Instant::now();
-        wal.flush();
-        self.metrics
-            .dirty_flush_wal_wait_ns
-            .add(saturating_duration_nanos(started.elapsed()).min(isize::MAX as u64) as isize);
-    }
-
-    #[cfg(miri)]
-    pub(crate) fn begin_dirty_flush_epoch_for_provider(&self) {}
-
     pub(crate) fn has_dirty_resident_pages_for_provider(&self) -> bool {
         (0..self.allocated_slots()).any(|idx| {
             if !self.is_slot_initialized(idx) {
@@ -4515,17 +4539,24 @@ impl BufferPool {
             return false;
         }
         let start = self.state.eviction_hand.fetch_add(1, Ordering::Relaxed) % num_slots;
-        for offset in 0..num_slots {
-            let idx = (start + offset) % num_slots;
-            if !self.is_slot_initialized(idx) {
-                continue;
-            }
-            let bf = self.raw_frame(idx);
-            if self
-                .with_single_evict_candidate(bf, |pid| self.finish_latched_evicting_frame(bf, pid))
-                .is_some()
-            {
-                return true;
+        // Prefer victims whose parent can be published through the cached
+        // link. The first pass can clear second-chance bits, so repeat the
+        // fast pass once before paying for a registered tree walk.
+        for allow_parent_discovery in [false, false, true] {
+            for offset in 0..num_slots {
+                let idx = (start + offset) % num_slots;
+                if !self.is_slot_initialized(idx) {
+                    continue;
+                }
+                let bf = self.raw_frame(idx);
+                if self
+                    .with_single_evict_candidate(bf, |pid| {
+                        self.finish_latched_evicting_frame(bf, pid, allow_parent_discovery)
+                    })
+                    .is_some_and(|evicted| evicted)
+                {
+                    return true;
+                }
             }
         }
         false
@@ -4632,8 +4663,13 @@ impl BufferPool {
     }
 
     #[cfg(not(miri))]
-    fn finish_latched_evicting_frame(&self, bf: *mut BufferFrame, pid: u64) -> bool {
-        self.unswizzle_and_free(bf, pid)
+    fn finish_latched_evicting_frame(
+        &self,
+        bf: *mut BufferFrame,
+        pid: u64,
+        allow_parent_discovery: bool,
+    ) -> bool {
+        self.unswizzle_and_free(bf, pid, allow_parent_discovery)
     }
 
     pub(crate) fn try_evict_policy(&self, max_batch: usize) -> usize {
@@ -5036,7 +5072,7 @@ impl BufferPool {
                 return false;
             }
 
-            pool.unswizzle_and_free(candidate.bf, candidate.pid)
+            pool.unswizzle_and_free(candidate.bf, candidate.pid, true)
         }
 
         let mut candidates: Vec<Candidate> = Vec::with_capacity(max_batch);
@@ -5157,8 +5193,13 @@ impl BufferPool {
     /// to Resident. Uses non-blocking latch acquisition on the parent
     /// to avoid deadlock when multiple frames are batch-evicted.
     #[cfg(not(miri))]
-    fn unswizzle_and_free(&self, bf: *mut BufferFrame, pid: u64) -> bool {
-        let parent_updated = self.unswizzle_parent(bf, pid);
+    fn unswizzle_and_free(
+        &self,
+        bf: *mut BufferFrame,
+        pid: u64,
+        allow_parent_discovery: bool,
+    ) -> bool {
+        let parent_updated = self.unswizzle_parent(bf, pid, allow_parent_discovery);
 
         if !self.parent_link_allows_free(bf, parent_updated) {
             Self::revert_frame_to_resident(bf);
@@ -5192,14 +5233,28 @@ impl BufferPool {
     /// was needed (Stable/None). Returns false for InnerNode if the
     /// parent couldn't be found or latched.
     #[cfg(not(miri))]
-    fn unswizzle_parent(&self, bf: *mut BufferFrame, pid: u64) -> bool {
-        self.unswizzle_parent_link(bf, pid, Self::frame_parent_link(bf))
+    fn unswizzle_parent(
+        &self,
+        bf: *mut BufferFrame,
+        pid: u64,
+        allow_parent_discovery: bool,
+    ) -> bool {
+        self.unswizzle_parent_link(bf, pid, Self::frame_parent_link(bf), allow_parent_discovery)
     }
 
     #[cfg(not(miri))]
-    fn unswizzle_parent_link(&self, bf: *mut BufferFrame, pid: u64, link: ParentLink) -> bool {
+    fn unswizzle_parent_link(
+        &self,
+        bf: *mut BufferFrame,
+        pid: u64,
+        link: ParentLink,
+        allow_parent_discovery: bool,
+    ) -> bool {
         match link {
             ParentLink::None if Self::frame_is_index_page(bf) => {
+                if !allow_parent_discovery {
+                    return false;
+                }
                 // Sibling/orphan loads can install a reachable leaf without a
                 // cached parent hint. Discover and unswizzle the live parent
                 // edge before allowing the index frame to be recycled.
@@ -5220,10 +5275,8 @@ impl BufferPool {
             ParentLink::InnerNode(link) => self.try_unswizzle_inner_node(
                 unsafe { BufferFrameRef::from_raw(bf) },
                 pid,
-                link.parent_pid,
-                link.slot_index,
-                link.is_upper,
-                link.dt_id,
+                link,
+                allow_parent_discovery,
             ),
         }
     }
@@ -5235,25 +5288,27 @@ impl BufferPool {
         &self,
         child: BufferFrameRef,
         pid: u64,
-        parent_pid: u64,
-        slot_index: u16,
-        is_upper: bool,
-        dt_id: u16,
+        link: InnerParentLink,
+        allow_parent_discovery: bool,
     ) -> bool {
-        if let Some(result) =
-            self.try_unswizzle_inner_node_fast_path(child, pid, parent_pid, slot_index, is_upper)
-        {
+        if let Some(result) = self.try_unswizzle_inner_node_fast_path(
+            child,
+            pid,
+            link.parent_pid,
+            link.slot_index,
+            link.is_upper,
+        ) {
             return result;
         }
 
-        let hinted_finder = self.dt_registry.lock().get(&dt_id).cloned();
+        let hinted_finder = self.dt_registry.lock().get(&link.dt_id).cloned();
         if let Some(finder) = hinted_finder
             && let Some(result) = finder.find_and_unswizzle_with_hint(
                 unsafe { EvictingFrame::new(child) },
                 pid,
-                parent_pid,
-                slot_index,
-                is_upper,
+                link.parent_pid,
+                link.slot_index,
+                link.is_upper,
             )
         {
             if result {
@@ -5264,10 +5319,14 @@ impl BufferPool {
             return result;
         }
 
+        if !allow_parent_discovery {
+            return false;
+        }
+
         self.metrics
             .unswizzle_parent_events
             .inc(UnswizzleParentEvent::DfsFallbacks);
-        self.find_and_unswizzle_with_registered_finders(child, pid, dt_id)
+        self.find_and_unswizzle_with_registered_finders(child, pid, link.dt_id)
     }
 
     #[cfg(not(miri))]
@@ -6865,7 +6924,7 @@ mod tests {
 
     #[test]
     #[cfg(not(miri))]
-    fn provider_flush_epoch_cleans_multiple_batches_after_one_wal_barrier() {
+    fn provider_only_flushes_pages_covered_by_durable_wal() {
         let dir = tempfile::tempdir().unwrap();
         let wal = Arc::new(Wal::open(&dir.path().join("wal")).unwrap());
         wal.set_commit_mode(CommitMode::Relaxed);
@@ -6888,12 +6947,12 @@ mod tests {
             "the provider must not write pages whose WAL records are not durable"
         );
 
-        pool.begin_dirty_flush_epoch_for_provider();
+        wal.flush();
         for remaining in (1..=3).rev() {
             assert_eq!(
                 pool.try_flush_dirty_batch_for_provider(1).unwrap(),
                 1,
-                "one durable epoch must cover every batch in the sweep"
+                "the provider must clean pages after their WAL records become durable"
             );
             assert_eq!(
                 pool.diagnostic_stats().dirty_frames,
@@ -6989,6 +7048,77 @@ mod tests {
                 "failed opportunistic eviction should leave the frame resident"
             );
         }
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn try_evict_one_prefers_later_fast_victim_over_parent_discovery() {
+        struct CountingReject {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl ParentFinder for CountingReject {
+            fn find_and_unswizzle(&self, _child: EvictingFrame<'_>, _child_pid: u64) -> bool {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+
+        let pool = BufferPool::new(2);
+        let discovery_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        pool.register_dt(
+            0,
+            Arc::new(CountingReject {
+                calls: Arc::clone(&discovery_calls),
+            }),
+        );
+        let stable = pool.allocate_page();
+        let (_unlinked_pid, unlinked) = pool.allocate_and_fix(unsafe { NoLatches::new(&pool) });
+        let unlinked_raw = unlinked.raw();
+        let mut unlinked = unlinked.exclusive();
+        let page = unlinked.page_bytes_mut();
+        let sp = crate::slotted_page::SlottedPage::init(page.try_into().unwrap());
+        sp.set_flag(1 << 1);
+        page_header::write_page_type(page, PageType::Index);
+        unlinked.mark_dirty();
+        drop(unlinked);
+        assert_eq!(pool.try_flush_dirty_batch(1).unwrap(), 1);
+
+        let stable_frame = pool.fix_stable(&stable, unsafe { NoLatches::new(&pool) });
+        let stable_raw = stable_frame.raw();
+        drop(stable_frame);
+        unsafe {
+            (*unlinked_raw)
+                .header
+                .core
+                .referenced
+                .store(false, Ordering::Relaxed);
+            (*stable_raw)
+                .header
+                .core
+                .referenced
+                .store(false, Ordering::Relaxed);
+        }
+
+        assert!(
+            pool.try_evict_one(),
+            "eviction must continue scanning after an earlier candidate cannot publish its parent"
+        );
+        assert!(
+            stable.load(Ordering::Acquire).is_evicted(),
+            "the later stable candidate must be evicted"
+        );
+        assert_eq!(
+            unsafe { (*unlinked_raw).header.core.state.load(Ordering::Acquire) },
+            FrameState::Resident,
+            "the failed index candidate must revert to Resident"
+        );
+        assert_eq!(
+            discovery_calls.load(Ordering::Relaxed),
+            0,
+            "a later fast-path victim must be preferred over parent discovery"
+        );
+        pool.unregister_dt(0);
     }
 
     #[test]
