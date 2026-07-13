@@ -1651,6 +1651,9 @@ impl BTree {
             if unsafe { self.try_publish_leaf_split_via_nonblocking_search(sep_key, left, right) } {
                 return;
             }
+            if unsafe { self.try_publish_leaf_split_via_blocking_search(sep_key, left, right) } {
+                return;
+            }
             self.stats.inc(BTreeEvent::ParentPublishRestarts);
             if attempts >= 100_000 {
                 let left_pid = left.pid();
@@ -1875,6 +1878,75 @@ impl BTree {
             stack.extend(child_pins);
         }
 
+        false
+    }
+
+    unsafe fn try_publish_leaf_split_via_blocking_search(
+        &self,
+        sep_key: &[u8],
+        left: &SplitChild<'_>,
+        right: &mut SplitChild<'_>,
+    ) -> bool {
+        // A leaf reached through its B-link need not be rediscoverable by a
+        // keyed descent until its separator is published. Search by stable
+        // page identity instead. Only page IDs survive between iterations, so
+        // loading a cold descendant never retains an ancestor latch or pin.
+        let pool = self.pool();
+        let root_pid = Self::swip_page_id(self.meta_swip.load(Ordering::Acquire));
+        let mut stack = vec![root_pid];
+        while let Some(pid) = stack.pop() {
+            if pid == left.pid() {
+                continue;
+            }
+            let current = unsafe {
+                pool.fix_orphan_frame(pid, unsafe { NoLatches::new(pool) })
+                    .exclusive()
+            };
+            let current_frame = ResidentFrame::from_exclusive(&current);
+            if current_frame.is_leaf() {
+                continue;
+            }
+            let mut current = ExclusiveNode::from_inner_frame(current);
+            let child = ChildRef::from_pid(left.frame_ref(), left.pid());
+            if let Some(edge) = current.child_edge_for(child) {
+                if !current.can_insert_separator(sep_key.len()) {
+                    let current_pid = current.resident_frame().pid();
+                    let current_is_root = current_pid == root_pid;
+                    drop(current);
+                    let mut empty_path = Vec::new();
+                    if current_is_root {
+                        let _ = unsafe {
+                            self.split_full_root_after_release(current_pid, &mut empty_path)
+                        };
+                    } else {
+                        let _ = unsafe {
+                            self.split_full_inner_after_release(
+                                current_pid,
+                                sep_key.len(),
+                                &mut empty_path,
+                            )
+                        };
+                    }
+                    return false;
+                }
+
+                let edges = unsafe {
+                    self.apply_split_to_latched_parent(&mut current, sep_key, left, right, edge)
+                };
+                current.mark_dirty();
+                unsafe { right.mark_published() };
+                let parent_count = current.num_slots();
+                let parent = current.into_pinned();
+                unsafe {
+                    self.install_split_parent_hints(left, right, parent, edges, parent_count)
+                };
+                return true;
+            }
+
+            let child_page_ids = current.child_page_ids();
+            drop(current);
+            stack.extend(child_page_ids.into_iter().rev());
+        }
         false
     }
 
