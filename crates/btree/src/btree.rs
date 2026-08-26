@@ -16,7 +16,8 @@ use parking_lot::Mutex;
 use pagebox_storage::buffer_frame::PAGE_SIZE;
 use pagebox_storage::buffer_frame::{BufferFrameRef, EvictingFrame, ParentFinder, StableSwip};
 use pagebox_storage::buffer_pool::{
-    BufferPool, BufferPoolHandle, ExclusiveFrame, NewUnlinkedPage, NoLatches, PinnedFrame,
+    BufferPool, BufferPoolHandle, ExclusiveFrame, NewUnlinkedPage, NoLatches, PageMutation,
+    PinnedFrame,
 };
 use pagebox_storage::slotted_page::SlottedPage;
 use pagebox_swip_kernel::SwipWord as Swip;
@@ -378,9 +379,9 @@ impl BTree {
                 .fix_orphan_frame(leaf_pid, unsafe { NoLatches::new(self.pool()) })
         }
         .exclusive();
-        let leaf = ExclusiveNode::from_leaf_frame(leaf);
-        leaf.resident_frame().set_leaf_left_pid(left_pid);
-        leaf.mark_dirty();
+        let mut leaf = ExclusiveNode::from_leaf_frame(leaf);
+        leaf.set_left_pid(left_pid);
+        leaf.finish_mutation();
     }
 
     pub fn new<P>(pool: P, dt_id: u16) -> Self
@@ -642,7 +643,7 @@ impl BTree {
         }
 
         leaf.insert_entry(pos, key, value);
-        leaf.mark_dirty();
+        leaf.finish_mutation();
         InsertLeafAction::Inserted
     }
 
@@ -657,10 +658,9 @@ impl BTree {
         if exact {
             let old_val_len = leaf.value_at(pos).len();
             if old_val_len == value.len() {
-                let value_range = leaf.resident_frame().sp().value_range(pos);
                 let updated = leaf.update_value_if_same_length(pos, value);
                 debug_assert!(updated, "equal-length update must succeed");
-                leaf.mark_dirty_patch(value_range.start, value);
+                leaf.finish_mutation();
                 return UpsertLeafAction::UpdatedExisting;
             }
 
@@ -670,7 +670,7 @@ impl BTree {
             if can_replace {
                 leaf.remove_slot(pos);
                 leaf.insert_entry(pos, key, value);
-                leaf.mark_dirty();
+                leaf.finish_mutation();
                 return UpsertLeafAction::UpdatedExisting;
             }
 
@@ -682,7 +682,7 @@ impl BTree {
         }
 
         leaf.insert_entry(pos, key, value);
-        leaf.mark_dirty();
+        leaf.finish_mutation();
         UpsertLeafAction::Inserted
     }
 
@@ -1505,7 +1505,9 @@ impl BTree {
         }
 
         new_sibling.frame().mark_dirty();
-        node.mark_dirty();
+        let mut mutation = PageMutation::new();
+        mutation.add_range(std::mem::size_of::<u64>()..PAGE_SIZE);
+        node.mark_dirty_ranges(&mutation);
         self.reachable_pages.fetch_add(1, Ordering::Relaxed);
 
         // Now insert the separator into the parent. Root splits returned above.
@@ -1632,6 +1634,7 @@ impl BTree {
         let mut root = ExclusiveNode::from_inner_frame(root);
         root.insert_separator(0, sep_key, left_swip);
         root.set_child_edge_swip(ParentEdge::Upper, right_swip);
+        let root = root.into_frame();
         root.mark_dirty();
 
         let left = unsafe { left.finish_publication() };
@@ -1719,6 +1722,7 @@ impl BTree {
         let mut root = ExclusiveNode::from_inner_frame(root);
         root.insert_separator(0, sep_key, left_swip);
         root.set_child_edge_swip(ParentEdge::Upper, right_swip);
+        let root = root.into_frame();
         root.mark_dirty();
 
         let left = unsafe { left.finish_publication() };
@@ -1816,7 +1820,9 @@ impl BTree {
         new_sibling_frame.set_leaf_left_pid(node_pid);
         new_sibling_frame.set_leaf_right_pid(old_right_pid);
         new_sibling.frame().mark_dirty();
-        node.mark_dirty();
+        let mut mutation = PageMutation::new();
+        mutation.add_range(std::mem::size_of::<u64>()..PAGE_SIZE);
+        node.mark_dirty_ranges(&mutation);
         self.reachable_pages.fetch_add(1, Ordering::Relaxed);
 
         let left = SplitChild::from_exclusive(node);
@@ -1925,7 +1931,7 @@ impl BTree {
 
         let edges =
             unsafe { self.apply_split_to_latched_parent(&mut parent, sep_key, left, right, edge) };
-        parent.mark_dirty();
+        parent.finish_mutation();
         unsafe { right.mark_published() };
         let parent_count = parent.num_slots();
         let parent = parent.into_pinned();
@@ -1991,7 +1997,7 @@ impl BTree {
         let edges = unsafe {
             self.apply_split_to_latched_parent(&mut root_inner, sep_key, left, right, edge)
         };
-        root_inner.mark_dirty();
+        root_inner.finish_mutation();
         unsafe { right.mark_published() };
         let parent_count = root_inner.num_slots();
         let parent = root_inner.into_pinned();
@@ -2054,7 +2060,7 @@ impl BTree {
                 let edges = unsafe {
                     self.apply_split_to_latched_parent(&mut current, sep_key, left, right, edge)
                 };
-                current.mark_dirty();
+                current.finish_mutation();
                 unsafe { right.mark_published() };
                 let parent_count = current.num_slots();
                 let parent = current.into_pinned();
@@ -2135,7 +2141,7 @@ impl BTree {
                 let edges = unsafe {
                     self.apply_split_to_latched_parent(&mut current, sep_key, left, right, edge)
                 };
-                current.mark_dirty();
+                current.finish_mutation();
                 unsafe { right.mark_published() };
                 let parent_count = current.num_slots();
                 let parent = current.into_pinned();
@@ -2390,7 +2396,7 @@ impl BTree {
                     && parent.key_at(pos) != key.as_slice()
                 {
                     parent.set_separator_key(pos, key);
-                    parent.mark_dirty();
+                    parent.finish_mutation();
                 }
                 break;
             }
@@ -2512,7 +2518,7 @@ impl BTree {
 
     unsafe fn merge_leaf_pages_into_left(
         &self,
-        left: &ExclusiveNode<'_, Leaf>,
+        left: &mut ExclusiveNode<'_, Leaf>,
         right: &ExclusiveNode<'_, Leaf>,
     ) -> bool {
         let left_frame = left.resident_frame();
@@ -2558,8 +2564,8 @@ impl BTree {
             &mut tmp.0,
             pagebox_storage::slotted_page::PageType::Index,
         );
-        left.resident_frame().replace_page(&tmp.0);
-        left.mark_dirty();
+        left.replace_page(&tmp.0);
+        left.finish_mutation();
         true
     }
 
@@ -2636,7 +2642,7 @@ impl BTree {
 
     unsafe fn merge_inner_pages_into_left(
         &self,
-        left: &ExclusiveNode<'_, Inner>,
+        left: &mut ExclusiveNode<'_, Inner>,
         boundary_key: &[u8],
         right: &ExclusiveNode<'_, Inner>,
     ) {
@@ -2667,16 +2673,16 @@ impl BTree {
             &mut tmp.0,
             pagebox_storage::slotted_page::PageType::Index,
         );
-        left.resident_frame().replace_page(&tmp.0);
-        left.resident_frame().set_upper(new_upper);
+        left.replace_page(&tmp.0);
+        left.set_upper(new_upper);
         unsafe { self.refresh_inner_child_parent_links(left) };
-        left.mark_dirty();
+        left.finish_mutation();
     }
 
     unsafe fn try_merge_leaf_with_path(
         &self,
         parent_path: &mut Vec<PinnedFrame<'_>>,
-        leaf: ExclusiveNode<'_, Leaf>,
+        mut leaf: ExclusiveNode<'_, Leaf>,
     ) -> bool {
         let mut leaf_frame = leaf.resident_frame();
 
@@ -2707,7 +2713,7 @@ impl BTree {
             let merged_pid = leaf.pid();
             if unsafe { self.leaf_pair_is_mergeable(&parent, &leaf, &right, pos) }
                 && unsafe { self.leaf_pair_fits(&leaf, &right) }
-                && unsafe { self.merge_leaf_pages_into_left(&leaf, &right) }
+                && unsafe { self.merge_leaf_pages_into_left(&mut leaf, &right) }
             {
                 unsafe {
                     self.unlink_merged_right_leaf(
@@ -2727,10 +2733,9 @@ impl BTree {
                     unsafe {
                         self.collapse_empty_root_to_child(&mut parent_frame, &mut leaf_frame)
                     };
-                    parent.mark_dirty();
-                    drop(parent);
+                    parent.into_frame().mark_dirty();
                 } else if !parent_is_root && parent.is_underfull() {
-                    parent.mark_dirty();
+                    parent.finish_mutation();
                     drop(leaf);
                     let _ = unsafe { self.try_merge_inner_with_path(parent_path, parent) };
                     if successor_pid != 0 {
@@ -2738,7 +2743,7 @@ impl BTree {
                     }
                     return true;
                 } else {
-                    parent.mark_dirty();
+                    parent.finish_mutation();
                     drop(parent);
                 }
                 drop(leaf);
@@ -2752,7 +2757,7 @@ impl BTree {
         if pos > 0 {
             let left_pos = pos - 1;
             let left_swip = parent.child_edge_swip(ParentEdge::Slot(left_pos));
-            let left = match unsafe { self.try_pin_exclusive_resident_child(left_swip) } {
+            let mut left = match unsafe { self.try_pin_exclusive_resident_child(left_swip) } {
                 Some(child) => ExclusiveNode::from_leaf_frame(child),
                 None => return false,
             };
@@ -2761,7 +2766,7 @@ impl BTree {
             let merged_pid = left.pid();
             if unsafe { self.leaf_pair_is_mergeable(&parent, &left, &leaf, left_pos) }
                 && unsafe { self.leaf_pair_fits(&left, &leaf) }
-                && unsafe { self.merge_leaf_pages_into_left(&left, &leaf) }
+                && unsafe { self.merge_leaf_pages_into_left(&mut left, &leaf) }
             {
                 let replacement_key = if pos == count {
                     None
@@ -2787,10 +2792,9 @@ impl BTree {
                     unsafe {
                         self.collapse_empty_root_to_child(&mut parent_frame, &mut left_frame)
                     };
-                    parent.mark_dirty();
-                    drop(parent);
+                    parent.into_frame().mark_dirty();
                 } else if !parent_is_root && parent.is_underfull() {
-                    parent.mark_dirty();
+                    parent.finish_mutation();
                     drop(left);
                     drop(leaf);
                     let _ = unsafe { self.try_merge_inner_with_path(parent_path, parent) };
@@ -2799,7 +2803,7 @@ impl BTree {
                     }
                     return true;
                 } else {
-                    parent.mark_dirty();
+                    parent.finish_mutation();
                     drop(parent);
                 }
                 drop(left);
@@ -2817,7 +2821,7 @@ impl BTree {
     unsafe fn try_merge_inner_with_path(
         &self,
         parent_path: &mut Vec<PinnedFrame<'_>>,
-        node: ExclusiveNode<'_, Inner>,
+        mut node: ExclusiveNode<'_, Inner>,
     ) -> bool {
         let mut node_frame = node.resident_frame();
 
@@ -2846,7 +2850,7 @@ impl BTree {
             let mut right_frame = right.resident_frame();
             let boundary_key = parent.key_at(pos).to_vec();
             if unsafe { self.inner_pair_fits(&node, &boundary_key, &right) } {
-                unsafe { self.merge_inner_pages_into_left(&node, &boundary_key, &right) };
+                unsafe { self.merge_inner_pages_into_left(&mut node, &boundary_key, &right) };
                 if matches!(right_edge, ParentEdge::Upper) {
                     unsafe {
                         self.unlink_merged_right_inner(
@@ -2879,13 +2883,12 @@ impl BTree {
                     unsafe {
                         self.collapse_empty_root_to_child(&mut parent_frame, &mut node_frame)
                     };
-                    parent.mark_dirty();
-                    drop(parent);
+                    parent.into_frame().mark_dirty();
                 } else if !parent_is_root && parent.is_underfull() {
-                    parent.mark_dirty();
+                    parent.finish_mutation();
                     let _ = unsafe { self.try_merge_inner_with_path(parent_path, parent) };
                 } else {
-                    parent.mark_dirty();
+                    parent.finish_mutation();
                 }
                 return true;
             }
@@ -2894,14 +2897,14 @@ impl BTree {
         if pos > 0 {
             let left_pos = pos - 1;
             let left_swip = parent.child_edge_swip(ParentEdge::Slot(left_pos));
-            let left = match unsafe { self.try_pin_exclusive_resident_child(left_swip) } {
+            let mut left = match unsafe { self.try_pin_exclusive_resident_child(left_swip) } {
                 Some(child) => ExclusiveNode::from_inner_frame(child),
                 None => return false,
             };
             let mut left_frame = left.resident_frame();
             let boundary_key = parent.key_at(left_pos).to_vec();
             if unsafe { self.inner_pair_fits(&left, &boundary_key, &node) } {
-                unsafe { self.merge_inner_pages_into_left(&left, &boundary_key, &node) };
+                unsafe { self.merge_inner_pages_into_left(&mut left, &boundary_key, &node) };
                 let replacement_key = if pos == count {
                     None
                 } else {
@@ -2924,13 +2927,12 @@ impl BTree {
                     unsafe {
                         self.collapse_empty_root_to_child(&mut parent_frame, &mut left_frame)
                     };
-                    parent.mark_dirty();
-                    drop(parent);
+                    parent.into_frame().mark_dirty();
                 } else if !parent_is_root && parent.is_underfull() {
-                    parent.mark_dirty();
+                    parent.finish_mutation();
                     let _ = unsafe { self.try_merge_inner_with_path(parent_path, parent) };
                 } else {
-                    parent.mark_dirty();
+                    parent.finish_mutation();
                 }
                 return true;
             }
@@ -3596,7 +3598,7 @@ impl BTree {
                 let deleted_was_max = pos + 1 == leaf.num_slots();
 
                 leaf.remove_slot(pos);
-                leaf.mark_dirty();
+                leaf.finish_mutation();
 
                 let new_max = if deleted_was_max && leaf.num_slots() > 0 {
                     Some(leaf.key_at(leaf.num_slots() - 1).to_vec())
@@ -4054,15 +4056,19 @@ impl BTree {
 
 #[cfg(test)]
 mod tests {
-    use super::node::BTreeNode;
-    use super::*;
-    use pagebox_storage::page_store::FilePageStore;
-    use proptest::prelude::*;
-    use proptest::test_runner::{Config as ProptestConfig, TestRunner};
     use std::collections::BTreeMap;
     use std::ops::Bound;
     use std::sync::{Arc, Barrier};
     use std::thread;
+
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config as ProptestConfig, TestRunner};
+
+    use pagebox_storage::page_store::{FilePageStore, InMemoryPageStore};
+    use pagebox_wal::{Wal, WalReplayRecord};
+
+    use super::node::BTreeNode;
+    use super::*;
 
     const FAT_VALUE_SIZE: usize = PAGE_SIZE / 2 - 128;
     const SINGLE_ENTRY_VALUE_SIZE: usize = PAGE_SIZE - 128;
@@ -5570,6 +5576,82 @@ mod tests {
             count += 1;
         });
         assert_eq!(count, expected, "scan count {count} != expected {expected}");
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn wal_ranges_recover_insert_remove_split_and_parent_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = Arc::new(Wal::open(&dir.path().join("wal")).unwrap());
+        let source_store = Arc::new(InMemoryPageStore::new());
+        let mut pool = BufferPool::with_store(4096, Box::new(Arc::clone(&source_store)));
+        pool.set_wal(Arc::clone(&wal));
+        let pool = Arc::new(pool);
+        let tree = BTree::new(&pool, 0);
+        let mut model = BTreeMap::new();
+
+        for key in 0..1_200u32 {
+            let key = key.to_be_bytes();
+            let value = vec![(key[3] % 251) + 1; 96];
+            assert!(tree.insert(&key, &value));
+            model.insert(key.to_vec(), value);
+        }
+        assert!(tree.height() > 0, "workload must split the root leaf");
+
+        for key in (0..1_200u32).step_by(11) {
+            let key = key.to_be_bytes();
+            let value = vec![(key[3] % 241) + 3; 37];
+            assert!(!tree.upsert(&key, &value));
+            model.insert(key.to_vec(), value);
+        }
+        for key in (0..1_200u32).step_by(3) {
+            let key = key.to_be_bytes();
+            assert_eq!(tree.remove(&key), model.remove(key.as_slice()).is_some());
+        }
+
+        let root_pid = tree.root_page_id();
+        let height = tree.height();
+        wal.flush();
+
+        let diagnostics = pool.diagnostic_stats();
+        assert!(
+            diagnostics.dirty_wal_page_patch_records > 0,
+            "existing B-tree pages must emit compact patch records"
+        );
+        let mut page_images = 0;
+        let mut patch_records = 0;
+        wal.replay_records(|record| match record {
+            WalReplayRecord::PageImage { .. } => page_images += 1,
+            WalReplayRecord::Logical { .. } => patch_records += 1,
+        })
+        .unwrap();
+        assert!(
+            page_images > 1,
+            "the root and split-created pages must begin with full images"
+        );
+        assert!(
+            patch_records > 0,
+            "existing-page mutations must use patches"
+        );
+
+        let recovered_store = Arc::new(InMemoryPageStore::new());
+        wal.recover_pages(recovered_store.as_ref(), 0, |page| {
+            pagebox_storage::slotted_page::read_page_lsn(
+                page.try_into().expect("recovery page must use PAGE_SIZE"),
+            )
+        })
+        .unwrap();
+        let recovered_pool = Arc::new(BufferPool::with_store(
+            4096,
+            Box::new(Arc::clone(&recovered_store)),
+        ));
+        let recovered_tree = BTree::open(&recovered_pool, root_pid, height, 0);
+
+        assert_eq!(
+            collect_all(&recovered_tree),
+            model_collect_all(&model),
+            "WAL replay must reconstruct the complete post-mutation tree"
+        );
     }
 
     /// Verify BTree works after flush + drop + reopen from a FilePageStore.

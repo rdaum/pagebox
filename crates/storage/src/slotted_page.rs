@@ -63,6 +63,7 @@ use fast_telemetry::{Counter, ExportMetrics, MetricVisitor};
 use crate::metrics_stub::{Counter, MetricVisitor};
 
 use crate::buffer_frame::PAGE_SIZE;
+use crate::buffer_pool::PageMutation;
 pub use crate::page_header::PageType;
 
 const HEADER_SIZE: usize = std::mem::size_of::<PageHeader>();
@@ -628,6 +629,43 @@ impl SlottedPage {
         self.header_mut().space_used += data_len as u32;
     }
 
+    /// Insert a key/value pair and add every changed byte range to `mutation`.
+    ///
+    /// If insertion compacts the page, the recorded ranges cover the rewritten
+    /// slot array and live data heap. The buffer pool can therefore choose a
+    /// compact patch or its full-image fallback from the actual mutation size.
+    #[inline]
+    pub fn insert_with_mutation(
+        &mut self,
+        slot_id: u16,
+        key: &[u8],
+        value: &[u8],
+        mutation: &mut PageMutation,
+    ) {
+        let count = self.header().num_slots;
+        let data_len = key.len() + value.len();
+        let needed = SLOT_SIZE + data_len;
+        let compacted = self.free_space() < needed;
+
+        self.insert(slot_id, key, value);
+
+        mutation.add_range(std::mem::size_of::<u64>()..HEADER_SIZE);
+        let first_changed_slot = if compacted { 0 } else { slot_id as usize };
+        mutation.add_range(
+            HEADER_SIZE + first_changed_slot * SLOT_SIZE
+                ..HEADER_SIZE + (count as usize + 1) * SLOT_SIZE,
+        );
+        let data_start = self.header().data_offset as usize;
+        let data_end = if compacted {
+            PAGE_SIZE
+        } else {
+            data_start + data_len
+        };
+        if data_start < data_end {
+            mutation.add_range(data_start..data_end);
+        }
+    }
+
     /// Remove entry at `slot_id`. Shifts remaining slots left.
     pub fn remove(&mut self, slot_id: u16) {
         let count = self.header().num_slots;
@@ -655,6 +693,20 @@ impl SlottedPage {
         self.header_mut().flags |= FLAG_HAS_GARBAGE;
     }
 
+    /// Remove one entry and add every changed byte range to `mutation`.
+    #[inline]
+    pub fn remove_with_mutation(&mut self, slot_id: u16, mutation: &mut PageMutation) {
+        let count = self.header().num_slots;
+        self.remove(slot_id);
+
+        mutation.add_range(std::mem::size_of::<u64>()..HEADER_SIZE);
+        let changed_slots_end = HEADER_SIZE + (count as usize - 1) * SLOT_SIZE;
+        let changed_slots_start = HEADER_SIZE + slot_id as usize * SLOT_SIZE;
+        if changed_slots_start < changed_slots_end {
+            mutation.add_range(changed_slots_start..changed_slots_end);
+        }
+    }
+
     /// Update value in-place if new value is the same length as existing.
     /// Returns `false` if lengths differ.
     pub fn update_value_if_same_length(&mut self, slot_id: u16, value: &[u8]) -> bool {
@@ -664,6 +716,24 @@ impl SlottedPage {
         }
         let start = s.offset as usize + s.key_len as usize;
         self.data[start..start + value.len()].copy_from_slice(value);
+        true
+    }
+
+    /// Update a same-length value and add its changed byte range to `mutation`.
+    #[inline]
+    pub fn update_value_with_mutation(
+        &mut self,
+        slot_id: u16,
+        value: &[u8],
+        mutation: &mut PageMutation,
+    ) -> bool {
+        let range = self.value_range(slot_id);
+        if !self.update_value_if_same_length(slot_id, value) {
+            return false;
+        }
+        if !range.is_empty() {
+            mutation.add_range(range);
+        }
         true
     }
 
@@ -838,6 +908,22 @@ mod tests {
 
     fn new_page() -> AlignedBuf {
         AlignedBuf([0u8; PAGE_SIZE])
+    }
+
+    fn assert_changed_bytes_covered(
+        before: &[u8; PAGE_SIZE],
+        after: &[u8; PAGE_SIZE],
+        mutation: &PageMutation,
+    ) {
+        let ranges: Vec<_> = mutation.ranges().collect();
+        for offset in std::mem::size_of::<u64>()..PAGE_SIZE {
+            if before[offset] != after[offset] {
+                assert!(
+                    ranges.iter().any(|range| range.contains(&offset)),
+                    "changed byte {offset} is absent from {ranges:?}"
+                );
+            }
+        }
     }
 
     struct GeneratedCase {
@@ -1057,6 +1143,61 @@ mod tests {
         assert_eq!(sp.free_space(), free_before + SLOT_SIZE);
         // But free_space_after_compaction does.
         assert!(sp.free_space_after_compaction() > sp.free_space());
+    }
+
+    #[test]
+    fn mutation_ranges_cover_insert_remove_and_update_postimages() {
+        let mut buf = new_page();
+        let sp = SlottedPage::init(&mut buf.0);
+        sp.reserve_suffix(16);
+        sp.insert(0, b"aaa", b"value-a");
+        sp.insert(1, b"ccc", b"value-c");
+
+        let before_insert = buf.0;
+        let mut mutation = PageMutation::new();
+        let sp = SlottedPage::from_page_mut(&mut buf.0);
+        sp.insert_with_mutation(1, b"bbb", b"value-b", &mut mutation);
+        assert_changed_bytes_covered(&before_insert, &buf.0, &mutation);
+
+        let before_remove = buf.0;
+        let mut mutation = PageMutation::new();
+        let sp = SlottedPage::from_page_mut(&mut buf.0);
+        sp.remove_with_mutation(1, &mut mutation);
+        assert_changed_bytes_covered(&before_remove, &buf.0, &mutation);
+
+        let before_update = buf.0;
+        let mut mutation = PageMutation::new();
+        let sp = SlottedPage::from_page_mut(&mut buf.0);
+        assert!(sp.update_value_with_mutation(1, b"VALUE-C", &mut mutation));
+        assert_changed_bytes_covered(&before_update, &buf.0, &mutation);
+    }
+
+    #[test]
+    fn mutation_ranges_cover_insert_that_compacts() {
+        let mut buf = new_page();
+        let sp = SlottedPage::init(&mut buf.0);
+        sp.reserve_suffix(16);
+        let mut key = 0u64;
+        while sp.can_insert(8, 64) {
+            sp.insert(sp.num_slots(), &key.to_be_bytes(), &[key as u8; 64]);
+            key += 1;
+        }
+        sp.remove(0);
+        sp.remove(0);
+
+        let free_space = sp.free_space();
+        let value_len = free_space + 1 - SLOT_SIZE - 8;
+        assert!(
+            sp.free_space_after_compaction() >= SLOT_SIZE + 8 + value_len,
+            "test setup must require and permit compaction"
+        );
+        let value = vec![0x5a; value_len];
+        let before = buf.0;
+        let mut mutation = PageMutation::new();
+        let sp = SlottedPage::from_page_mut(&mut buf.0);
+        sp.insert_with_mutation(sp.num_slots(), &key.to_be_bytes(), &value, &mut mutation);
+
+        assert_changed_bytes_covered(&before, &buf.0, &mutation);
     }
 
     #[test]

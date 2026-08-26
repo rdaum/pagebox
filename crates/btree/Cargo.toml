@@ -22,6 +22,7 @@ parking_lot.workspace = true
 [dev-dependencies]
 fast-telemetry.workspace = true
 micromeasure.workspace = true
+pagebox-wal.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 

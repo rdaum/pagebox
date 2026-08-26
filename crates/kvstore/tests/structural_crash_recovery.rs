@@ -34,7 +34,31 @@ impl OwnedRecord {
                 .unwrap();
             }
             Self::Logical { lsn, kind, payload } => {
-                wal.append_logical_with_lsn(*lsn, *kind, payload).unwrap()
+                // Captured tree mutations use Pagebox's internal patch format.
+                // Re-append through its page API; caller-logical appends reject
+                // reserved kinds. Keep each patch as one durable-prefix step.
+                assert_eq!(*kind, 0x4258_5041_5443_0001, "expected a page patch");
+                let page_id = u64::from_le_bytes(payload[..8].try_into().unwrap());
+                let count = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+                let mut ranges = Vec::new();
+                let mut offset = 16;
+                for _ in 0..count {
+                    let start = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap())
+                        as usize;
+                    let len =
+                        u32::from_le_bytes(payload[offset + 4..offset + 8].try_into().unwrap())
+                            as usize;
+                    offset += 8;
+                    ranges.push((start, &payload[offset..offset + len]));
+                    offset += len;
+                }
+                assert_eq!(offset, payload.len(), "patch must have no trailing bytes");
+                assert_eq!(
+                    wal.append_page_patch_ranges_with_lsn(*lsn, page_id, &ranges)
+                        .unwrap(),
+                    Some(payload.len()),
+                    "captured patch must retain its compact encoding"
+                );
             }
         }
     }

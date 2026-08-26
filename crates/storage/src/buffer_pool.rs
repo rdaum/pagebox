@@ -93,8 +93,9 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::mem::MaybeUninit;
 use std::num::NonZeroU64;
-use std::ops::Deref;
+use std::ops::{Deref, Range};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
@@ -130,6 +131,179 @@ use pagebox_swip_kernel::{AtomicSwipWord as AtomicSwip, SwipWord as Swip};
 
 static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 const FRAME_CAPACITY_STALL_LIMIT: u32 = 256;
+
+/// Maximum number of disjoint byte ranges retained by a [`PageMutation`].
+///
+/// Page-layout operations normally touch a header, part of a slot array, and
+/// one or two heap regions. If a mutation remains more fragmented after
+/// coalescing, it automatically requests a full-page WAL image instead of
+/// allocating overflow storage.
+pub const PAGE_MUTATION_MAX_RANGES: usize = 8;
+
+const PAGE_LSN_RANGE: Range<usize> = 0..std::mem::size_of::<Lsn>();
+const _: () = assert!(PAGE_SIZE <= u32::MAX as usize);
+
+#[derive(Clone, Copy)]
+struct PageMutationRange {
+    start: u32,
+    end: u32,
+}
+
+/// Allocation-free description of the page bytes changed by one mutation.
+///
+/// Ranges refer to the post-mutation bytes already installed in an
+/// exclusively latched frame. [`PageMutation::add_range`] keeps them ordered
+/// and coalesces adjacent or overlapping ranges. Invalid page-local ranges
+/// panic because they indicate a page-layout implementation bug. Mutations
+/// with more than [`PAGE_MUTATION_MAX_RANGES`] disjoint ranges transparently
+/// fall back to a full-page image.
+///
+/// The common page-LSN bytes are owned by the buffer pool and must not be
+/// included by callers. [`ExclusiveFrame::mark_dirty_ranges`] adds that range
+/// after assigning the mutation's LSN.
+#[derive(Clone, Copy)]
+pub struct PageMutation {
+    ranges: [MaybeUninit<PageMutationRange>; PAGE_MUTATION_MAX_RANGES],
+    len: usize,
+    full_image: bool,
+}
+
+impl PageMutation {
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            ranges: [MaybeUninit::uninit(); PAGE_MUTATION_MAX_RANGES],
+            len: 0,
+            full_image: false,
+        }
+    }
+
+    #[inline]
+    fn range(&self, index: usize) -> PageMutationRange {
+        debug_assert!(index < self.len);
+        // SAFETY: `len` advances only after the indexed element is written.
+        unsafe { self.ranges[index].assume_init() }
+    }
+
+    #[inline]
+    fn set_range(&mut self, index: usize, range: PageMutationRange) {
+        self.ranges[index].write(range);
+    }
+
+    /// Add a non-empty changed range in post-mutation page coordinates.
+    ///
+    /// Ranges may arrive in any order. Adjacent and overlapping ranges are
+    /// normalized into one range. Exceeding the inline capacity selects the
+    /// full-image fallback; it is not an error and does not allocate.
+    #[inline]
+    #[track_caller]
+    pub fn add_range(&mut self, range: Range<usize>) {
+        assert!(
+            range.start < range.end,
+            "page mutation range must be non-empty"
+        );
+        assert!(
+            range.end <= PAGE_SIZE,
+            "page mutation range extends beyond page"
+        );
+        assert!(
+            range.start >= PAGE_LSN_RANGE.end,
+            "page mutation range overlaps Pagebox-owned page LSN"
+        );
+
+        if self.full_image {
+            return;
+        }
+
+        let mut start = range.start as u32;
+        let mut end = range.end as u32;
+        if self.len == 0 {
+            self.set_range(0, PageMutationRange { start, end });
+            self.len = 1;
+            return;
+        }
+
+        let last = self.range(self.len - 1);
+        if start >= last.start {
+            if start <= last.end {
+                self.set_range(
+                    self.len - 1,
+                    PageMutationRange {
+                        start: last.start,
+                        end: end.max(last.end),
+                    },
+                );
+                return;
+            }
+            if self.len == PAGE_MUTATION_MAX_RANGES {
+                self.len = 0;
+                self.full_image = true;
+                return;
+            }
+            self.set_range(self.len, PageMutationRange { start, end });
+            self.len += 1;
+            return;
+        }
+
+        let mut first = 0;
+        while first < self.len && self.range(first).end < start {
+            first += 1;
+        }
+
+        let mut after = first;
+        while after < self.len && self.range(after).start <= end {
+            let current = self.range(after);
+            start = start.min(current.start);
+            end = end.max(current.end);
+            after += 1;
+        }
+
+        if first < after {
+            self.set_range(first, PageMutationRange { start, end });
+            let removed = after - first - 1;
+            if removed > 0 {
+                self.ranges.copy_within(after..self.len, first + 1);
+                self.len -= removed;
+            }
+            return;
+        }
+
+        if self.len == PAGE_MUTATION_MAX_RANGES {
+            self.len = 0;
+            self.full_image = true;
+            return;
+        }
+
+        self.ranges.copy_within(first..self.len, first + 1);
+        self.set_range(first, PageMutationRange { start, end });
+        self.len += 1;
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0 && !self.full_image
+    }
+
+    #[inline]
+    pub fn uses_full_image(&self) -> bool {
+        self.full_image
+    }
+
+    #[inline]
+    pub fn ranges(&self) -> impl ExactSizeIterator<Item = Range<usize>> + '_ {
+        self.ranges[..self.len].iter().map(|range| {
+            // SAFETY: every element below `len` has been initialized.
+            let range = unsafe { range.assume_init_ref() };
+            range.start as usize..range.end as usize
+        })
+    }
+}
+
+impl Default for PageMutation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 fn allocate_pool_id() -> PoolId {
     let raw = NEXT_POOL_ID
@@ -1426,6 +1600,11 @@ impl BufferPool {
             (*bf)
                 .header
                 .core
+                .has_page_image_base
+                .store(on_disk_lsn != 0, Ordering::Relaxed);
+            (*bf)
+                .header
+                .core
                 .wal_buffer_epoch
                 .store(0, Ordering::Relaxed);
             (*bf)
@@ -1444,6 +1623,11 @@ impl BufferPool {
         unsafe {
             (*bf).header.core.pin_count.store(0, Ordering::Relaxed);
             (*bf).header.parent_link = ParentLink::None;
+            (*bf)
+                .header
+                .core
+                .has_page_image_base
+                .store(false, Ordering::Relaxed);
             (*bf)
                 .header
                 .core
@@ -1633,6 +1817,11 @@ fn try_claim_prefetch_frame(
         (*bf).header.core.pid = pid;
         (*bf).header.core.pin_count.store(0, Ordering::Relaxed);
         (*bf).header.core.dirty.store(false, Ordering::Relaxed);
+        (*bf)
+            .header
+            .core
+            .has_page_image_base
+            .store(false, Ordering::Relaxed);
         (*bf).header.parent_link = ParentLink::None;
     }
     Some(LoadingFrameReservation::new(pool, bf))
@@ -1661,6 +1850,11 @@ fn finish_prefetch_frame(
                 .core
                 .page_lsn
                 .store(on_disk_lsn, Ordering::Relaxed);
+            (*bf)
+                .header
+                .core
+                .has_page_image_base
+                .store(on_disk_lsn != 0, Ordering::Relaxed);
             (*bf).header.core.dirty.store(false, Ordering::Relaxed);
             (*bf).header.core.pin_count.store(0, Ordering::Relaxed);
             (*bf).header.parent_link = ParentLink::Unswizzled;
@@ -2283,12 +2477,31 @@ impl<'a> ExclusiveFrame<'a> {
         self.pinned.mark_dirty_with_lsn(lsn);
     }
 
-    pub fn mark_dirty_patch(&self, offset: usize, data: &[u8]) {
-        unsafe {
-            self.pinned
-                .pool
-                .mark_dirty_patch_raw(self.raw(), offset, data)
-        };
+    /// Return whether range-aware dirty marking can emit WAL patches.
+    ///
+    /// Callers that build mutation descriptions on a hot path can skip that
+    /// bookkeeping when no WAL is attached; [`ExclusiveFrame::mark_dirty_ranges`]
+    /// would use the ordinary dirty path in that configuration.
+    #[inline]
+    pub fn logs_dirty_ranges(&self) -> bool {
+        #[cfg(not(miri))]
+        {
+            self.pinned.pool.wal.is_some()
+        }
+        #[cfg(miri)]
+        {
+            false
+        }
+    }
+
+    /// Mark the frame dirty and log the mutation's changed byte ranges.
+    ///
+    /// The caller must have already installed the postimage bytes described
+    /// by `mutation`. Pagebox assigns and adds the page LSN. A newly
+    /// initialized page, an over-capacity mutation, or a patch whose encoded
+    /// record is not smaller than a page uses a full-page WAL image.
+    pub fn mark_dirty_ranges(&self, mutation: &PageMutation) {
+        unsafe { self.pinned.pool.mark_dirty_ranges_raw(self.raw(), mutation) };
     }
 
     pub fn into_pinned(self) -> PinnedFrame<'a> {
@@ -3388,6 +3601,11 @@ impl BufferPool {
             (*bf)
                 .header
                 .core
+                .has_page_image_base
+                .store(false, Ordering::Relaxed);
+            (*bf)
+                .header
+                .core
                 .wal_buffer_epoch
                 .store(0, Ordering::Relaxed);
             (*bf)
@@ -3437,6 +3655,11 @@ impl BufferPool {
             (*bf).header.core.dirty.store(false, Ordering::Relaxed);
             (*bf).header.core.referenced.store(false, Ordering::Relaxed);
             (*bf).header.core.page_lsn.store(0, Ordering::Relaxed);
+            (*bf)
+                .header
+                .core
+                .has_page_image_base
+                .store(false, Ordering::Relaxed);
             (*bf)
                 .header
                 .core
@@ -3525,6 +3748,11 @@ impl BufferPool {
             (*bf).header.core.referenced.store(true, Ordering::Relaxed);
             (*bf).header.core.dirty.store(false, Ordering::Relaxed);
             (*bf).header.core.page_lsn.store(0, Ordering::Relaxed);
+            (*bf)
+                .header
+                .core
+                .has_page_image_base
+                .store(false, Ordering::Relaxed);
             (*bf)
                 .header
                 .core
@@ -4155,6 +4383,96 @@ impl BufferPool {
         // Parent pin management is handled during eviction.
     }
 
+    #[cfg(not(miri))]
+    unsafe fn append_full_page_image_with_lsn(
+        &self,
+        bf: *mut BufferFrame,
+        wal: &Wal,
+        was_dirty: bool,
+        lsn: Lsn,
+    ) {
+        let pid = unsafe { (*bf).header.core.pid };
+        let page = unsafe { (*bf).page_bytes_mut() };
+        assert_eq!(
+            page.len(),
+            PAGE_SIZE,
+            "buffer frame must use the workspace page size"
+        );
+        Self::record_page_kind(page, &self.metrics.dirty_wal_page_image_pages);
+        if was_dirty {
+            Self::record_page_kind(page, &self.metrics.dirty_wal_page_image_relog_pages);
+        }
+
+        let prev_epoch_raw = unsafe { (*bf).header.core.wal_buffer_epoch.load(Ordering::Relaxed) };
+        let prev_epoch = prev_epoch_raw & ((1u64 << 48) - 1);
+        let prev_shard_idx = (prev_epoch_raw >> 48) as u16;
+        let prev_offset = unsafe { (*bf).header.core.wal_buffer_offset.load(Ordering::Relaxed) };
+        let prev_record =
+            (was_dirty && prev_epoch != 0 && prev_offset != 0).then_some(BufferedWalRecord {
+                epoch: prev_epoch,
+                offset: prev_offset,
+                shard_idx: prev_shard_idx,
+            });
+
+        page_header::write_page_lsn(page, lsn);
+        let mut scratch = PageScratch::take();
+        scratch.as_mut_slice().copy_from_slice(page);
+        prepare_page_copy_for_writeback(scratch.as_mut_slice(), self);
+        let mut record = BufferedWalRecord {
+            epoch: 0,
+            offset: 0,
+            shard_idx: 0,
+        };
+        let mut logged = false;
+
+        if let Some(prev_record) = prev_record {
+            logged = wal
+                .try_overwrite_page_image_with_lsn(prev_record, lsn, pid, |_lsn, page_image| {
+                    page_image.copy_from_slice(scratch.as_mut_slice());
+                })
+                .expect("WAL overwrite failed");
+            if logged {
+                record = prev_record;
+            }
+        }
+
+        if !logged {
+            record = wal
+                .append_page_image_with_lsn(lsn, pid, |_lsn, page_image| {
+                    page_image.copy_from_slice(scratch.as_mut_slice());
+                })
+                .expect("WAL append failed");
+        }
+        unsafe {
+            (*bf).header.core.page_lsn.store(lsn, Ordering::Relaxed);
+            (*bf)
+                .header
+                .core
+                .has_page_image_base
+                .store(true, Ordering::Relaxed);
+            (*bf).header.core.wal_buffer_epoch.store(
+                record.epoch | ((u64::from(record.shard_idx)) << 48),
+                Ordering::Relaxed,
+            );
+            (*bf)
+                .header
+                .core
+                .wal_buffer_offset
+                .store(record.offset, Ordering::Relaxed);
+        }
+    }
+
+    unsafe fn finish_dirty_mark(&self, bf: *mut BufferFrame) {
+        unsafe {
+            (*bf)
+                .header
+                .core
+                .dirty_generation
+                .fetch_add(1, Ordering::Relaxed);
+            (*bf).header.core.dirty.store(true, Ordering::Release);
+        }
+    }
+
     /// Mark a frame as dirty (modified). If a WAL is attached, appends a
     /// full-page image to the WAL and records the LSN on the frame.
     ///
@@ -4177,84 +4495,93 @@ impl BufferPool {
         self.mark_referenced(bf);
         #[cfg(not(miri))]
         if let Some(ref wal) = self.wal {
+            let lsn = wal.claim_lsn();
+            unsafe { self.append_full_page_image_with_lsn(bf, wal, was_dirty, lsn) };
+        }
+        unsafe { self.finish_dirty_mark(bf) };
+    }
+
+    /// Mark a page dirty after an in-place mutation and log its changed ranges.
+    /// The caller must hold the frame's exclusive latch and the ranges must
+    /// describe postimage bytes already installed in the page.
+    unsafe fn mark_dirty_ranges_raw(&self, bf: *mut BufferFrame, mutation: &PageMutation) {
+        assert!(
+            !mutation.is_empty(),
+            "page mutation must contain at least one changed range"
+        );
+        debug_assert!(
+            unsafe { (*bf).header.core.pin_count.load(Ordering::Relaxed) } > 0,
+            "must be pinned to mark dirty"
+        );
+
+        #[cfg(not(miri))]
+        let Some(wal) = self.wal.as_ref() else {
+            unsafe { self.mark_dirty_raw(bf) };
+            return;
+        };
+        #[cfg(miri)]
+        {
+            let _ = mutation;
+            unsafe { self.mark_dirty_raw(bf) };
+            return;
+        }
+
+        #[cfg(not(miri))]
+        {
+            let has_recovery_base = unsafe {
+                (*bf)
+                    .header
+                    .core
+                    .has_page_image_base
+                    .load(Ordering::Relaxed)
+            };
+            if mutation.uses_full_image() || !has_recovery_base {
+                unsafe { self.mark_dirty_raw(bf) };
+                return;
+            }
+
+            self.metrics
+                .eviction_events
+                .inc(BufferPoolEvictionEvent::DirtyMarks);
+            let was_dirty = unsafe { (*bf).header.core.dirty.load(Ordering::Relaxed) };
+            if was_dirty {
+                self.metrics
+                    .eviction_events
+                    .inc(BufferPoolEvictionEvent::DirtyRelogs);
+            }
+            self.mark_referenced(bf);
+
             let pid = unsafe { (*bf).header.core.pid };
+            let lsn = wal.claim_lsn();
+            let lsn_bytes = lsn.to_le_bytes();
             let page = unsafe { (*bf).page_bytes_mut() };
-            if page.len() == PAGE_SIZE {
-                Self::record_page_kind(page, &self.metrics.dirty_wal_page_image_pages);
-                if was_dirty {
-                    Self::record_page_kind(page, &self.metrics.dirty_wal_page_image_relog_pages);
-                }
-                let prev_epoch_raw =
-                    unsafe { (*bf).header.core.wal_buffer_epoch.load(Ordering::Relaxed) };
-                let prev_epoch = prev_epoch_raw & ((1u64 << 48) - 1);
-                let prev_shard_idx = (prev_epoch_raw >> 48) as u16;
-                let prev_offset =
-                    unsafe { (*bf).header.core.wal_buffer_offset.load(Ordering::Relaxed) };
-                let prev_record = (was_dirty && prev_epoch != 0 && prev_offset != 0).then_some(
-                    BufferedWalRecord {
-                        epoch: prev_epoch,
-                        offset: prev_offset,
-                        shard_idx: prev_shard_idx,
-                    },
-                );
-                let lsn = wal.claim_lsn();
-                page_header::write_page_lsn(page, lsn);
-                let mut scratch = PageScratch::take();
-                scratch.as_mut_slice().copy_from_slice(page);
-                prepare_page_copy_for_writeback(scratch.as_mut_slice(), self);
-                let mut record = BufferedWalRecord {
-                    epoch: 0,
-                    offset: 0,
-                    shard_idx: 0,
-                };
-                let mut logged = false;
+            page_header::write_page_lsn(page, lsn);
 
-                if let Some(prev_record) = prev_record {
-                    logged = wal
-                        .try_overwrite_page_image_with_lsn(
-                            prev_record,
-                            lsn,
-                            pid,
-                            |_lsn, page_image| {
-                                page_image.copy_from_slice(scratch.as_mut_slice());
-                            },
-                        )
-                        .expect("WAL overwrite failed");
-                    if logged {
-                        record = prev_record;
-                    }
-                }
-
-                if !logged {
-                    record = wal
-                        .append_page_image_with_lsn(lsn, pid, |_lsn, page_image| {
-                            page_image.copy_from_slice(scratch.as_mut_slice());
-                        })
-                        .expect("WAL append failed");
-                }
-                unsafe {
-                    (*bf).header.core.page_lsn.store(lsn, Ordering::Relaxed);
-                    (*bf).header.core.wal_buffer_epoch.store(
-                        record.epoch | ((u64::from(record.shard_idx)) << 48),
-                        Ordering::Relaxed,
-                    );
-                    (*bf)
-                        .header
-                        .core
-                        .wal_buffer_offset
-                        .store(record.offset, Ordering::Relaxed);
-                };
+            let needs_preparation = page_header::is_inner_index_page(page)
+                || self
+                    .page_writeback_preparers
+                    .lock()
+                    .contains_key(&page_header::read_page_type(page));
+            let mut prepared_page = needs_preparation.then(PageScratch::take);
+            let source = if let Some(prepared_page) = prepared_page.as_mut() {
+                prepared_page.as_mut_slice().copy_from_slice(page);
+                prepare_page_copy_for_writeback(prepared_page.as_mut_slice(), self);
+                &prepared_page.as_mut_slice()[..]
             } else {
-                let lsn = wal.claim_lsn();
-                page_header::write_page_lsn(page, lsn);
-                let mut page_copy = AlignedPageCopy::copy_from(page);
-                prepare_page_copy_for_writeback(page_copy.as_mut_slice(), self);
-                let page_len = page_copy.as_slice().len();
-                wal.append_page_image_bytes_with_lsn(lsn, pid, page_len, |lsn, page_image| {
-                    page_header::write_page_lsn(page_image, lsn);
-                    page_image.copy_from_slice(page_copy.as_slice());
-                })
-                .expect("WAL append failed");
+                &page[..]
+            };
+
+            let mut patch_ranges = [(0usize, &[][..]); PAGE_MUTATION_MAX_RANGES + 1];
+            patch_ranges[0] = (PAGE_LSN_RANGE.start, &lsn_bytes);
+            for (index, range) in mutation.ranges().enumerate() {
+                patch_ranges[index + 1] = (range.start, &source[range]);
+            }
+            let patch_range_count = mutation.ranges().len() + 1;
+            let encoded_bytes = wal
+                .append_page_patch_ranges_with_lsn(lsn, pid, &patch_ranges[..patch_range_count])
+                .expect("WAL page-patch append failed");
+
+            if let Some(encoded_bytes) = encoded_bytes {
                 unsafe {
                     (*bf).header.core.page_lsn.store(lsn, Ordering::Relaxed);
                     (*bf)
@@ -4267,98 +4594,16 @@ impl BufferPool {
                         .core
                         .wal_buffer_offset
                         .store(0, Ordering::Relaxed);
-                };
-            }
-        }
-        unsafe {
-            (*bf)
-                .header
-                .core
-                .dirty_generation
-                .fetch_add(1, Ordering::Relaxed);
-            (*bf).header.core.dirty.store(true, Ordering::Release);
-        };
-    }
-
-    /// Mark a page dirty after an in-place byte-range update and log only the
-    /// page LSN plus the changed range. The caller must hold the frame's
-    /// exclusive latch and `data` must already match the page at `offset`.
-    unsafe fn mark_dirty_patch_raw(&self, bf: *mut BufferFrame, offset: usize, data: &[u8]) {
-        #[cfg(not(miri))]
-        let Some(wal) = self.wal.as_ref() else {
-            unsafe { self.mark_dirty_raw(bf) };
-            return;
-        };
-        #[cfg(miri)]
-        {
-            let _ = (offset, data);
-            unsafe { self.mark_dirty_raw(bf) };
-            return;
-        }
-
-        #[cfg(not(miri))]
-        {
-            debug_assert!(
-                unsafe { (*bf).header.core.pin_count.load(Ordering::Relaxed) } > 0,
-                "must be pinned to mark dirty"
-            );
-            assert!(offset >= std::mem::size_of::<Lsn>());
-            let end = offset
-                .checked_add(data.len())
-                .expect("dirty patch range overflow");
-            assert!(end <= PAGE_SIZE, "dirty patch extends beyond page");
-            let page = unsafe { (*bf).page_bytes_mut() };
-            assert_eq!(
-                &page[offset..end],
-                data,
-                "dirty patch bytes must already be installed in the page"
-            );
-
-            self.metrics
-                .eviction_events
-                .inc(BufferPoolEvictionEvent::DirtyMarks);
-            if unsafe { (*bf).header.core.dirty.load(Ordering::Relaxed) } {
+                }
+                self.metrics.dirty_wal_page_patch_records.inc();
                 self.metrics
-                    .eviction_events
-                    .inc(BufferPoolEvictionEvent::DirtyRelogs);
-            }
-            self.mark_referenced(bf);
-
-            let pid = unsafe { (*bf).header.core.pid };
-            let lsn = wal.claim_lsn();
-            let lsn_bytes = lsn.to_le_bytes();
-            let encoded_bytes = if data.is_empty() {
-                wal.append_page_patch_ranges_with_lsn(lsn, pid, &[(0, &lsn_bytes)])
+                    .dirty_wal_page_patch_bytes
+                    .add(encoded_bytes.min(isize::MAX as usize) as isize);
             } else {
-                wal.append_page_patch_ranges_with_lsn(lsn, pid, &[(0, &lsn_bytes), (offset, data)])
+                drop(prepared_page);
+                unsafe { self.append_full_page_image_with_lsn(bf, wal, was_dirty, lsn) };
             }
-            .expect("WAL page-patch append failed")
-            .expect("valid page-local ranges must use patch encoding");
-
-            page_header::write_page_lsn(page, lsn);
-            unsafe {
-                (*bf).header.core.page_lsn.store(lsn, Ordering::Relaxed);
-                (*bf)
-                    .header
-                    .core
-                    .wal_buffer_epoch
-                    .store(0, Ordering::Relaxed);
-                (*bf)
-                    .header
-                    .core
-                    .wal_buffer_offset
-                    .store(0, Ordering::Relaxed);
-                (*bf)
-                    .header
-                    .core
-                    .dirty_generation
-                    .fetch_add(1, Ordering::Relaxed);
-                (*bf).header.core.dirty.store(true, Ordering::Release);
-            }
-            self.metrics.dirty_wal_page_patch_records.inc();
-            self.metrics
-                .dirty_wal_page_patch_bytes
-                .add(encoded_bytes.min(isize::MAX as usize) as isize);
+            unsafe { self.finish_dirty_mark(bf) };
         }
     }
 
@@ -5203,6 +5448,11 @@ impl BufferPool {
             (*bf)
                 .header
                 .core
+                .has_page_image_base
+                .store(true, Ordering::Relaxed);
+            (*bf)
+                .header
+                .core
                 .wal_buffer_epoch
                 .store(0, Ordering::Relaxed);
             (*bf)
@@ -5900,6 +6150,11 @@ impl BufferPool {
                 (**bf)
                     .header
                     .core
+                    .has_page_image_base
+                    .store(true, Ordering::Relaxed);
+                (**bf)
+                    .header
+                    .core
                     .wal_buffer_epoch
                     .store(0, Ordering::Relaxed);
                 (**bf)
@@ -6025,7 +6280,7 @@ mod tests {
     use super::*;
 
     #[cfg(not(miri))]
-    use pagebox_wal::CommitMode;
+    use pagebox_wal::{CommitMode, WalReplayRecord};
 
     use crate::buffer_frame::physical_page_number;
 
@@ -6056,6 +6311,67 @@ mod tests {
             stats.page_table_lock_wait_ns > 0,
             "a blocked shard lookup must report non-zero wait time"
         );
+    }
+
+    #[test]
+    fn page_mutation_coalesces_and_orders_ranges_without_allocation() {
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<PageMutation>();
+        assert!(!std::mem::needs_drop::<PageMutation>());
+        assert!(std::mem::size_of::<PageMutation>() <= 80);
+
+        let mut mutation = PageMutation::new();
+        mutation.add_range(100..110);
+        mutation.add_range(64..72);
+        mutation.add_range(72..90);
+        mutation.add_range(88..105);
+        mutation.add_range(200..208);
+
+        assert_eq!(
+            mutation.ranges().collect::<Vec<_>>(),
+            vec![64..110, 200..208]
+        );
+        assert!(!mutation.uses_full_image());
+    }
+
+    #[test]
+    fn page_mutation_capacity_overflow_selects_full_image() {
+        let mut mutation = PageMutation::new();
+        for index in 0..=PAGE_MUTATION_MAX_RANGES {
+            let start = 64 + index * 4;
+            mutation.add_range(start..start + 1);
+        }
+
+        assert!(mutation.uses_full_image());
+        assert_eq!(mutation.ranges().len(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "page mutation range must be non-empty")]
+    fn page_mutation_rejects_empty_range() {
+        PageMutation::new().add_range(64..64);
+    }
+
+    #[test]
+    #[should_panic(expected = "page mutation range overlaps Pagebox-owned page LSN")]
+    fn page_mutation_rejects_page_lsn_overlap() {
+        PageMutation::new().add_range(4..12);
+    }
+
+    #[test]
+    #[should_panic(expected = "page mutation range extends beyond page")]
+    fn page_mutation_rejects_out_of_bounds_range() {
+        PageMutation::new().add_range(PAGE_SIZE - 1..PAGE_SIZE + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "page mutation must contain at least one changed range")]
+    fn dirty_ranges_reject_empty_mutation_without_wal() {
+        let pool = BufferPool::new(1);
+        let page = pool.allocate_unlinked(unsafe { NoLatches::new(&pool) });
+        page.exclusive()
+            .frame()
+            .mark_dirty_ranges(&PageMutation::new());
     }
 
     #[cfg(not(miri))]
@@ -6855,6 +7171,247 @@ mod tests {
             123,
             "page LSN should survive reload"
         );
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn dirty_ranges_log_one_compact_multi_range_patch_and_recover_exact_postimage() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = Arc::new(Wal::open(&dir.path().join("wal")).unwrap());
+        let store = Arc::new(InMemoryPageStore::new());
+        let mut pool = BufferPool::with_store(1, Box::new(Arc::clone(&store)));
+        pool.set_wal(Arc::clone(&wal));
+        let edge = pool.allocate_page();
+        let pid = edge.page_id();
+
+        {
+            let mut frame = pool
+                .fix_stable(&edge, unsafe { NoLatches::new(&pool) })
+                .exclusive();
+            frame.page_mut()[64..68].copy_from_slice(b"base");
+            frame.page_mut()[128..132].copy_from_slice(b"keep");
+            frame.mark_dirty();
+        }
+        wal.flush();
+
+        let expected_lsn = {
+            let mut frame = pool
+                .fix_stable(&edge, unsafe { NoLatches::new(&pool) })
+                .exclusive();
+            frame.page_mut()[64..68].copy_from_slice(b"left");
+            frame.page_mut()[192..197].copy_from_slice(b"right");
+            let mut mutation = PageMutation::new();
+            mutation.add_range(192..197);
+            mutation.add_range(64..68);
+            frame.mark_dirty_ranges(&mutation);
+            page_header::read_page_lsn(frame.page())
+        };
+        wal.flush();
+
+        let mut page_images = 0;
+        let mut logical_records = 0;
+        wal.replay_records(|record| match record {
+            WalReplayRecord::PageImage { .. } => page_images += 1,
+            WalReplayRecord::Logical { .. } => logical_records += 1,
+        })
+        .unwrap();
+        assert_eq!(page_images, 1, "initialization must use one page image");
+        assert_eq!(logical_records, 1, "the mutation must use one patch record");
+        assert_eq!(pool.diagnostic_stats().dirty_wal_page_patch_records, 1);
+
+        wal.recover_pages(store.as_ref(), 0, page_header::read_page_lsn)
+            .unwrap();
+        let mut recovered = [0u8; PAGE_SIZE];
+        assert!(PageStore::read_page(store.as_ref(), pid, &mut recovered).unwrap());
+        assert_eq!(&recovered[64..68], b"left");
+        assert_eq!(&recovered[128..132], b"keep");
+        assert_eq!(&recovered[192..197], b"right");
+        assert_eq!(
+            page_header::read_page_lsn(&recovered),
+            expected_lsn,
+            "recovery must apply the Pagebox-owned LSN range"
+        );
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn dirty_ranges_use_full_image_for_newly_initialized_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = Arc::new(Wal::open(&dir.path().join("wal")).unwrap());
+        let store = Arc::new(InMemoryPageStore::new());
+        let mut pool = BufferPool::with_store(1, Box::new(Arc::clone(&store)));
+        pool.set_wal(Arc::clone(&wal));
+        let edge = pool.allocate_page();
+        let pid = edge.page_id();
+
+        {
+            let mut frame = pool
+                .fix_stable(&edge, unsafe { NoLatches::new(&pool) })
+                .exclusive();
+            frame.page_mut()[64] = 7;
+            frame.page_mut()[128] = 9;
+            let mut mutation = PageMutation::new();
+            mutation.add_range(64..65);
+            frame.mark_dirty_ranges(&mutation);
+        }
+        wal.flush();
+
+        let mut page_images = 0;
+        let mut logical_records = 0;
+        wal.replay_records(|record| match record {
+            WalReplayRecord::PageImage { .. } => page_images += 1,
+            WalReplayRecord::Logical { .. } => logical_records += 1,
+        })
+        .unwrap();
+        assert_eq!(page_images, 1);
+        assert_eq!(logical_records, 0, "a new page cannot start with a patch");
+
+        wal.recover_pages(store.as_ref(), 0, page_header::read_page_lsn)
+            .unwrap();
+        let mut recovered = [0u8; PAGE_SIZE];
+        assert!(PageStore::read_page(store.as_ref(), pid, &mut recovered).unwrap());
+        assert_eq!(recovered[64], 7);
+        assert_eq!(
+            recovered[128], 9,
+            "the full initialization postimage must include bytes outside the supplied range"
+        );
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn dirty_ranges_require_page_image_base_after_caller_logical_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = Arc::new(Wal::open(&dir.path().join("wal")).unwrap());
+        let store = Arc::new(InMemoryPageStore::new());
+        let mut pool = BufferPool::with_store(1, Box::new(Arc::clone(&store)));
+        pool.set_wal(Arc::clone(&wal));
+        let edge = pool.allocate_page();
+
+        {
+            let mut frame = pool
+                .fix_stable(&edge, unsafe { NoLatches::new(&pool) })
+                .exclusive();
+            frame.page_mut()[64] = 1;
+            frame.page_mut()[128] = 9;
+            let logical_lsn = pool.append_logical_wal(42, b"initialize").unwrap().unwrap();
+            frame.mark_dirty_with_lsn(logical_lsn);
+
+            frame.page_mut()[64] = 2;
+            let mut mutation = PageMutation::new();
+            mutation.add_range(64..65);
+            frame.mark_dirty_ranges(&mutation);
+        }
+        wal.flush();
+
+        let mut page_images = 0;
+        let mut logical_records = 0;
+        wal.replay_records(|record| match record {
+            WalReplayRecord::PageImage { .. } => page_images += 1,
+            WalReplayRecord::Logical { .. } => logical_records += 1,
+        })
+        .unwrap();
+        assert_eq!(
+            logical_records, 1,
+            "the caller record must remain in the WAL"
+        );
+        assert_eq!(
+            page_images, 1,
+            "a caller-owned logical record is not a Pagebox page-image base"
+        );
+    }
+
+    struct MutationWritebackPreparer;
+
+    impl PageWritebackPreparer for MutationWritebackPreparer {
+        fn prepare_page_copy_for_writeback(&self, page: &mut [u8], _pool: &BufferPool) {
+            page[64] ^= 0xff;
+        }
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn dirty_ranges_encode_registered_writeback_representation() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = Arc::new(Wal::open(&dir.path().join("wal")).unwrap());
+        let store = Arc::new(InMemoryPageStore::new());
+        let mut pool = BufferPool::with_store(1, Box::new(Arc::clone(&store)));
+        pool.set_wal(Arc::clone(&wal));
+        pool.register_page_writeback_preparer(PageType::Tuple, Arc::new(MutationWritebackPreparer));
+        let edge = pool.allocate_page();
+        let pid = edge.page_id();
+
+        {
+            let mut frame = pool
+                .fix_stable(&edge, unsafe { NoLatches::new(&pool) })
+                .exclusive();
+            page_header::write_page_type(frame.page_mut(), PageType::Tuple);
+            frame.page_mut()[64] = 1;
+            frame.mark_dirty();
+        }
+        wal.flush();
+
+        {
+            let mut frame = pool
+                .fix_stable(&edge, unsafe { NoLatches::new(&pool) })
+                .exclusive();
+            frame.page_mut()[64] = 2;
+            let mut mutation = PageMutation::new();
+            mutation.add_range(64..65);
+            frame.mark_dirty_ranges(&mutation);
+        }
+        wal.flush();
+
+        wal.recover_pages(store.as_ref(), 0, page_header::read_page_lsn)
+            .unwrap();
+        let mut recovered = [0u8; PAGE_SIZE];
+        assert!(PageStore::read_page(store.as_ref(), pid, &mut recovered).unwrap());
+        assert_eq!(
+            recovered[64],
+            2 ^ 0xff,
+            "patch bytes must use the registered persistent representation"
+        );
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn dirty_ranges_fall_back_when_patch_is_not_smaller_than_page_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = Arc::new(Wal::open(&dir.path().join("wal")).unwrap());
+        let store = Arc::new(InMemoryPageStore::new());
+        let mut pool = BufferPool::with_store(1, Box::new(Arc::clone(&store)));
+        pool.set_wal(Arc::clone(&wal));
+        let edge = pool.allocate_page();
+
+        {
+            let mut frame = pool
+                .fix_stable(&edge, unsafe { NoLatches::new(&pool) })
+                .exclusive();
+            frame.page_mut()[64] = 1;
+            frame.mark_dirty();
+        }
+        wal.flush();
+
+        {
+            let mut frame = pool
+                .fix_stable(&edge, unsafe { NoLatches::new(&pool) })
+                .exclusive();
+            frame.page_mut()[PAGE_LSN_RANGE.end..].fill(0);
+            let mut mutation = PageMutation::new();
+            mutation.add_range(PAGE_LSN_RANGE.end..PAGE_SIZE);
+            frame.mark_dirty_ranges(&mutation);
+        }
+        wal.flush();
+
+        let mut page_images = 0;
+        let mut logical_records = 0;
+        wal.replay_records(|record| match record {
+            WalReplayRecord::PageImage { .. } => page_images += 1,
+            WalReplayRecord::Logical { .. } => logical_records += 1,
+        })
+        .unwrap();
+        assert_eq!(page_images, 2, "oversized patch must use a page image");
+        assert_eq!(logical_records, 0);
+        assert_eq!(pool.diagnostic_stats().dirty_wal_page_patch_records, 0);
     }
 
     #[test]

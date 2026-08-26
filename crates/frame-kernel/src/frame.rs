@@ -202,6 +202,9 @@ pub struct FrameCoreHeader {
     pub state: AtomicFrameState,
     /// LSN of the most recent WAL record for this page.
     pub page_lsn: AtomicU64,
+    /// Whether Pagebox has established a complete recovery base for the
+    /// page's initialized contents, either on disk or in the WAL.
+    pub has_page_image_base: AtomicBool,
     /// WAL buffer epoch containing the most recent buffered page image.
     pub wal_buffer_epoch: AtomicU64,
     /// Byte offset within the WAL buffer for the buffered page image.
@@ -218,6 +221,7 @@ impl FrameCoreHeader {
             referenced: AtomicBool::new(false),
             state: AtomicFrameState::new(FrameState::Free),
             page_lsn: AtomicU64::new(0),
+            has_page_image_base: AtomicBool::new(false),
             wal_buffer_epoch: AtomicU64::new(0),
             wal_buffer_offset: AtomicU32::new(0),
         }

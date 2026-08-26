@@ -6,7 +6,7 @@ use pagebox_storage::buffer_frame::{
     BufferFrameReadRef, BufferFrameRef, BufferFrameWriteRef, EvictingFrame, PAGE_SIZE, ParentLink,
 };
 use pagebox_storage::buffer_pool::{
-    BufferPool, ExclusiveFrame, NoLatches, OptimisticFrame, PinnedFrame, SharedFrame,
+    BufferPool, ExclusiveFrame, NoLatches, OptimisticFrame, PageMutation, PinnedFrame, SharedFrame,
 };
 use pagebox_storage::slotted_page::SlottedPage;
 use pagebox_swip_kernel::SwipWord as Swip;
@@ -115,27 +115,10 @@ impl BTreeNode {
         Swip::from_raw(u64::from_ne_bytes(val[..8].try_into().unwrap()))
     }
 
-    pub(crate) fn insert_inner_at(
-        bf: &mut BufferFrameWriteRef<'_>,
-        pos: u16,
-        key: &[u8],
-        child_swip: Swip,
-    ) {
-        let sp = Self::sp_mut(bf);
-        sp.insert(pos, key, &child_swip.raw().to_ne_bytes());
-    }
-
     pub(crate) fn set_child_swip_at(bf: &mut BufferFrameWriteRef<'_>, pos: u16, child_swip: Swip) {
         let sp = Self::sp_mut(bf);
         let ok = sp.update_value_if_same_length(pos, &child_swip.raw().to_ne_bytes());
         debug_assert!(ok, "child swip value must remain 8 bytes");
-    }
-
-    pub(crate) fn replace_inner_key(bf: &mut BufferFrameWriteRef<'_>, pos: u16, key: &[u8]) {
-        let child_swip = Self::child_swip_at(bf.read_ref(), pos);
-        let sp = Self::sp_mut(bf);
-        sp.remove(pos);
-        sp.insert(pos, key, &child_swip.raw().to_ne_bytes());
     }
 
     pub(crate) fn can_insert_inner(bf: BufferFrameReadRef<'_>, key_len: usize) -> bool {
@@ -425,14 +408,6 @@ impl<'g> ResidentFrame<'g> {
         self.with_sp_mut(|sp| sp.insert(pos, key, value));
     }
 
-    pub(crate) fn remove_slot(&mut self, pos: u16) {
-        self.with_sp_mut(|sp| sp.remove(pos));
-    }
-
-    pub(crate) fn update_value_if_same_length(&mut self, pos: u16, value: &[u8]) -> bool {
-        self.with_sp_mut(|sp| sp.update_value_if_same_length(pos, value))
-    }
-
     pub(crate) fn free_space_after_compaction(&self) -> usize {
         self.sp().free_space_after_compaction()
     }
@@ -471,16 +446,6 @@ impl<'g> ResidentFrame<'g> {
     pub(crate) fn set_child_swip_at(&mut self, pos: u16, swip: Swip) {
         let mut write = self.write_ref();
         BTreeNode::set_child_swip_at(&mut write, pos, swip)
-    }
-
-    pub(crate) fn replace_inner_key(&mut self, pos: u16, key: &[u8]) {
-        let mut write = self.write_ref();
-        BTreeNode::replace_inner_key(&mut write, pos, key)
-    }
-
-    pub(crate) fn insert_inner_at(&mut self, pos: u16, key: &[u8], child_swip: Swip) {
-        let mut write = self.write_ref();
-        BTreeNode::insert_inner_at(&mut write, pos, key, child_swip)
     }
 
     pub(crate) fn can_insert_inner(&self, key_len: usize) -> bool {
@@ -611,7 +576,9 @@ pub(crate) struct SharedNode<'a, Kind> {
 }
 
 pub(crate) struct ExclusiveNode<'a, Kind> {
+    logs_dirty_ranges: bool,
     frame: ExclusiveFrame<'a>,
+    mutation: PageMutation,
     _kind: PhantomData<Kind>,
 }
 
@@ -649,10 +616,7 @@ impl<'a> OptimisticNode<'a, Leaf> {
 
     pub(crate) fn upgrade_to_exclusive(self) -> Result<ExclusiveNode<'a, Leaf>, PinnedFrame<'a>> {
         let frame = self.frame.upgrade_to_exclusive()?;
-        Ok(ExclusiveNode {
-            frame,
-            _kind: PhantomData,
-        })
+        Ok(ExclusiveNode::new(frame))
     }
 
     pub(crate) fn upgrade_to_shared(self) -> Result<SharedNode<'a, Leaf>, PinnedFrame<'a>> {
@@ -761,20 +725,14 @@ impl<'a> OptimisticNode<'a, Inner> {
 
     pub(crate) fn upgrade_to_exclusive(self) -> Result<ExclusiveNode<'a, Inner>, PinnedFrame<'a>> {
         let frame = self.frame.upgrade_to_exclusive()?;
-        Ok(ExclusiveNode {
-            frame,
-            _kind: PhantomData,
-        })
+        Ok(ExclusiveNode::new(frame))
     }
 
     pub(crate) fn try_upgrade_to_exclusive(
         self,
     ) -> Result<ExclusiveNode<'a, Inner>, PinnedFrame<'a>> {
         let frame = self.frame.try_upgrade_to_exclusive()?;
-        Ok(ExclusiveNode {
-            frame,
-            _kind: PhantomData,
-        })
+        Ok(ExclusiveNode::new(frame))
     }
 }
 
@@ -833,16 +791,37 @@ impl<'a> SharedNode<'a, Leaf> {
 }
 
 impl<'a, Kind> ExclusiveNode<'a, Kind> {
+    fn new(frame: ExclusiveFrame<'a>) -> Self {
+        Self {
+            logs_dirty_ranges: frame.logs_dirty_ranges(),
+            frame,
+            mutation: PageMutation::new(),
+            _kind: PhantomData,
+        }
+    }
+
     pub(crate) fn resident_frame(&self) -> ResidentFrame<'a> {
         ResidentFrame::from_exclusive(&self.frame)
     }
 
-    pub(crate) fn mark_dirty(&self) {
-        self.frame.mark_dirty();
+    pub(crate) fn finish_mutation(&mut self) {
+        if !self.logs_dirty_ranges {
+            self.frame.mark_dirty();
+            return;
+        }
+        let mutation = std::mem::take(&mut self.mutation);
+        if mutation.is_empty() {
+            return;
+        }
+        self.frame.mark_dirty_ranges(&mutation);
     }
 
-    pub(crate) fn mark_dirty_patch(&self, offset: usize, data: &[u8]) {
-        self.frame.mark_dirty_patch(offset, data);
+    pub(crate) fn replace_page(&mut self, page: &[u8; PAGE_SIZE]) {
+        self.resident_frame().replace_page(page);
+        if self.logs_dirty_ranges {
+            self.mutation
+                .add_range(std::mem::size_of::<u64>()..PAGE_SIZE);
+        }
     }
 
     pub(crate) fn into_frame(self) -> ExclusiveFrame<'a> {
@@ -857,10 +836,7 @@ impl<'a, Kind> ExclusiveNode<'a, Kind> {
 
 impl<'a> ExclusiveNode<'a, Leaf> {
     pub(crate) fn from_leaf_frame(frame: ExclusiveFrame<'a>) -> Self {
-        Self {
-            frame,
-            _kind: PhantomData,
-        }
+        Self::new(frame)
     }
 
     pub(crate) fn pid(&self) -> u64 {
@@ -896,16 +872,40 @@ impl<'a> ExclusiveNode<'a, Leaf> {
     }
 
     pub(crate) fn insert_entry(&mut self, pos: u16, key: &[u8], value: &[u8]) {
-        self.resident_frame().insert(pos, key, value);
+        if self.logs_dirty_ranges {
+            self.resident_frame()
+                .with_sp_mut(|sp| sp.insert_with_mutation(pos, key, value, &mut self.mutation));
+        } else {
+            self.resident_frame()
+                .with_sp_mut(|sp| sp.insert(pos, key, value));
+        }
     }
 
     pub(crate) fn remove_slot(&mut self, pos: u16) {
-        self.resident_frame().remove_slot(pos);
+        if self.logs_dirty_ranges {
+            self.resident_frame()
+                .with_sp_mut(|sp| sp.remove_with_mutation(pos, &mut self.mutation));
+        } else {
+            self.resident_frame().with_sp_mut(|sp| sp.remove(pos));
+        }
     }
 
     pub(crate) fn update_value_if_same_length(&mut self, pos: u16, value: &[u8]) -> bool {
-        self.resident_frame()
-            .update_value_if_same_length(pos, value)
+        if self.logs_dirty_ranges {
+            self.resident_frame()
+                .with_sp_mut(|sp| sp.update_value_with_mutation(pos, value, &mut self.mutation))
+        } else {
+            self.resident_frame()
+                .with_sp_mut(|sp| sp.update_value_if_same_length(pos, value))
+        }
+    }
+
+    pub(crate) fn set_left_pid(&mut self, pid: u64) {
+        self.resident_frame().set_leaf_left_pid(pid);
+        if self.logs_dirty_ranges {
+            self.mutation
+                .add_range(LEFT_SIBLING_OFFSET..LEFT_SIBLING_OFFSET + 8);
+        }
     }
 
     pub(crate) fn free_space_after_compaction(&self) -> usize {
@@ -919,10 +919,7 @@ impl<'a> ExclusiveNode<'a, Leaf> {
 
 impl<'a> ExclusiveNode<'a, Inner> {
     pub(crate) fn from_inner_frame(frame: ExclusiveFrame<'a>) -> Self {
-        Self {
-            frame,
-            _kind: PhantomData,
-        }
+        Self::new(frame)
     }
 
     pub(crate) fn num_slots(&self) -> u16 {
@@ -1003,8 +1000,21 @@ impl<'a> ExclusiveNode<'a, Inner> {
 
     pub(crate) fn set_child_edge_swip(&mut self, edge: ParentEdge, swip: Swip) {
         match edge {
-            ParentEdge::Slot(pos) => self.resident_frame().set_child_swip_at(pos, swip),
-            ParentEdge::Upper => self.resident_frame().set_upper(swip),
+            ParentEdge::Slot(pos) => {
+                let value_range = self
+                    .logs_dirty_ranges
+                    .then(|| self.resident_frame().sp().value_range(pos));
+                self.resident_frame().set_child_swip_at(pos, swip);
+                if let Some(value_range) = value_range {
+                    self.mutation.add_range(value_range);
+                }
+            }
+            ParentEdge::Upper => {
+                self.resident_frame().set_upper(swip);
+                if self.logs_dirty_ranges {
+                    self.mutation.add_range(UPPER_OFFSET..PAGE_SIZE);
+                }
+            }
         }
     }
 
@@ -1013,14 +1023,55 @@ impl<'a> ExclusiveNode<'a, Inner> {
     }
 
     pub(crate) fn insert_separator(&mut self, pos: u16, key: &[u8], child_swip: Swip) {
-        self.resident_frame().insert_inner_at(pos, key, child_swip);
+        if self.logs_dirty_ranges {
+            self.resident_frame().with_sp_mut(|sp| {
+                sp.insert_with_mutation(
+                    pos,
+                    key,
+                    &child_swip.raw().to_ne_bytes(),
+                    &mut self.mutation,
+                )
+            });
+        } else {
+            self.resident_frame().with_sp_mut(|sp| {
+                sp.insert(pos, key, &child_swip.raw().to_ne_bytes());
+            });
+        }
     }
 
     pub(crate) fn set_separator_key(&mut self, pos: u16, key: &[u8]) {
-        self.resident_frame().replace_inner_key(pos, key);
+        let child_swip = self.resident_frame().child_swip_at(pos);
+        if self.logs_dirty_ranges {
+            self.resident_frame().with_sp_mut(|sp| {
+                sp.remove_with_mutation(pos, &mut self.mutation);
+                sp.insert_with_mutation(
+                    pos,
+                    key,
+                    &child_swip.raw().to_ne_bytes(),
+                    &mut self.mutation,
+                );
+            });
+        } else {
+            self.resident_frame().with_sp_mut(|sp| {
+                sp.remove(pos);
+                sp.insert(pos, key, &child_swip.raw().to_ne_bytes());
+            });
+        }
     }
 
     pub(crate) fn remove_slot(&mut self, pos: u16) {
-        self.resident_frame().with_sp_mut(|sp| sp.remove(pos));
+        if self.logs_dirty_ranges {
+            self.resident_frame()
+                .with_sp_mut(|sp| sp.remove_with_mutation(pos, &mut self.mutation));
+        } else {
+            self.resident_frame().with_sp_mut(|sp| sp.remove(pos));
+        }
+    }
+
+    pub(crate) fn set_upper(&mut self, swip: Swip) {
+        self.resident_frame().set_upper(swip);
+        if self.logs_dirty_ranges {
+            self.mutation.add_range(UPPER_OFFSET..PAGE_SIZE);
+        }
     }
 }

@@ -493,8 +493,8 @@ mod tests {
                 .extra
                 .get("dirty_wal_page_patch_records")
                 .map(String::as_str),
-            Some("1"),
-            "buffer-pool diagnostic counters must also be phase deltas"
+            Some("2"),
+            "phase deltas must count both the insert and same-length update patches"
         );
     }
 }
