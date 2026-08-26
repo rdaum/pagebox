@@ -1,12 +1,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+#[path = "support/micromeasure.rs"]
+mod benchmark_support;
+
 use micromeasure::{
     ConcurrentBenchContext, ConcurrentBenchControl, ConcurrentWorker, ConcurrentWorkerResult,
     Throughput, benchmark_main, black_box,
 };
 use pagebox_btree::BTree;
 use pagebox_storage::buffer_pool::BufferPool;
+
+use benchmark_support::PageboxBenchmarkRunner;
 
 const N_RECORDS: usize = 10_000;
 
@@ -70,6 +75,8 @@ fn ycsb_worker<const READ_PCT: u32>(
 }
 
 benchmark_main!(|runner| {
+    let runner = PageboxBenchmarkRunner::new(runner);
+
     for &n_threads in &[1usize, 2, 4] {
         let workers_a = [ConcurrentWorker {
             name: "ycsb_worker",

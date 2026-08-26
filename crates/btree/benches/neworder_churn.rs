@@ -1,8 +1,13 @@
 use std::sync::Arc;
 
+#[path = "support/micromeasure.rs"]
+mod benchmark_support;
+
 use micromeasure::{BenchContext, Throughput, benchmark_main, black_box};
 use pagebox_btree::BTree;
 use pagebox_storage::buffer_pool::BufferPool;
+
+use benchmark_support::PageboxBenchmarkRunner;
 
 const PREFIX: [u8; 4] = [0, 1, 0, 1];
 
@@ -38,7 +43,7 @@ struct AppendOnlyCtx {
 }
 
 impl BenchContext for AppendOnlyCtx {
-    fn prepare(_num_chunks: usize) -> Self {
+    fn prepare(_chunk_size: usize) -> Self {
         panic!("append-only bench must use factory-backed setup");
     }
 
@@ -61,7 +66,7 @@ struct FindOldestCtx {
 }
 
 impl BenchContext for FindOldestCtx {
-    fn prepare(_num_chunks: usize) -> Self {
+    fn prepare(_chunk_size: usize) -> Self {
         panic!("find-oldest bench must use factory-backed setup");
     }
 
@@ -84,7 +89,7 @@ struct ChurnCtx {
 }
 
 impl BenchContext for ChurnCtx {
-    fn prepare(_num_chunks: usize) -> Self {
+    fn prepare(_chunk_size: usize) -> Self {
         panic!("churn bench must use factory-backed setup");
     }
 
@@ -114,6 +119,8 @@ fn delete_oldest_then_append(ctx: &mut ChurnCtx, chunk_size: usize, _chunk_num: 
 }
 
 benchmark_main!(|runner| {
+    let runner = PageboxBenchmarkRunner::new(runner);
+
     let preload = env_usize("PAGEBOX_BTREE_NEW_ORDER_PRELOAD", 50_000);
     let pool_frames = env_usize("PAGEBOX_BTREE_NEW_ORDER_POOL_FRAMES", 65_536);
 

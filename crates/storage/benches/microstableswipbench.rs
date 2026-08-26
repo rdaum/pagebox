@@ -6,12 +6,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+#[path = "support/micromeasure.rs"]
+mod benchmark_support;
+
 use micromeasure::{
     BenchContext, ConcurrentBenchContext, ConcurrentBenchControl, ConcurrentWorker,
     ConcurrentWorkerResult, Throughput, benchmark_main, black_box,
 };
 use pagebox_storage::buffer_frame::StableSwip;
 use pagebox_storage::buffer_pool::{BufferPool, NoLatches};
+
+use benchmark_support::PageboxBenchmarkRunner;
 
 const OPS_PER_CHUNK: usize = 10_000;
 
@@ -30,7 +35,7 @@ impl StableFixCtx {
 }
 
 impl BenchContext for StableFixCtx {
-    fn prepare(_num_chunks: usize) -> Self {
+    fn prepare(_chunk_size: usize) -> Self {
         Self::resident()
     }
 
@@ -80,6 +85,8 @@ fn concurrent_hot_fix(
 }
 
 benchmark_main!(|runner| {
+    let runner = PageboxBenchmarkRunner::new(runner);
+
     runner.group::<StableFixCtx>("stable_swip/resident", |g| {
         g.throughput(Throughput::per_operation(1, "fixes"))
             .bench("fix", hot_fix);

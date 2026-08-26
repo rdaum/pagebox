@@ -7,13 +7,18 @@ use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[path = "support/micromeasure.rs"]
+mod benchmark_support;
+
 use micromeasure::{
     ConcurrentBenchContext, ConcurrentBenchControl, ConcurrentWorker, ConcurrentWorkerResult,
-    Throughput, benchmark_main, black_box,
+    MeasurementDomain, Throughput, benchmark_main, black_box,
 };
 use pagebox_storage::buffer_frame::PAGE_SIZE;
 use pagebox_storage::buffer_pool::{BufferPool, NoLatches};
 use pagebox_storage::page_store::{FilePageStore, PageStore};
+
+use benchmark_support::PageboxBenchmarkRunner;
 
 #[repr(align(4096))]
 struct AlignedPage([u8; PAGE_SIZE]);
@@ -201,6 +206,9 @@ fn sync_fault_worker(
 }
 
 benchmark_main!(|runner| {
+    let runner = PageboxBenchmarkRunner::new(runner);
+    let config = FaultBenchConfig::from_env();
+
     for &n_threads in &[1usize, 2, 4, 8, 16] {
         let workers = [ConcurrentWorker {
             name: "fault_worker",
@@ -210,6 +218,11 @@ benchmark_main!(|runner| {
         runner.concurrent_group::<SyncFaultCtx>("buffer_pool/sync/random_orphan_fault", |g| {
             g.sample_duration(Duration::from_millis(100))
                 .throughput(Throughput::per_operation(1, "pages"))
+                .measurement_domain(MeasurementDomain::Io)
+                .metadata("num_pages", config.num_pages.to_string())
+                .metadata("pool_frames", config.pool_frames.to_string())
+                .metadata("pages_per_thread", config.pages_per_thread.to_string())
+                .metadata("drop_cache", config.drop_cache.to_string())
                 .bench(&format!("{n_threads}t"), &workers);
         });
     }

@@ -7,6 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+#[path = "support/micromeasure.rs"]
+mod benchmark_support;
+
 use micromeasure::{
     BenchContext, ConcurrentBenchContext, ConcurrentBenchControl, ConcurrentWorker,
     ConcurrentWorkerResult, Throughput, benchmark_main, black_box,
@@ -14,6 +17,8 @@ use micromeasure::{
 use pagebox_storage::buffer_frame::physical_page_number;
 use pagebox_storage::buffer_pool::{BufferPool, NoLatches};
 use pagebox_storage::free_page_allocator::{FreeExtent, FreePageAllocator};
+
+use benchmark_support::PageboxBenchmarkRunner;
 
 const OPS_PER_CHUNK: usize = 10_000;
 
@@ -24,7 +29,7 @@ struct FreeAllocatorCtx {
 }
 
 impl BenchContext for FreeAllocatorCtx {
-    fn prepare(_num_chunks: usize) -> Self {
+    fn prepare(_chunk_size: usize) -> Self {
         panic!("free-page allocator bench must use factory-backed setup");
     }
 
@@ -56,7 +61,7 @@ struct ConcurrentBufferPoolMonotonicCtx {
 }
 
 impl BenchContext for BufferPoolAllocCtx {
-    fn prepare(_num_chunks: usize) -> Self {
+    fn prepare(_chunk_size: usize) -> Self {
         panic!("buffer-pool allocation bench must use factory-backed setup");
     }
 
@@ -218,6 +223,8 @@ fn concurrent_buffer_pool_monotonic_allocate_page(
 }
 
 benchmark_main!(|runner| {
+    let runner = PageboxBenchmarkRunner::new(runner);
+
     runner.group::<FreeAllocatorCtx>("free_page_allocator", |g| {
         g.throughput(Throughput::per_operation(1, "allocations"))
             .factory(&|| FreeAllocatorCtx {

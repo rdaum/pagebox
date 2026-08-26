@@ -1,6 +1,11 @@
+#[path = "support/micromeasure.rs"]
+mod benchmark_support;
+
 use micromeasure::{BenchContext, Throughput, benchmark_main, black_box};
 use pagebox_storage::buffer_frame::PAGE_SIZE;
 use pagebox_storage::slotted_page::SlottedPage;
+
+use benchmark_support::PageboxBenchmarkRunner;
 
 struct SlottedPageInsertCtx {
     page: [u8; PAGE_SIZE],
@@ -9,7 +14,7 @@ struct SlottedPageInsertCtx {
 }
 
 impl BenchContext for SlottedPageInsertCtx {
-    fn prepare(_num_chunks: usize) -> Self {
+    fn prepare(_chunk_size: usize) -> Self {
         panic!("slotted-page insert bench must use factory-backed setup");
     }
 
@@ -28,7 +33,7 @@ struct SlottedPageResetInsertCtx {
 }
 
 impl BenchContext for SlottedPageResetInsertCtx {
-    fn prepare(_num_chunks: usize) -> Self {
+    fn prepare(_chunk_size: usize) -> Self {
         panic!("slotted-page reset insert bench must use factory-backed setup");
     }
 
@@ -183,6 +188,8 @@ fn reset_insert_once(ctx: &mut SlottedPageResetInsertCtx, chunk_size: usize, _ch
 }
 
 benchmark_main!(|runner| {
+    let runner = PageboxBenchmarkRunner::new(runner);
+
     runner.group::<SlottedPageInsertCtx>("slotted_page_leaf_local", |g| {
         g.throughput(Throughput::per_operation(100_000, "operations"))
             .factory(&|| SlottedPageInsertCtx {

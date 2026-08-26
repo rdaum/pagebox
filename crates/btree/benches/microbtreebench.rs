@@ -1,8 +1,13 @@
 use std::sync::Arc;
 
+#[path = "support/micromeasure.rs"]
+mod benchmark_support;
+
 use micromeasure::{BenchContext, Throughput, benchmark_main, black_box};
 use pagebox_btree::BTree;
 use pagebox_storage::buffer_pool::BufferPool;
+
+use benchmark_support::PageboxBenchmarkRunner;
 
 struct BtreeLookupSeed {
     pool: Arc<BufferPool>,
@@ -18,7 +23,7 @@ struct BtreeLookupCtx {
 }
 
 impl BenchContext for BtreeLookupCtx {
-    fn prepare(_num_chunks: usize) -> Self {
+    fn prepare(_chunk_size: usize) -> Self {
         panic!("btree lookup bench must use factory-backed setup");
     }
 
@@ -42,7 +47,7 @@ struct BtreeInsertCtx {
 }
 
 impl BenchContext for BtreeInsertCtx {
-    fn prepare(_num_chunks: usize) -> Self {
+    fn prepare(_chunk_size: usize) -> Self {
         panic!("btree insert bench must use factory-backed setup");
     }
 
@@ -60,6 +65,8 @@ fn insert_hot(ctx: &mut BtreeInsertCtx, chunk_size: usize, _chunk_num: usize) {
 }
 
 benchmark_main!(|runner| {
+    let runner = PageboxBenchmarkRunner::new(runner);
+
     let lookup_seed = {
         let n = 100_000usize;
         let hot_window = 64usize;

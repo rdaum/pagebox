@@ -1,11 +1,16 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+#[path = "support/micromeasure.rs"]
+mod benchmark_support;
+
 use micromeasure::{
     ConcurrentBenchContext, ConcurrentBenchControl, ConcurrentWorker, ConcurrentWorkerResult,
     Throughput, benchmark_main, black_box,
 };
 use pagebox_hybrid_latch::HybridLatch;
+
+use benchmark_support::PageboxBenchmarkRunner;
 
 const HOTSET_SIZE: usize = 16;
 const HOT_LATCHES: usize = 2;
@@ -371,6 +376,8 @@ fn hotset_try_shared_mixed_reader(
 }
 
 benchmark_main!(|runner| {
+    let runner = PageboxBenchmarkRunner::new(runner);
+
     let optimistic_readers_vs_writer = [
         ConcurrentWorker {
             name: "optimistic_reader",

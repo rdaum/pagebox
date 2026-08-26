@@ -2,12 +2,17 @@ use std::ops::Bound;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[path = "support/micromeasure.rs"]
+mod benchmark_support;
+
 use micromeasure::{
     BenchContext, ConcurrentBenchContext, ConcurrentBenchControl, ConcurrentWorker,
     ConcurrentWorkerResult, Throughput, benchmark_main, black_box,
 };
 use pagebox_btree::BTree;
 use pagebox_storage::buffer_pool::BufferPool;
+
+use benchmark_support::PageboxBenchmarkRunner;
 
 fn random_key(seed: u64) -> [u8; 8] {
     seed.wrapping_mul(0x517cc1b727220a95)
@@ -33,7 +38,7 @@ struct SequentialInsertCtx<const N: usize> {
 }
 
 impl<const N: usize> BenchContext for SequentialInsertCtx<N> {
-    fn prepare(_num_chunks: usize) -> Self {
+    fn prepare(_chunk_size: usize) -> Self {
         panic!("sequential insert bench must use factory-backed setup");
     }
 
@@ -61,7 +66,7 @@ struct RandomInsertCtx<const N: usize> {
 }
 
 impl<const N: usize> BenchContext for RandomInsertCtx<N> {
-    fn prepare(_num_chunks: usize) -> Self {
+    fn prepare(_chunk_size: usize) -> Self {
         panic!("random insert bench must use factory-backed setup");
     }
 
@@ -94,7 +99,7 @@ struct LookupCtx<const N: usize> {
 }
 
 impl<const N: usize> BenchContext for LookupCtx<N> {
-    fn prepare(_num_chunks: usize) -> Self {
+    fn prepare(_chunk_size: usize) -> Self {
         panic!("lookup bench must use factory-backed setup");
     }
 
@@ -127,7 +132,7 @@ struct RangeScanCtx<const N: usize> {
 }
 
 impl<const N: usize> BenchContext for RangeScanCtx<N> {
-    fn prepare(_num_chunks: usize) -> Self {
+    fn prepare(_chunk_size: usize) -> Self {
         panic!("range scan bench must use factory-backed setup");
     }
 
@@ -164,7 +169,7 @@ struct MixedRwCtx {
 }
 
 impl BenchContext for MixedRwCtx {
-    fn prepare(_num_chunks: usize) -> Self {
+    fn prepare(_chunk_size: usize) -> Self {
         panic!("mixed read/write bench must use factory-backed setup");
     }
 
@@ -291,6 +296,8 @@ fn concurrent_insert_steady_worker(
 }
 
 benchmark_main!(|runner| {
+    let runner = PageboxBenchmarkRunner::new(runner);
+
     runner.group::<SequentialInsertCtx<1_000>>("btree/sequential_insert", |g| {
         g.throughput(Throughput::per_operation(1_000, "keys"))
             .factory(&|| {

@@ -187,6 +187,9 @@ cargo bench -p pagebox-storage --bench microbufferpoolfaultbench
 cargo bench -p pagebox-wal --bench wal
 ```
 
+See [the microbenchmark workflow](./benchmarks/README.md) for all Micromeasure suites, measurement controls, and
+reproducible report comparisons.
+
 ## License
 
 Copyright Ryan Daum and contributors, 2026.

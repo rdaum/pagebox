@@ -22,13 +22,18 @@ use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[path = "support/micromeasure.rs"]
+mod benchmark_support;
+
 use micromeasure::{
     ConcurrentBenchContext, ConcurrentBenchControl, ConcurrentWorker, ConcurrentWorkerResult,
-    Throughput, benchmark_main, black_box,
+    MeasurementDomain, Throughput, benchmark_main, black_box,
 };
 use pagebox_storage::buffer_frame::PAGE_SIZE;
 use pagebox_storage::buffer_pool::{BufferPool, NoLatches};
 use pagebox_storage::page_store::{FilePageStore, PageStore};
+
+use benchmark_support::PageboxBenchmarkRunner;
 
 #[repr(align(4096))]
 struct AlignedPage([u8; PAGE_SIZE]);
@@ -264,6 +269,9 @@ fn evict_worker_random(ctx: &EvictCtx, control: &ConcurrentBenchControl) -> Conc
 }
 
 benchmark_main!(|runner| {
+    let runner = PageboxBenchmarkRunner::new(runner);
+
+    let config = EvictBenchConfig::from_env();
     let sample_duration =
         Duration::from_millis(env_usize("PAGEBOX_BP_EVICT_SAMPLE_MS", 200) as u64);
     for n_threads in thread_counts() {
@@ -275,6 +283,10 @@ benchmark_main!(|runner| {
         runner.concurrent_group::<EvictCtx>("buffer_pool/evict/sequential", |g| {
             g.sample_duration(sample_duration)
                 .throughput(Throughput::per_operation(1, "pages"))
+                .measurement_domain(MeasurementDomain::Mixed)
+                .metadata("num_pages", config.num_pages.to_string())
+                .metadata("pool_frames", config.pool_frames.to_string())
+                .metadata("pages_per_thread", config.pages_per_thread.to_string())
                 .bench(&format!("{n_threads}t"), &workers);
         });
 
@@ -286,6 +298,10 @@ benchmark_main!(|runner| {
         runner.concurrent_group::<EvictCtx>("buffer_pool/evict/random", |g| {
             g.sample_duration(sample_duration)
                 .throughput(Throughput::per_operation(1, "pages"))
+                .measurement_domain(MeasurementDomain::Mixed)
+                .metadata("num_pages", config.num_pages.to_string())
+                .metadata("pool_frames", config.pool_frames.to_string())
+                .metadata("pages_per_thread", config.pages_per_thread.to_string())
                 .bench(&format!("{n_threads}t"), &workers);
         });
     }

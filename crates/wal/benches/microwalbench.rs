@@ -1,6 +1,9 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+#[path = "support/micromeasure.rs"]
+mod benchmark_support;
+
 #[cfg(feature = "metrics")]
 use fast_telemetry::{HistogramSnapshot, MetricLabels, MetricMeta, MetricVisitor};
 use micromeasure::{
@@ -11,6 +14,8 @@ use micromeasure::{
 use pagebox_frame_kernel::PAGE_SIZE;
 use pagebox_wal::{CommitMode, WAL_BUF_RECORDS, Wal};
 
+use benchmark_support::PageboxBenchmarkRunner;
+
 struct AppendBufferOnlyCtx {
     wal: Wal,
     _dir: tempfile::TempDir,
@@ -18,7 +23,7 @@ struct AppendBufferOnlyCtx {
 }
 
 impl BenchContext for AppendBufferOnlyCtx {
-    fn prepare(_num_chunks: usize) -> Self {
+    fn prepare(_chunk_size: usize) -> Self {
         panic!("append buffer bench must use factory-backed setup");
     }
 
@@ -34,7 +39,7 @@ struct AppendFlushCtx {
 }
 
 impl BenchContext for AppendFlushCtx {
-    fn prepare(_num_chunks: usize) -> Self {
+    fn prepare(_chunk_size: usize) -> Self {
         panic!("append flush bench must use factory-backed setup");
     }
 
@@ -50,7 +55,7 @@ struct ReplayCtx {
 }
 
 impl BenchContext for ReplayCtx {
-    fn prepare(_num_chunks: usize) -> Self {
+    fn prepare(_chunk_size: usize) -> Self {
         panic!("replay bench must use factory-backed setup");
     }
 
@@ -553,6 +558,8 @@ fn concurrent_commit_worker_inner(ctx: &ConcurrentWalCtx, control: &ConcurrentBe
 }
 
 benchmark_main!(|runner| {
+    let mut runner = PageboxBenchmarkRunner::new(runner);
+
     let sync_backend = wal_sync_backend_metadata();
     let direct_io = wal_direct_io_metadata();
     let delay_min_us = env_u64_or("PAGEBOX_WAL_GROUP_COMMIT_DELAY_MIN_US", 100);
@@ -586,6 +593,7 @@ benchmark_main!(|runner| {
 
     runner.group::<AppendFlushCtx>("wal_commit", |g| {
         g.throughput(Throughput::per_operation(64, "pages"))
+            .measurement_domain(MeasurementDomain::Io)
             .factory(&|| {
                 let dir = tempfile::tempdir().unwrap();
                 let wal = Wal::open_opts(&dir.path().join("wal")).unwrap();
@@ -598,6 +606,7 @@ benchmark_main!(|runner| {
             })
             .bench("append_flush_batch_1", append_flush);
         g.throughput(Throughput::per_operation(64, "pages"))
+            .measurement_domain(MeasurementDomain::Io)
             .factory(&|| {
                 let dir = tempfile::tempdir().unwrap();
                 let wal = Wal::open_opts(&dir.path().join("wal")).unwrap();
@@ -610,6 +619,7 @@ benchmark_main!(|runner| {
             })
             .bench("append_flush_batch_8", append_flush);
         g.throughput(Throughput::per_operation(64, "pages"))
+            .measurement_domain(MeasurementDomain::Io)
             .factory(&|| {
                 let dir = tempfile::tempdir().unwrap();
                 let wal = Wal::open_opts(&dir.path().join("wal")).unwrap();
@@ -625,6 +635,7 @@ benchmark_main!(|runner| {
 
     runner.group::<ReplayCtx>("wal_replay", |g| {
         g.throughput(Throughput::per_operation(1_024, "records"))
+            .measurement_domain(MeasurementDomain::Io)
             .factory(&|| {
                 let dir = tempfile::tempdir().unwrap();
                 let wal = Wal::open_opts(&dir.path().join("wal")).unwrap();
@@ -641,6 +652,7 @@ benchmark_main!(|runner| {
             })
             .bench("records_1024", replay_walk);
         g.throughput(Throughput::per_operation(8_192, "records"))
+            .measurement_domain(MeasurementDomain::Io)
             .factory(&|| {
                 let dir = tempfile::tempdir().unwrap();
                 let wal = Wal::open_opts(&dir.path().join("wal")).unwrap();
@@ -705,6 +717,7 @@ benchmark_main!(|runner| {
         runner.concurrent_group::<ConcurrentWalAppendCtx>("wal_concurrent_append", |g| {
             g.sample_duration(Duration::from_millis(200))
                 .throughput(Throughput::per_operation(1, "pages"))
+                .measurement_domain(MeasurementDomain::Mixed)
                 .metadata("sync_backend", sync_backend)
                 .metadata("direct_io", direct_io)
                 .metadata("delay_min_us", delay_min_us.to_string())
@@ -758,6 +771,7 @@ benchmark_main!(|runner| {
             |g| {
                 g.sample_duration(Duration::from_millis(200))
                     .throughput(Throughput::per_operation(1, "commits"))
+                    .measurement_domain(MeasurementDomain::Mixed)
                     .metadata("sync_backend", sync_backend)
                     .metadata("direct_io", direct_io)
                     .metadata("delay_min_us", delay_min_us.to_string())
