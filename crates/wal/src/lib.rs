@@ -152,8 +152,8 @@ mod wal_impl;
 
 pub use format::WAL_BUF_RECORDS;
 pub use wal_impl::{
-    BufferedWalRecord, CommitMode, RecoveryPageStore, RecoveryReport, Wal, WalReplayRecord,
-    WalStats,
+    BufferedWalRecord, CommitMode, RecoveryPageStore, RecoveryReport, Wal, WalMemoryStats,
+    WalReplayRecord, WalShardMemoryStats, WalStats,
 };
 
 #[cfg(test)]

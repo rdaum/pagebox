@@ -8,11 +8,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::comparison::ComparisonContract;
 use crate::engine::{EngineOpts, EngineStats};
+use crate::memory::ProcessMemoryStats;
 use crate::stats::PhaseSummary;
 use crate::workload::WorkloadSpec;
 
 /// JSON report schema version.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// A complete benchmark report for one run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,8 +37,11 @@ pub struct Report {
     pub durability_drain_secs: f64,
     /// Run-phase operations divided by run time plus durability drain time.
     pub drained_ops_per_sec: f64,
-    /// Cache and persisted-data evidence captured after the measured phase.
+    /// Phase-scoped engine counters plus after-phase capacity/use gauges.
     pub engine_stats: EngineStats,
+    /// Process RSS/PSS sampled during the measured phase, kept separate from
+    /// engine cache and WAL virtual-capacity evidence.
+    pub process_memory: ProcessMemoryStats,
 }
 
 /// Phase measurements supplied when constructing a report.
@@ -47,6 +51,7 @@ pub struct ReportMeasurements {
     pub run_phase: PhaseSummary,
     pub durability_drain_secs: f64,
     pub engine_stats: EngineStats,
+    pub process_memory: ProcessMemoryStats,
 }
 
 impl Report {
@@ -65,6 +70,7 @@ impl Report {
             run_phase,
             durability_drain_secs,
             engine_stats,
+            process_memory,
         } = measurements;
         let drained_duration = run_phase.duration_secs + durability_drain_secs;
         let drained_ops_per_sec = if drained_duration == 0.0 {
@@ -92,6 +98,7 @@ impl Report {
             durability_drain_secs,
             drained_ops_per_sec,
             engine_stats,
+            process_memory,
         }
     }
 
@@ -415,7 +422,13 @@ fn summarize_engine<'a>(engine: &'a str, reports: &[&Report]) -> SummaryRow<'a> 
         storage_read_mib: median_some(
             reports
                 .iter()
-                .filter_map(|report| report.engine_stats.storage_read_bytes)
+                .filter_map(|report| {
+                    report
+                        .engine_stats
+                        .storage_io
+                        .as_ref()?
+                        .read_completed_bytes
+                })
                 .map(|bytes| bytes as f64 / 1_048_576.0)
                 .collect(),
         ),
@@ -659,6 +672,9 @@ pub fn print_summary_table(reports: &[Report]) {
             );
         }
     }
+    println!(
+        "Cache hit percentages use each engine's native access unit and are not cross-engine rankings; read MiB is completed data-file read bytes."
+    );
     println!();
     println!("Load phase medians:");
     println!(
@@ -745,6 +761,7 @@ mod tests {
                 run_phase: (&stats).into(),
                 durability_drain_secs: 0.0,
                 engine_stats: EngineStats::default(),
+                process_memory: ProcessMemoryStats::default(),
             },
         );
         let json = report.to_json_pretty().unwrap();
@@ -755,6 +772,9 @@ mod tests {
         assert!(json.contains("\"durability_drain_secs\""));
         assert!(json.contains("\"binary_hash\""));
         assert!(json.contains("\"engine_stats\""));
+        assert!(json.contains("\"process_memory\""));
+        assert!(json.contains("\"phase_peak_rss_bytes\": null"));
+        assert_eq!(report.schema, 5);
     }
 
     #[test]
@@ -786,6 +806,7 @@ mod tests {
                 run_phase: (&stats).into(),
                 durability_drain_secs: 0.0,
                 engine_stats: EngineStats::default(),
+                process_memory: ProcessMemoryStats::default(),
             },
         );
         let mut different_opts = EngineOpts::default();
@@ -802,6 +823,7 @@ mod tests {
                 run_phase: (&stats).into(),
                 durability_drain_secs: 0.0,
                 engine_stats: EngineStats::default(),
+                process_memory: ProcessMemoryStats::default(),
             },
         );
         assert_ne!(

@@ -140,6 +140,7 @@ impl KvEngine for RedbAdapter {
             cache_used_bytes: Some(stats.used_bytes() as u64),
             cache_hits: Some(stats.read_hits() + stats.write_hits()),
             cache_misses: Some(stats.read_misses() + stats.write_misses()),
+            cache_access_unit: Some("redb_cache_read_write_events".to_string()),
             cache_evictions: Some(stats.evictions()),
             persisted_data_bytes: std::fs::metadata(&self.path).ok().map(|meta| meta.len()),
             ..EngineStats::default()

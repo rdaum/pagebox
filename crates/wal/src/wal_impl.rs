@@ -94,9 +94,9 @@ use crate::aligned_buf::AlignedBuf;
 use crate::backend::WalIoBackend;
 use crate::format::SEGMENT_SIZE;
 use crate::format::{
-    BATCH_MAX_RECORDS, BatchEntry, LOGICAL_CHUNK_MAX_LEN, LOGICAL_FLAG_FIRST, LOGICAL_FLAG_LAST,
-    PACKED_LOGICAL_ENTRY_HEADER_LEN, PACKED_LOGICAL_MAX_PAYLOAD_LEN, RECORD_KIND_LOGICAL,
-    RECORD_KIND_LOGICAL_PACKED, RECORD_KIND_PAGE_IMAGE, WAL_BUF_CAPACITY,
+    BATCH_MAX_RECORDS, BatchEntry, DIRECT_IO_ALIGN, LOGICAL_CHUNK_MAX_LEN, LOGICAL_FLAG_FIRST,
+    LOGICAL_FLAG_LAST, PACKED_LOGICAL_ENTRY_HEADER_LEN, PACKED_LOGICAL_MAX_PAYLOAD_LEN,
+    RECORD_KIND_LOGICAL, RECORD_KIND_LOGICAL_PACKED, RECORD_KIND_PAGE_IMAGE, WAL_BUF_CAPACITY,
     WAL_GROUP_COMMIT_DELAY_MIN_US, WAL_HEADER_SIZE, WAL_RECORD_SIZE, WAL_RELAXED_SYNC_INTERVAL_US,
     WAL_RELAXED_SYNC_RECORDS, WAL_RELAXED_WRITE_INTERVAL_US, WAL_RELAXED_WRITE_RECORDS,
     batch_meta_count, batch_meta_count_unchecked, build_wal_header, env_u64_us,
@@ -190,6 +190,57 @@ pub struct WalStats {
     pub(crate) events: LabeledCounter<WalEvent>,
     #[cfg_attr(feature = "metrics", help = "WAL latency in nanoseconds")]
     pub(crate) latencies: LabeledHistogram<WalLatency>,
+}
+
+/// Memory and append-volume evidence for one WAL shard.
+///
+/// Buffer capacity is virtual allocation capacity, not resident memory.
+/// `known_touched_buffer_bytes` is a lower-bound accounting of buffer pages
+/// Pagebox has written at least once; process RSS/PSS must be measured
+/// separately when resident memory is the quantity of interest.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WalShardMemoryStats {
+    pub configured_buffer_capacity_bytes: u64,
+    pub active_buffer_count: u64,
+    pub spare_buffer_count: u64,
+    pub pending_buffer_count: u64,
+    pub in_flight_buffer_count: u64,
+    pub allocated_buffer_count: u64,
+    pub virtual_buffer_capacity_bytes: u64,
+    pub known_touched_buffer_bytes: u64,
+    pub active_used_bytes: u64,
+    /// High-water mark since open or the last explicit reset.
+    pub active_used_high_water_bytes: u64,
+    /// Most records in one sealed buffer since open or the last reset.
+    pub max_submitted_buffer_records: u64,
+    /// Most records in one submitted on-disk batch since open or reset.
+    pub max_submitted_batch_records: u64,
+    /// Page-image payload bytes appended, when WAL metrics are enabled.
+    pub page_image_bytes_appended: Option<u64>,
+    /// Logical payload bytes appended, when WAL metrics are enabled.
+    pub logical_bytes_appended: Option<u64>,
+}
+
+/// Aggregate WAL memory evidence plus the constituent shard snapshots.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WalMemoryStats {
+    pub shard_count: u64,
+    pub configured_buffer_capacity_bytes: u64,
+    pub active_buffer_count: u64,
+    pub spare_buffer_count: u64,
+    pub pending_buffer_count: u64,
+    pub in_flight_buffer_count: u64,
+    pub allocated_buffer_count: u64,
+    pub virtual_buffer_capacity_bytes: u64,
+    pub known_touched_buffer_bytes: u64,
+    pub active_used_bytes: u64,
+    /// Sum of the independently observed per-shard high-water marks.
+    pub active_used_high_water_bytes: u64,
+    pub max_submitted_buffer_records: u64,
+    pub max_submitted_batch_records: u64,
+    pub page_image_bytes_appended: Option<u64>,
+    pub logical_bytes_appended: Option<u64>,
+    pub shards: Vec<WalShardMemoryStats>,
 }
 
 /// One record surfaced by [`Wal::replay`] / [`Wal::replay_records`].
@@ -446,6 +497,10 @@ pub(crate) struct WalState {
     pub(crate) allocated_size: u64,
     pub(crate) flush_waiters: usize,
     pub(crate) next_buffer_epoch: u64,
+    known_touched_buffer_bytes: usize,
+    active_used_high_water_bytes: usize,
+    max_submitted_buffer_records: usize,
+    max_submitted_batch_records: usize,
     pub(crate) crash_shutdown: bool,
     pub(crate) shutdown: bool,
 }
@@ -591,6 +646,9 @@ pub(crate) struct WalBuffer {
     pub(crate) max_lsn: Lsn,
     pub(crate) open_batch_meta_offset: Option<usize>,
     pub(crate) open_batch_count: usize,
+    pub(crate) max_batch_records: usize,
+    /// Bytes in this allocation known to have been touched at least once.
+    pub(crate) known_touched_bytes: usize,
     pub(crate) packed_logical: Option<PackedLogicalSlot>,
 }
 
@@ -621,6 +679,8 @@ impl WalBuffer {
             max_lsn: 0,
             open_batch_meta_offset: None,
             open_batch_count: 0,
+            max_batch_records: 0,
+            known_touched_bytes: 0,
             packed_logical: None,
         }
     }
@@ -632,6 +692,7 @@ impl WalBuffer {
         self.max_lsn = 0;
         self.open_batch_meta_offset = None;
         self.open_batch_count = 0;
+        self.max_batch_records = 0;
         self.packed_logical = None;
     }
 }
@@ -1360,6 +1421,81 @@ impl Wal {
         }
     }
 
+    /// Snapshot buffer allocation, touched-byte, high-water, and append-byte
+    /// evidence for this WAL and each shard.
+    pub fn memory_stats(&self) -> WalMemoryStats {
+        let mut shards = Vec::with_capacity(self.shard_count());
+        self.for_each_inner(|inner| shards.push(inner.memory_stats()));
+
+        let mut aggregate = WalMemoryStats {
+            shard_count: shards.len() as u64,
+            configured_buffer_capacity_bytes: WAL_BUF_CAPACITY as u64,
+            shards,
+            ..WalMemoryStats::default()
+        };
+        for shard in &aggregate.shards {
+            aggregate.active_buffer_count = aggregate
+                .active_buffer_count
+                .saturating_add(shard.active_buffer_count);
+            aggregate.spare_buffer_count = aggregate
+                .spare_buffer_count
+                .saturating_add(shard.spare_buffer_count);
+            aggregate.pending_buffer_count = aggregate
+                .pending_buffer_count
+                .saturating_add(shard.pending_buffer_count);
+            aggregate.in_flight_buffer_count = aggregate
+                .in_flight_buffer_count
+                .saturating_add(shard.in_flight_buffer_count);
+            aggregate.allocated_buffer_count = aggregate
+                .allocated_buffer_count
+                .saturating_add(shard.allocated_buffer_count);
+            aggregate.virtual_buffer_capacity_bytes = aggregate
+                .virtual_buffer_capacity_bytes
+                .saturating_add(shard.virtual_buffer_capacity_bytes);
+            aggregate.known_touched_buffer_bytes = aggregate
+                .known_touched_buffer_bytes
+                .saturating_add(shard.known_touched_buffer_bytes);
+            aggregate.active_used_bytes = aggregate
+                .active_used_bytes
+                .saturating_add(shard.active_used_bytes);
+            aggregate.active_used_high_water_bytes = aggregate
+                .active_used_high_water_bytes
+                .saturating_add(shard.active_used_high_water_bytes);
+            aggregate.max_submitted_buffer_records = aggregate
+                .max_submitted_buffer_records
+                .max(shard.max_submitted_buffer_records);
+            aggregate.max_submitted_batch_records = aggregate
+                .max_submitted_batch_records
+                .max(shard.max_submitted_batch_records);
+        }
+        aggregate.page_image_bytes_appended = sum_optional(
+            aggregate
+                .shards
+                .iter()
+                .map(|shard| shard.page_image_bytes_appended),
+        );
+        aggregate.logical_bytes_appended = sum_optional(
+            aggregate
+                .shards
+                .iter()
+                .map(|shard| shard.logical_bytes_appended),
+        );
+        aggregate
+    }
+
+    /// Start a new observation interval for WAL high-water marks.
+    ///
+    /// Lifetime allocation/touched-byte evidence and append counters are not
+    /// reset. Callers obtain phase append bytes by differencing snapshots.
+    pub fn reset_memory_high_water_marks(&self) {
+        self.for_each_inner(|inner| {
+            let mut state = inner.state.lock();
+            state.active_used_high_water_bytes = state.active.used;
+            state.max_submitted_buffer_records = 0;
+            state.max_submitted_batch_records = 0;
+        });
+    }
+
     fn shard_count(&self) -> usize {
         1 + self.extra_shards.len()
     }
@@ -1539,12 +1675,20 @@ impl Wal {
         );
         state.active.open_batch_count += 1;
         let batch_count = state.active.open_batch_count;
+        state.active.max_batch_records = state.active.max_batch_records.max(batch_count);
         set_batch_meta_count(
             &mut state.active.buffer.as_mut_slice()[meta_start..meta_start + WAL_RECORD_SIZE],
             batch_count,
         );
         state.active.used = data_end;
         state.active.records += 1;
+        let touched_bytes = data_end.next_multiple_of(DIRECT_IO_ALIGN);
+        if touched_bytes > state.active.known_touched_bytes {
+            state.known_touched_buffer_bytes += touched_bytes - state.active.known_touched_bytes;
+            state.active.known_touched_bytes = touched_bytes;
+        }
+        state.active_used_high_water_bytes =
+            state.active_used_high_water_bytes.max(state.active.used);
         if entry.kind == RECORD_KIND_PAGE_IMAGE
             || entry.kind == RECORD_KIND_LOGICAL_PACKED
             || entry.flags & LOGICAL_FLAG_LAST == LOGICAL_FLAG_LAST
@@ -1795,6 +1939,12 @@ impl Wal {
     /// Pagebox's internal logical kinds are rejected as reserved.
     pub fn append_logical_with_lsn(&self, lsn: Lsn, kind: u64, payload: &[u8]) -> io::Result<()> {
         validate_caller_logical_kind(kind)?;
+        let inner = self.inner_for_lsn(lsn);
+        inner.stats.events.inc(WalEvent::LogicalRecords);
+        inner.stats.events.add(
+            WalEvent::LogicalBytes,
+            payload.len().min(isize::MAX as usize) as isize,
+        );
         self.append_logical_record_with_lsn(lsn, kind, payload)
     }
 
@@ -2419,6 +2569,12 @@ impl Wal {
     }
 }
 
+fn sum_optional(mut values: impl Iterator<Item = Option<u64>>) -> Option<u64> {
+    values.try_fold(0u64, |total, value| {
+        value.map(|value| total.saturating_add(value))
+    })
+}
+
 impl Drop for Wal {
     fn drop(&mut self) {
         Self::stop_shard(&mut self.inner, false);
@@ -2429,6 +2585,42 @@ impl Drop for Wal {
 }
 
 impl WalInner {
+    fn memory_stats(&self) -> WalShardMemoryStats {
+        let state = self.state.lock();
+        let allocated_buffer_count = 1usize
+            .saturating_add(state.spare_buffers.len())
+            .saturating_add(state.pending_writes.len())
+            .saturating_add(state.writes_in_progress);
+        #[cfg(feature = "metrics")]
+        let page_image_bytes_appended =
+            Some(self.stats.events.get(WalEvent::PageImageBytes).max(0) as u64);
+        #[cfg(not(feature = "metrics"))]
+        let page_image_bytes_appended = None;
+        #[cfg(feature = "metrics")]
+        let logical_bytes_appended =
+            Some(self.stats.events.get(WalEvent::LogicalBytes).max(0) as u64);
+        #[cfg(not(feature = "metrics"))]
+        let logical_bytes_appended = None;
+
+        WalShardMemoryStats {
+            configured_buffer_capacity_bytes: WAL_BUF_CAPACITY as u64,
+            active_buffer_count: 1,
+            spare_buffer_count: state.spare_buffers.len() as u64,
+            pending_buffer_count: state.pending_writes.len() as u64,
+            in_flight_buffer_count: state.writes_in_progress as u64,
+            allocated_buffer_count: allocated_buffer_count as u64,
+            virtual_buffer_capacity_bytes: (allocated_buffer_count as u64)
+                .saturating_mul(WAL_BUF_CAPACITY as u64),
+            known_touched_buffer_bytes: state.known_touched_buffer_bytes as u64,
+            active_used_bytes: state.active.used as u64,
+            active_used_high_water_bytes: state.active_used_high_water_bytes as u64,
+            max_submitted_buffer_records: state.max_submitted_buffer_records as u64,
+            max_submitted_batch_records: state.max_submitted_batch_records as u64,
+            page_image_bytes_appended,
+            logical_bytes_appended,
+        }
+    }
+
     pub(crate) fn record_backend_failure(&self, error: impl std::fmt::Display) {
         let mut failure = self.backend_failure.lock();
         if failure.is_none() {
@@ -2545,6 +2737,10 @@ impl WalInner {
                 allocated_size,
                 flush_waiters: 0,
                 next_buffer_epoch: 3,
+                known_touched_buffer_bytes: 0,
+                active_used_high_water_bytes: 0,
+                max_submitted_buffer_records: 0,
+                max_submitted_batch_records: 0,
                 crash_shutdown: false,
                 shutdown: false,
             }),
@@ -3024,6 +3220,11 @@ impl WalInner {
 
         let len = state.active.used;
         let max_lsn = state.active.max_lsn;
+        state.max_submitted_buffer_records =
+            state.max_submitted_buffer_records.max(state.active.records);
+        state.max_submitted_batch_records = state
+            .max_submitted_batch_records
+            .max(state.active.max_batch_records);
         let file_offset = state.file_offset;
         let write_end = file_offset + len as u64;
         if write_end > state.allocated_size {
@@ -3392,6 +3593,7 @@ impl WalInner {
         state.spare_buffers.clear();
         let spare_epoch = Self::next_buffer_epoch_locked(&mut state);
         state.spare_buffers.push(WalBuffer::new(spare_epoch));
+        state.known_touched_buffer_bytes = state.active.known_touched_bytes;
 
         extend_file(state.fd, SEGMENT_SIZE)?;
         state.allocated_size = SEGMENT_SIZE;

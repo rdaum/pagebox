@@ -13,7 +13,7 @@ use std::path::Path;
 
 use fjall::{Database, KeyspaceCreateOptions, PersistMode};
 
-use crate::engine::{CacheControl, EngineOpts, EngineStats, KvEngine, SyncMode};
+use crate::engine::{CacheControl, EngineOpts, EngineStats, KvEngine, StorageIoStats, SyncMode};
 
 /// Adapter wrapping `fjall::Database` with a single keyspace.
 pub struct FjallAdapter {
@@ -150,8 +150,12 @@ impl KvEngine for FjallAdapter {
             cache_used_bytes: Some(self.db.cache_size() + self.db.write_buffer_size()),
             cache_hits: Some(hits),
             cache_misses: Some(misses),
+            cache_access_unit: Some("block_loads".to_string()),
             cache_insert_bytes: Some(metrics.block_io()),
-            storage_read_bytes: Some(metrics.block_io()),
+            storage_io: Some(StorageIoStats {
+                read_completed_bytes: Some(metrics.block_io()),
+                ..StorageIoStats::default()
+            }),
             persisted_data_bytes: Some(self.keyspace.disk_space()),
             extra,
             ..EngineStats::default()

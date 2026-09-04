@@ -192,12 +192,16 @@ const PAGE_TABLE_SHARDS: usize = 8;
 /// Sharded by PID for scalability (like LeanStore's `Partition::io_ht`).
 struct PageTable {
     shards: [parking_lot::Mutex<HashMap<u64, *mut BufferFrame>>; PAGE_TABLE_SHARDS],
+    lock_contentions: AtomicU64,
+    lock_wait_ns: AtomicU64,
 }
 
 impl PageTable {
     fn new() -> Self {
         Self {
             shards: std::array::from_fn(|_| parking_lot::Mutex::new(HashMap::new())),
+            lock_contentions: AtomicU64::new(0),
+            lock_wait_ns: AtomicU64::new(0),
         }
     }
 
@@ -206,15 +210,30 @@ impl PageTable {
         &self.shards[idx]
     }
 
+    fn lock_shard(&self, pid: u64) -> parking_lot::MutexGuard<'_, HashMap<u64, *mut BufferFrame>> {
+        let shard = self.shard(pid);
+        if let Some(guard) = shard.try_lock() {
+            return guard;
+        }
+        self.lock_contentions.fetch_add(1, Ordering::Relaxed);
+        let start = Instant::now();
+        let guard = shard.lock();
+        self.lock_wait_ns.fetch_add(
+            saturating_duration_nanos(start.elapsed()),
+            Ordering::Relaxed,
+        );
+        guard
+    }
+
     /// Look up a page by PID. Returns the frame if resident or in-flight.
     fn lookup(&self, pid: u64) -> Option<*mut BufferFrame> {
-        self.shard(pid).lock().get(&pid).copied()
+        self.lock_shard(pid).get(&pid).copied()
     }
 
     /// Try to insert a PID→frame mapping. Returns `false` if the PID is
     /// already mapped (another thread won the race to load this page).
     fn try_insert(&self, pid: u64, bf: *mut BufferFrame) -> bool {
-        let mut map = self.shard(pid).lock();
+        let mut map = self.lock_shard(pid);
         if map.contains_key(&pid) {
             return false;
         }
@@ -224,12 +243,12 @@ impl PageTable {
 
     /// Remove a PID→frame mapping. Called on eviction.
     fn remove(&self, pid: u64) {
-        self.shard(pid).lock().remove(&pid);
+        self.lock_shard(pid).remove(&pid);
     }
 
     /// Unconditionally insert a PID→frame mapping (for freshly allocated pages).
     fn insert(&self, pid: u64, bf: *mut BufferFrame) {
-        self.shard(pid).lock().insert(pid, bf);
+        self.lock_shard(pid).insert(pid, bf);
     }
 }
 
@@ -858,6 +877,20 @@ struct BufferPoolMetrics {
         help = "Loading frame transition wait latency in nanoseconds"
     )]
     loading_frame_transition_wait_latency: Histogram,
+    #[cfg_attr(feature = "metrics", help = "Duplicate/in-flight page-load waits")]
+    loading_frame_waits: Counter,
+    #[cfg_attr(
+        feature = "metrics",
+        help = "Nanoseconds waiting for duplicate/in-flight page loads"
+    )]
+    loading_frame_wait_ns: Counter,
+    #[cfg_attr(feature = "metrics", help = "Final eviction coordination lock waits")]
+    eviction_final_lock_waits: Counter,
+    #[cfg_attr(
+        feature = "metrics",
+        help = "Nanoseconds waiting for the final eviction coordination lock"
+    )]
+    eviction_final_lock_wait_ns: Counter,
     #[cfg_attr(feature = "metrics", help = "Fix-orphan events")]
     fix_orphan_events: LabeledCounter<BufferPoolFixOrphanEvent>,
     #[cfg_attr(feature = "metrics", help = "Unswizzle parent lookup events")]
@@ -907,6 +940,10 @@ impl BufferPoolMetrics {
                 &buffer_pool_latency_bounds_ns(),
                 shards,
             ),
+            loading_frame_waits: Counter::new(shards),
+            loading_frame_wait_ns: Counter::new(shards),
+            eviction_final_lock_waits: Counter::new(shards),
+            eviction_final_lock_wait_ns: Counter::new(shards),
             fix_orphan_events: LabeledCounter::new(shards),
             unswizzle_parent_events: LabeledCounter::new(shards),
         }
@@ -1309,9 +1346,14 @@ impl BufferPool {
     }
 
     fn record_loading_frame_transition_wait(&self, elapsed: Duration) {
+        let elapsed_ns = saturating_duration_nanos(elapsed);
         self.metrics
             .loading_frame_transition_wait_latency
-            .record(saturating_duration_nanos(elapsed));
+            .record(elapsed_ns);
+        self.metrics.loading_frame_waits.inc();
+        self.metrics
+            .loading_frame_wait_ns
+            .add(elapsed_ns.min(isize::MAX as u64) as isize);
     }
 
     fn record_simple_prefetch_queue_wait(&self, elapsed: Duration) {
@@ -5211,7 +5253,17 @@ impl BufferPool {
         // swip is updated, we only need to ensure no in-flight hot pin
         // observes the Evicting-to-Free transition.
         self.eviction_writer_pending.fetch_add(1, Ordering::AcqRel);
-        let _eviction_guard = self.eviction_mu.write();
+        let _eviction_guard = if let Some(guard) = self.eviction_mu.try_write() {
+            guard
+        } else {
+            let start = Instant::now();
+            let guard = self.eviction_mu.write();
+            self.metrics.eviction_final_lock_waits.inc();
+            self.metrics
+                .eviction_final_lock_wait_ns
+                .add(saturating_duration_nanos(start.elapsed()).min(isize::MAX as u64) as isize);
+            guard
+        };
         self.eviction_writer_pending.fetch_sub(1, Ordering::AcqRel);
 
         if !Self::can_free_evicting_frame(bf) {
@@ -5634,6 +5686,13 @@ impl BufferPool {
             resident_budget_available: self.resident_base_pages_available.load(Ordering::Relaxed)
                 as u64,
             eviction_in_flight: self.eviction_in_flight.load(Ordering::Relaxed) as u64,
+            page_table_lock_contentions: self.page_table.lock_contentions.load(Ordering::Relaxed),
+            page_table_lock_wait_ns: self.page_table.lock_wait_ns.load(Ordering::Relaxed),
+            loading_frame_waits: self.metrics.loading_frame_waits.sum().max(0) as u64,
+            loading_frame_wait_ns: self.metrics.loading_frame_wait_ns.sum().max(0) as u64,
+            eviction_final_lock_waits: self.metrics.eviction_final_lock_waits.sum().max(0) as u64,
+            eviction_final_lock_wait_ns: self.metrics.eviction_final_lock_wait_ns.sum().max(0)
+                as u64,
             dirty_flush_batches: self.metrics.dirty_flush_batches.sum().max(0) as u64,
             dirty_flush_pages: self.metrics.dirty_flush_pages.sum().max(0) as u64,
             dirty_flush_wal_wait_ns: self.metrics.dirty_flush_wal_wait_ns.sum().max(0) as u64,
@@ -5788,6 +5847,12 @@ pub struct BufferPoolDiagnosticStats {
     pub free_list_frames: u64,
     pub resident_budget_available: u64,
     pub eviction_in_flight: u64,
+    pub page_table_lock_contentions: u64,
+    pub page_table_lock_wait_ns: u64,
+    pub loading_frame_waits: u64,
+    pub loading_frame_wait_ns: u64,
+    pub eviction_final_lock_waits: u64,
+    pub eviction_final_lock_wait_ns: u64,
     pub dirty_flush_batches: u64,
     pub dirty_flush_pages: u64,
     pub dirty_flush_wal_wait_ns: u64,
@@ -5855,6 +5920,35 @@ mod tests {
     use pagebox_wal::CommitMode;
 
     use crate::buffer_frame::physical_page_number;
+
+    #[test]
+    fn page_table_reports_contended_lock_waits() {
+        let pool = Arc::new(BufferPool::new(2));
+        let pid = 17;
+        let guard = pool.page_table.shard(pid).lock();
+        let waiter_pool = Arc::clone(&pool);
+        let waiter = std::thread::spawn(move || {
+            assert!(waiter_pool.page_table.lookup(pid).is_none());
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while pool.page_table.lock_contentions.load(Ordering::Relaxed) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "page-table waiter did not observe the held shard lock"
+            );
+            std::thread::yield_now();
+        }
+        drop(guard);
+        waiter.join().unwrap();
+
+        let stats = pool.diagnostic_stats();
+        assert_eq!(stats.page_table_lock_contentions, 1);
+        assert!(
+            stats.page_table_lock_wait_ns > 0,
+            "a blocked shard lookup must report non-zero wait time"
+        );
+    }
 
     #[cfg(not(miri))]
     struct BlockingPageStore {

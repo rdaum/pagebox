@@ -4,7 +4,10 @@ use std::path::Path;
 
 use kvstore::{KvStore, KvStoreOptions, PAGE_SIZE, SyncMode as KvSyncMode, TreeBackend};
 
-use crate::engine::{CacheControl, EngineOpts, EngineStats, KvEngine, SyncMode};
+use crate::engine::{
+    CacheControl, EngineOpts, EngineStats, KvEngine, StorageIoStats, SyncMode, WalMemoryStats,
+    WalShardMemoryStats,
+};
 
 pub struct KvstoreAdapter {
     inner: KvStore,
@@ -86,6 +89,10 @@ impl KvEngine for KvstoreAdapter {
         self.inner.checkpoint()
     }
 
+    fn begin_measurement(&self) {
+        self.inner.reset_wal_memory_high_water_marks();
+    }
+
     fn stats(&self) -> EngineStats {
         let mut extra = std::collections::HashMap::new();
         if let Ok(backend) = std::env::var("PAGEBOX_WAL_SYNC_BACKEND") {
@@ -95,6 +102,8 @@ impl KvEngine for KvstoreAdapter {
         let cache_evictions = self.inner.cache_evictions();
         let buffer = self.inner.buffer_pool_diagnostic_stats();
         let btree = self.inner.btree_diagnostic_stats();
+        let io = self.inner.page_store_io_stats();
+        let wal = self.inner.wal_memory_stats();
         let diagnostics = [
             ("load_inner", buffer.inner_index_loads),
             ("load_leaf", buffer.leaf_index_loads),
@@ -118,6 +127,21 @@ impl KvEngine for KvstoreAdapter {
                 buffer.resident_budget_available,
             ),
             ("eviction_in_flight", buffer.eviction_in_flight),
+            (
+                "page_table_lock_contentions",
+                buffer.page_table_lock_contentions,
+            ),
+            ("page_table_lock_wait_ns", buffer.page_table_lock_wait_ns),
+            ("loading_frame_waits", buffer.loading_frame_waits),
+            ("loading_frame_wait_ns", buffer.loading_frame_wait_ns),
+            (
+                "eviction_final_lock_waits",
+                buffer.eviction_final_lock_waits,
+            ),
+            (
+                "eviction_final_lock_wait_ns",
+                buffer.eviction_final_lock_wait_ns,
+            ),
             ("dirty_flush_batches", buffer.dirty_flush_batches),
             ("dirty_flush_pages", buffer.dirty_flush_pages),
             ("dirty_flush_wal_wait_ns", buffer.dirty_flush_wal_wait_ns),
@@ -171,13 +195,107 @@ impl KvEngine for KvstoreAdapter {
             cache_capacity_bytes: Some((self.inner.cache_capacity_pages() * PAGE_SIZE) as u64),
             cache_used_bytes: Some((self.inner.cache_used_pages() * PAGE_SIZE) as u64),
             cache_misses: Some(cache_misses),
+            cache_access_unit: Some("buffer_pool_page_loads".to_string()),
             cache_evictions: Some(cache_evictions),
             cache_insert_bytes: Some(cache_misses.saturating_mul(PAGE_SIZE as u64)),
+            storage_io: Some(StorageIoStats {
+                read_calls: Some(io.reads.calls),
+                read_requested_bytes: Some(io.reads.requested_bytes),
+                read_completed_bytes: Some(io.reads.completed_bytes),
+                write_calls: Some(io.writes.calls),
+                write_requested_bytes: Some(io.writes.requested_bytes),
+                write_completed_bytes: Some(io.writes.completed_bytes),
+                direct_read_completed_bytes: Some(io.direct_reads.completed_bytes),
+                direct_write_completed_bytes: Some(io.direct_writes.completed_bytes),
+                buffered_read_completed_bytes: Some(io.buffered_reads.completed_bytes),
+                buffered_write_completed_bytes: Some(io.buffered_writes.completed_bytes),
+                foreground_read_completed_bytes: Some(io.foreground_reads.completed_bytes),
+                prefetch_read_completed_bytes: Some(io.prefetch_reads.completed_bytes),
+                recovery_read_completed_bytes: Some(io.recovery_reads.completed_bytes),
+                foreground_write_completed_bytes: Some(io.foreground_writes.completed_bytes),
+                background_write_completed_bytes: Some(io.background_writes.completed_bytes),
+                checkpoint_write_completed_bytes: Some(io.checkpoint_writes.completed_bytes),
+                recovery_write_completed_bytes: Some(io.recovery_writes.completed_bytes),
+                metadata_write_completed_bytes: Some(io.metadata_writes.completed_bytes),
+                batched_read_calls: Some(io.batched_reads.calls),
+                batched_read_pages: Some(io.batched_reads.pages),
+                batched_write_calls: Some(io.batched_writes.calls),
+                batched_write_pages: Some(io.batched_writes.pages),
+                sync_calls: Some(io.sync_calls),
+                foreground_sync_calls: Some(io.foreground_sync_calls),
+                checkpoint_sync_calls: Some(io.checkpoint_sync_calls),
+                recovery_sync_calls: Some(io.recovery_sync_calls),
+            }),
+            wal_memory: Some(WalMemoryStats {
+                shard_count: wal.shard_count,
+                configured_buffer_capacity_bytes: wal.configured_buffer_capacity_bytes,
+                active_buffer_count: wal.active_buffer_count,
+                spare_buffer_count: wal.spare_buffer_count,
+                pending_buffer_count: wal.pending_buffer_count,
+                in_flight_buffer_count: wal.in_flight_buffer_count,
+                allocated_buffer_count: wal.allocated_buffer_count,
+                virtual_buffer_capacity_bytes: wal.virtual_buffer_capacity_bytes,
+                known_touched_buffer_bytes: wal.known_touched_buffer_bytes,
+                active_used_bytes: wal.active_used_bytes,
+                active_used_high_water_bytes: wal.active_used_high_water_bytes,
+                max_submitted_buffer_records: wal.max_submitted_buffer_records,
+                max_submitted_batch_records: wal.max_submitted_batch_records,
+                page_image_bytes_appended: wal.page_image_bytes_appended,
+                logical_bytes_appended: wal.logical_bytes_appended,
+                shards: wal
+                    .shards
+                    .iter()
+                    .map(|shard| WalShardMemoryStats {
+                        configured_buffer_capacity_bytes: shard.configured_buffer_capacity_bytes,
+                        active_buffer_count: shard.active_buffer_count,
+                        spare_buffer_count: shard.spare_buffer_count,
+                        pending_buffer_count: shard.pending_buffer_count,
+                        in_flight_buffer_count: shard.in_flight_buffer_count,
+                        allocated_buffer_count: shard.allocated_buffer_count,
+                        virtual_buffer_capacity_bytes: shard.virtual_buffer_capacity_bytes,
+                        known_touched_buffer_bytes: shard.known_touched_buffer_bytes,
+                        active_used_bytes: shard.active_used_bytes,
+                        active_used_high_water_bytes: shard.active_used_high_water_bytes,
+                        max_submitted_buffer_records: shard.max_submitted_buffer_records,
+                        max_submitted_batch_records: shard.max_submitted_batch_records,
+                        page_image_bytes_appended: shard.page_image_bytes_appended,
+                        logical_bytes_appended: shard.logical_bytes_appended,
+                    })
+                    .collect(),
+            }),
             live_data_bytes: Some(live_data_bytes),
             persisted_data_bytes: Some((self.inner.persisted_pages() * PAGE_SIZE) as u64),
             extra,
             ..EngineStats::default()
         }
+    }
+
+    fn phase_stats_since(&self, earlier: &EngineStats) -> EngineStats {
+        const EXTRA_GAUGES: &[&str] = &[
+            "resident_frames",
+            "pinned_frames",
+            "dirty_frames",
+            "referenced_frames",
+            "eviction_allowed_frames",
+            "free_list_frames",
+            "resident_budget_available",
+            "eviction_in_flight",
+        ];
+
+        let mut stats = self.stats().phase_delta_since(earlier);
+        for (name, value) in &mut stats.extra {
+            if EXTRA_GAUGES.contains(&name.as_str()) {
+                continue;
+            }
+            let (Ok(current), Some(Ok(before))) = (
+                value.parse::<u64>(),
+                earlier.extra.get(name).map(|value| value.parse::<u64>()),
+            ) else {
+                continue;
+            };
+            *value = current.saturating_sub(before).to_string();
+        }
+        stats
     }
 }
 
@@ -248,6 +366,37 @@ mod tests {
             reopened.stats().live_data_bytes,
             Some(before),
             "reachable-page accounting must survive checkpoint and reopen"
+        );
+    }
+
+    #[test]
+    fn adapter_reports_measured_phase_page_store_io() {
+        let dir = TempDir::new().unwrap();
+        let engine = KvstoreAdapter::open(dir.path(), &test_opts()).unwrap();
+        engine.begin_measurement();
+        let before = engine.stats();
+        engine.put(b"key", b"value");
+        engine.put(b"key", b"other");
+        engine.inner.checkpoint().unwrap();
+        let phase = engine.phase_stats_since(&before);
+        let io = phase
+            .storage_io
+            .expect("kvstore must expose page-store I/O");
+        assert!(
+            io.write_calls.unwrap() > 0,
+            "checkpoint must issue page-store writes"
+        );
+        assert_eq!(
+            io.write_requested_bytes, io.write_completed_bytes,
+            "successful full-page writes must complete every requested byte"
+        );
+        assert_eq!(
+            phase
+                .extra
+                .get("dirty_wal_page_patch_records")
+                .map(String::as_str),
+            Some("1"),
+            "buffer-pool diagnostic counters must also be phase deltas"
         );
     }
 }

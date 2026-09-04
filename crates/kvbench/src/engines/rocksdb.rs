@@ -12,7 +12,7 @@ use rocksdb::{
     properties, statistics::Ticker,
 };
 
-use crate::engine::{CacheControl, EngineOpts, EngineStats, KvEngine, SyncMode};
+use crate::engine::{CacheControl, EngineOpts, EngineStats, KvEngine, StorageIoStats, SyncMode};
 
 pub struct RocksdbAdapter {
     db: DB,
@@ -151,11 +151,15 @@ impl KvEngine for RocksdbAdapter {
             cache_used_bytes: Some(self.cache.get_usage() as u64),
             cache_hits: Some(self.statistics.get_ticker_count(Ticker::BlockCacheHit)),
             cache_misses: Some(self.statistics.get_ticker_count(Ticker::BlockCacheMiss)),
+            cache_access_unit: Some("rocksdb_block_cache_events".to_string()),
             cache_insert_bytes: Some(
                 self.statistics
                     .get_ticker_count(Ticker::BlockCacheBytesWrite),
             ),
-            storage_read_bytes: Some(self.statistics.get_ticker_count(Ticker::BytesRead)),
+            storage_io: Some(StorageIoStats {
+                read_completed_bytes: Some(self.statistics.get_ticker_count(Ticker::BytesRead)),
+                ..StorageIoStats::default()
+            }),
             persisted_data_bytes,
             extra,
             ..EngineStats::default()

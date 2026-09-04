@@ -61,6 +61,75 @@ fn wal_counter_event(wal: &Wal, label_value: &str) -> u64 {
     visitor.value
 }
 
+#[test]
+fn memory_stats_separate_virtual_capacity_from_touched_bytes() {
+    let path = tmp_path("memory_stats");
+    let _cleanup = Cleanup(path.clone());
+    let wal = Wal::open_with_shards(&path, 1).unwrap();
+
+    let fresh = wal.memory_stats();
+    assert_eq!(fresh.shard_count, 1);
+    assert_eq!(fresh.active_buffer_count, 1);
+    assert_eq!(fresh.spare_buffer_count, 1);
+    assert_eq!(fresh.pending_buffer_count, 0);
+    assert_eq!(fresh.in_flight_buffer_count, 0);
+    assert_eq!(fresh.allocated_buffer_count, 2);
+    assert_eq!(
+        fresh.virtual_buffer_capacity_bytes,
+        fresh
+            .allocated_buffer_count
+            .saturating_mul(fresh.configured_buffer_capacity_bytes)
+    );
+    assert_eq!(fresh.known_touched_buffer_bytes, 0);
+    assert_eq!(fresh.active_used_bytes, 0);
+
+    wal.append_page_image(7, &[0x5a; PAGE_SIZE]).unwrap();
+    let logical_lsn = wal.claim_lsn();
+    wal.append_logical_with_lsn(logical_lsn, 42, b"logical")
+        .unwrap();
+    wal.flush();
+
+    let used = wal.memory_stats();
+    assert_eq!(
+        used.allocated_buffer_count,
+        used.active_buffer_count
+            + used.spare_buffer_count
+            + used.pending_buffer_count
+            + used.in_flight_buffer_count
+    );
+    assert!(
+        used.known_touched_buffer_bytes >= 3 * PAGE_SIZE as u64,
+        "two records plus at least one metadata page must be touched"
+    );
+    assert!(
+        used.known_touched_buffer_bytes < used.virtual_buffer_capacity_bytes,
+        "small appends must not make the virtual reservation look resident"
+    );
+    assert!(used.active_used_high_water_bytes >= 2 * PAGE_SIZE as u64);
+    assert!(used.max_submitted_buffer_records >= 1);
+    assert!(used.max_submitted_batch_records >= 1);
+    #[cfg(feature = "metrics")]
+    {
+        assert_eq!(used.page_image_bytes_appended, Some(PAGE_SIZE as u64));
+        assert_eq!(used.logical_bytes_appended, Some(7));
+    }
+    #[cfg(not(feature = "metrics"))]
+    {
+        assert_eq!(used.page_image_bytes_appended, None);
+        assert_eq!(used.logical_bytes_appended, None);
+    }
+
+    wal.reset_memory_high_water_marks();
+    let reset = wal.memory_stats();
+    assert_eq!(reset.active_used_high_water_bytes, reset.active_used_bytes);
+    assert_eq!(reset.max_submitted_buffer_records, 0);
+    assert_eq!(reset.max_submitted_batch_records, 0);
+    assert_eq!(
+        reset.known_touched_buffer_bytes, used.known_touched_buffer_bytes,
+        "resetting phase high-water marks must retain lifetime touched evidence"
+    );
+}
+
 fn read_test_page_lsn(page: &[u8]) -> u64 {
     let Some(bytes) = page.get(TEST_PAGE_LSN_OFF..TEST_PAGE_LSN_OFF + 8) else {
         return 0;

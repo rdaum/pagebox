@@ -15,6 +15,7 @@ mod distribution;
 mod driver;
 mod engine;
 mod engines;
+mod memory;
 mod report;
 mod stats;
 mod workload;
@@ -23,6 +24,7 @@ use comparison::{ComparisonContract, MemoryRegime};
 use driver::run_phase;
 use engine::{EngineOpts, EngineStats, KvEngine};
 use engines::kvstore_adapter::KvstoreAdapter;
+use memory::ProcessMemorySampler;
 use report::{Report, ReportMeasurements};
 use workload::{WorkloadSpec, generate_load_ops, generate_run_ops, validate_spec};
 
@@ -360,6 +362,9 @@ fn run_engine<E: KvEngine>(
     eprintln!("  Running {} operations...", spec.operation_count);
     let run_ops = generate_run_ops(spec);
     let minimum_duration = Duration::from_secs(spec.minimum_duration_secs);
+    engine.begin_measurement();
+    let engine_stats_before = engine.stats();
+    let memory_sampler = ProcessMemorySampler::start();
     let run_stats = if verify {
         driver::run_phase_verify(
             &engine,
@@ -381,7 +386,8 @@ fn run_engine<E: KvEngine>(
             0.0
         };
 
-    let engine_stats = engine.stats();
+    let engine_stats = engine.phase_stats_since(&engine_stats_before);
+    let process_memory = memory_sampler.finish();
     if uses_bounded_cold_start(comparison.memory_regime) {
         validate_cache_pressure_evidence(E::NAME, opts, &engine_stats)?;
     }
@@ -398,6 +404,7 @@ fn run_engine<E: KvEngine>(
             run_phase: (&run_stats).into(),
             durability_drain_secs,
             engine_stats,
+            process_memory,
         },
     );
 

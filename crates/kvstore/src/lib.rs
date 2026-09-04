@@ -14,7 +14,7 @@ use pagebox_btree::BTree;
 use pagebox_storage::buffer_pool::{BufferPool, BufferPoolHandle};
 use pagebox_storage::page_header::read_page_lsn;
 use pagebox_storage::page_store::{FilePageStore, PageStore, PageStoreIoStats};
-use pagebox_wal::Wal;
+use pagebox_wal::{Wal, WalMemoryStats};
 
 pub use pagebox_frame_kernel::PAGE_SIZE;
 
@@ -303,6 +303,17 @@ impl KvStore {
     /// Cumulative exact data-file I/O counters since this store was opened.
     pub fn page_store_io_stats(&self) -> PageStoreIoStats {
         self.store.io_stats()
+    }
+
+    /// WAL virtual-capacity, touched-buffer, and append-volume evidence.
+    pub fn wal_memory_stats(&self) -> WalMemoryStats {
+        self.wal.memory_stats()
+    }
+
+    /// Reset phase-local WAL high-water marks without changing lifetime
+    /// allocation, touched-byte, or append counters.
+    pub fn reset_wal_memory_high_water_marks(&self) {
+        self.wal.reset_memory_high_water_marks();
     }
 }
 
