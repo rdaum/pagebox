@@ -55,9 +55,10 @@
 //!
 //! ## Recovery
 //!
-//! [`Wal::recover`] flushes any buffered appends, then either streams
-//! records from the single shard (`recover`) or collects, sorts by LSN, and
-//! replays in merged order (`recover_merged`, for multi-shard WALs). Both
+//! [`Wal::recover_pages`] / [`Wal::recover_with_logical`] flush buffered
+//! appends, then either stream records from the single shard (`recover`) or
+//! collect, sort by LSN, and replay in merged order (`recover_merged`, for
+//! multi-shard WALs). Both
 //! delegate the actual page-write decision into [`recover_page_image`] /
 //! [`recover_logical_payload`], which respect the idempotent-recovery rule:
 //! a page-image record at LSN `L` is replayed into the store iff
@@ -112,6 +113,8 @@ pub struct RecoveryReport {
     pub records_scanned: u64,
     /// Records applied to the page store (page was older than WAL).
     pub records_applied: u64,
+    /// Caller-defined logical records successfully delivered to the callback.
+    pub logical_records_delivered: u64,
     /// Records skipped because LSN <= checkpoint_lsn.
     pub skipped_checkpoint: u64,
     /// Records skipped because on-disk page_lsn >= WAL record LSN.
@@ -341,11 +344,28 @@ pub trait RecoveryPageStore: Send + Sync {
     fn next_page_id(&self) -> PageId;
 }
 
-const LOGICAL_KIND_PAGE_IMAGE_BYTES: u64 = 0x4258_5049_4D47_0001;
-const LOGICAL_KIND_PAGE_PATCH: u64 = 0x4258_5041_5443_0001;
+pub(crate) const LOGICAL_KIND_PAGE_IMAGE_BYTES: u64 = 0x4258_5049_4D47_0001;
+pub(crate) const LOGICAL_KIND_PAGE_PATCH: u64 = 0x4258_5041_5443_0001;
 const PAGE_IMAGE_BYTES_HEADER_LEN: usize = 16;
 const PAGE_PATCH_HEADER_LEN: usize = 16;
 const PAGE_PATCH_RANGE_HEADER_LEN: usize = 8;
+
+fn is_internal_logical_kind(kind: u64) -> bool {
+    matches!(
+        kind,
+        LOGICAL_KIND_PAGE_IMAGE_BYTES | LOGICAL_KIND_PAGE_PATCH
+    )
+}
+
+fn validate_caller_logical_kind(kind: u64) -> io::Result<()> {
+    if is_internal_logical_kind(kind) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("logical WAL kind {kind:#018x} is reserved by Pagebox"),
+        ));
+    }
+    Ok(())
+}
 
 pub(crate) struct WalInner {
     pub(crate) state: Mutex<WalState>,
@@ -852,6 +872,12 @@ struct PagePatch<'a> {
     ranges: PagePatchRanges<'a>,
 }
 
+struct LogicalRecord<'a> {
+    lsn: Lsn,
+    kind: u64,
+    payload: &'a [u8],
+}
+
 fn recover_page_image<S, F>(
     recovery: &PageImageRecovery<'_, S, F>,
     report: &mut RecoveryReport,
@@ -937,19 +963,20 @@ where
     Ok(())
 }
 
-fn recover_logical_payload<S, F>(
+fn recover_logical_payload<S, F, L>(
     recovery: &PageImageRecovery<'_, S, F>,
     report: &mut RecoveryReport,
     current_next: &mut PageId,
     page_buf: &mut Vec<u8>,
-    lsn: Lsn,
-    kind: u64,
-    payload: &[u8],
+    record: LogicalRecord<'_>,
+    apply_logical: &mut L,
 ) -> io::Result<bool>
 where
     S: RecoveryPageStore + ?Sized,
     F: Fn(&[u8]) -> Lsn,
+    L: FnMut(Lsn, u64, &[u8]) -> io::Result<()>,
 {
+    let LogicalRecord { lsn, kind, payload } = record;
     if kind == LOGICAL_KIND_PAGE_IMAGE_BYTES {
         let Some((pid, page_data)) = decode_page_image_bytes_payload(payload) else {
             return Ok(false);
@@ -982,6 +1009,13 @@ where
         return Ok(true);
     }
 
+    if lsn <= recovery.checkpoint_lsn {
+        report.skipped_checkpoint += 1;
+        return Ok(true);
+    }
+
+    apply_logical(lsn, kind, payload)?;
+    report.logical_records_delivered += 1;
     Ok(true)
 }
 
@@ -1689,7 +1723,7 @@ impl Wal {
     /// record. Returns `Ok(false)` if `before` and `after` have no
     /// differing ranges that fit the patch encoding; in that case the caller
     /// should fall back to a full page image. Patches are decoded on
-    /// replay by [`Wal::recover`] and applied to the page in store.
+    /// replay by [`Wal::recover_pages`] and applied to the page in store.
     pub fn append_page_patch_with_lsn(
         &self,
         lsn: Lsn,
@@ -1706,7 +1740,7 @@ impl Wal {
             WalEvent::LogicalBytes,
             payload.len().min(isize::MAX as usize) as isize,
         );
-        self.append_logical_with_lsn(lsn, LOGICAL_KIND_PAGE_PATCH, &payload)?;
+        self.append_logical_record_with_lsn(lsn, LOGICAL_KIND_PAGE_PATCH, &payload)?;
         Ok(true)
     }
 
@@ -1731,17 +1765,19 @@ impl Wal {
             WalEvent::LogicalBytes,
             payload.len().min(isize::MAX as usize) as isize,
         );
-        self.append_logical_with_lsn(lsn, LOGICAL_KIND_PAGE_PATCH, &payload)?;
+        self.append_logical_record_with_lsn(lsn, LOGICAL_KIND_PAGE_PATCH, &payload)?;
         Ok(Some(payload_len))
     }
 
     /// Append a logical record (caller-defined `kind`, opaque `payload`)
     /// and return its newly-claimed LSN. Payloads are chunked at
     /// `LOGICAL_CHUNK_MAX_LEN`; short payloads are packed into a single
-    /// data page alongside others. [`Wal::recover`] surfaces these as
-    /// [`WalReplayRecord::Logical`] for the caller's higher-level recovery
-    /// logic to apply.
+    /// data page alongside others. [`Wal::recover_with_logical`] delivers
+    /// these to the caller's higher-level recovery callback. Pagebox reserves
+    /// its internal page-image and page-patch kinds; attempting to append one
+    /// through this caller-facing method returns [`io::ErrorKind::InvalidInput`].
     pub fn append_logical(&self, kind: u64, payload: &[u8]) -> io::Result<Lsn> {
+        validate_caller_logical_kind(kind)?;
         let lsn = self.claim_lsn();
         let inner = self.inner_for_lsn(lsn);
         inner.stats.events.inc(WalEvent::LogicalRecords);
@@ -1749,14 +1785,25 @@ impl Wal {
             WalEvent::LogicalBytes,
             payload.len().min(isize::MAX as usize) as isize,
         );
-        self.append_logical_with_lsn(lsn, kind, payload)?;
+        self.append_logical_record_with_lsn(lsn, kind, payload)?;
         Ok(lsn)
     }
 
     /// Append a logical record using a pre-claimed `lsn` (paired with
     /// [`Wal::claim_lsn`]). The LSN is honoured exactly even across shards;
     /// callers must guarantee no other append may have already used it.
+    /// Pagebox's internal logical kinds are rejected as reserved.
     pub fn append_logical_with_lsn(&self, lsn: Lsn, kind: u64, payload: &[u8]) -> io::Result<()> {
+        validate_caller_logical_kind(kind)?;
+        self.append_logical_record_with_lsn(lsn, kind, payload)
+    }
+
+    fn append_logical_record_with_lsn(
+        &self,
+        lsn: Lsn,
+        kind: u64,
+        payload: &[u8],
+    ) -> io::Result<()> {
         if kind != LOGICAL_KIND_PAGE_IMAGE_BYTES && payload.len() <= PACKED_LOGICAL_MAX_PAYLOAD_LEN
         {
             return self.append_packed_logical_with_lsn(lsn, kind, payload);
@@ -1894,7 +1941,7 @@ impl Wal {
         let payload = encode_page_image_bytes_payload(page_id, page_len, |page| {
             fill_page(lsn, page);
         });
-        self.append_logical_with_lsn(lsn, LOGICAL_KIND_PAGE_IMAGE_BYTES, &payload)
+        self.append_logical_record_with_lsn(lsn, LOGICAL_KIND_PAGE_IMAGE_BYTES, &payload)
     }
 
     /// Variable-length page-image append using `&[u8]` directly. Allocates a
@@ -2047,7 +2094,7 @@ impl Wal {
     /// Deliberate crash shutdown: stop worker threads in place **without**
     /// draining pending appends and close the fd. Used by recovery tests to
     /// simulate a process crash mid-append. After this the WAL file resembles
-    /// one torn mid-batch; reopening must call [`Wal::recover`] before any
+    /// one torn mid-batch; reopening must call [`Wal::recover_pages`] before any
     /// new appends.
     ///
     /// Consumes `self` via `ManuallyDrop` so no `Drop` cleanup runs.
@@ -2227,17 +2274,17 @@ impl Wal {
         result
     }
 
-    /// Drive recovery into `store`.
+    /// Recover Pagebox-owned page images and page patches into `store`.
     ///
     /// Flushes pending appends, then replays records in LSN order applying
     /// the idempotent rule: page-image records with `lsn <= checkpoint_lsn`
     /// or `lsn <= read_page_lsn(page_bytes)` are skipped, the rest are
-    /// written into `store`. Logical records are forwarded to the caller-
-    /// supplied `read_page_lsn` only for the LSN-derivation step; logical
-    /// payloads (page-patch included) are applied inline via the recovery
-    /// helpers. Returns a [`RecoveryReport`] with the scan/apply counts and
-    /// the highest LSN seen.
-    pub fn recover<S, F>(
+    /// written into `store`. Pagebox-owned logical encodings are applied
+    /// internally. A caller-defined logical record above `checkpoint_lsn`
+    /// fails recovery with [`io::ErrorKind::InvalidData`] instead of being
+    /// silently discarded; use [`Wal::recover_with_logical`] when the WAL
+    /// contains caller-defined records.
+    pub fn recover_pages<S, F>(
         &self,
         store: &S,
         checkpoint_lsn: Lsn,
@@ -2247,22 +2294,60 @@ impl Wal {
         S: RecoveryPageStore + ?Sized,
         F: Fn(&[u8]) -> Lsn,
     {
-        self.flush();
-        if self.shard_count() > 1 {
-            return self.recover_merged(store, checkpoint_lsn, read_page_lsn);
-        }
-        self.inner.recover(store, checkpoint_lsn, read_page_lsn)
+        self.recover_with_logical(
+            store,
+            checkpoint_lsn,
+            read_page_lsn,
+            |lsn, kind, _payload| {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "caller-defined logical WAL record kind {kind:#018x} at LSN {lsn} requires recover_with_logical"
+                    ),
+                ))
+            },
+        )
     }
 
-    fn recover_merged<S, F>(
+    /// Recover pages and deliver caller-defined logical records in LSN order.
+    ///
+    /// Each complete caller-defined record above `checkpoint_lsn` is passed
+    /// once to `apply_logical` after chunk reassembly. Pagebox-owned page
+    /// image and page-patch encodings are applied internally and are never
+    /// exposed to the callback. An incomplete WAL tail is ignored. Callback
+    /// errors stop recovery immediately and are returned unchanged; the WAL
+    /// does not advance a checkpoint or reset itself.
+    pub fn recover_with_logical<S, F, L>(
         &self,
         store: &S,
         checkpoint_lsn: Lsn,
         read_page_lsn: F,
+        mut apply_logical: L,
     ) -> io::Result<RecoveryReport>
     where
         S: RecoveryPageStore + ?Sized,
         F: Fn(&[u8]) -> Lsn,
+        L: FnMut(Lsn, u64, &[u8]) -> io::Result<()>,
+    {
+        self.flush();
+        if self.shard_count() > 1 {
+            return self.recover_merged(store, checkpoint_lsn, read_page_lsn, &mut apply_logical);
+        }
+        self.inner
+            .recover(store, checkpoint_lsn, read_page_lsn, &mut apply_logical)
+    }
+
+    fn recover_merged<S, F, L>(
+        &self,
+        store: &S,
+        checkpoint_lsn: Lsn,
+        read_page_lsn: F,
+        apply_logical: &mut L,
+    ) -> io::Result<RecoveryReport>
+    where
+        S: RecoveryPageStore + ?Sized,
+        F: Fn(&[u8]) -> Lsn,
+        L: FnMut(Lsn, u64, &[u8]) -> io::Result<()>,
     {
         let mut records = Vec::new();
         self.collect_records(&mut records)?;
@@ -2300,9 +2385,12 @@ impl Wal {
                         &mut report,
                         &mut current_next,
                         &mut page_buf,
-                        *lsn,
-                        *kind,
-                        payload,
+                        LogicalRecord {
+                            lsn: *lsn,
+                            kind: *kind,
+                            payload,
+                        },
+                        apply_logical,
                     )? {
                         return Ok(report);
                     }
@@ -3135,15 +3223,17 @@ impl WalInner {
         Ok(())
     }
 
-    fn recover<S, F>(
+    fn recover<S, F, L>(
         &self,
         store: &S,
         checkpoint_lsn: Lsn,
         read_page_lsn: F,
+        apply_logical: &mut L,
     ) -> io::Result<RecoveryReport>
     where
         S: RecoveryPageStore + ?Sized,
         F: Fn(&[u8]) -> Lsn,
+        L: FnMut(Lsn, u64, &[u8]) -> io::Result<()>,
     {
         let state = self.state.lock();
         let end = state.file_offset;
@@ -3228,9 +3318,12 @@ impl WalInner {
                                 &mut report,
                                 &mut current_next,
                                 &mut page_buf,
-                                logical_lsn,
-                                logical_kind,
-                                &logical_payload,
+                                LogicalRecord {
+                                    lsn: logical_lsn,
+                                    kind: logical_kind,
+                                    payload: &logical_payload,
+                                },
+                                apply_logical,
                             )? {
                                 return Ok(report);
                             }
@@ -3257,9 +3350,12 @@ impl WalInner {
                                 &mut report,
                                 &mut current_next,
                                 &mut page_buf,
-                                lsn,
-                                kind,
-                                &payload,
+                                LogicalRecord {
+                                    lsn,
+                                    kind,
+                                    payload: &payload,
+                                },
+                                apply_logical,
                             )? {
                                 return Ok(report);
                             }

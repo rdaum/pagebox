@@ -134,7 +134,7 @@ impl KvStore {
         let wal = Wal::open_opts(&wal_path)?;
 
         let checkpoint_lsn = store.checkpoint_lsn();
-        let report = wal.recover(&*store, checkpoint_lsn, read_page_lsn)?;
+        let report = wal.recover_pages(&*store, checkpoint_lsn, read_page_lsn)?;
         if report.max_lsn > checkpoint_lsn {
             store.sync()?;
             store.set_checkpoint_lsn(report.max_lsn);

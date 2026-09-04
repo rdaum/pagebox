@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "metrics")]
@@ -13,7 +13,9 @@ use crate::format::{
     WAL_RECORD_SIZE, batch_meta_count, finalize_batch_meta, init_batch_meta, page_crc,
     set_batch_meta_count, write_batch_entry,
 };
-use crate::wal_impl::configured_wal_shard_count;
+use crate::wal_impl::{
+    LOGICAL_KIND_PAGE_IMAGE_BYTES, LOGICAL_KIND_PAGE_PATCH, configured_wal_shard_count,
+};
 use crate::{CommitMode, RecoveryPageStore, Wal, WalReplayRecord};
 
 const TEST_PAGE_LSN_OFF: usize = 8;
@@ -114,6 +116,71 @@ impl RecoveryPageStore for TestRecoveryStore {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum RecoveryEvent {
+    Page(Lsn),
+    Logical(Lsn, u64, Vec<u8>),
+    Sync,
+}
+
+struct OrderedRecoveryStore {
+    pages: Mutex<HashMap<PageId, Vec<u8>>>,
+    events: Arc<Mutex<Vec<RecoveryEvent>>>,
+}
+
+impl OrderedRecoveryStore {
+    fn new(events: Arc<Mutex<Vec<RecoveryEvent>>>) -> Self {
+        Self {
+            pages: Mutex::new(HashMap::new()),
+            events,
+        }
+    }
+}
+
+impl RecoveryPageStore for OrderedRecoveryStore {
+    fn read_page(&self, pid: PageId, buf: &mut [u8]) -> io::Result<bool> {
+        let pages = self.pages.lock().unwrap();
+        let Some(data) = pages.get(&pid) else {
+            return Ok(false);
+        };
+        buf.copy_from_slice(data);
+        Ok(true)
+    }
+
+    fn write_page(&self, pid: PageId, data: &[u8]) -> io::Result<()> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(RecoveryEvent::Page(read_test_page_lsn(data)));
+        self.pages.lock().unwrap().insert(pid, data.to_vec());
+        Ok(())
+    }
+
+    fn allocate(&self, pid: PageId) -> io::Result<()> {
+        self.pages
+            .lock()
+            .unwrap()
+            .insert(pid, vec![0; page_size(pid)]);
+        Ok(())
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        self.events.lock().unwrap().push(RecoveryEvent::Sync);
+        Ok(())
+    }
+
+    fn next_page_id(&self) -> PageId {
+        self.pages
+            .lock()
+            .unwrap()
+            .keys()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            + 1
+    }
+}
+
 fn tmp_path(name: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!("pagebox_wal_{name}_{}", std::process::id()));
@@ -178,7 +245,7 @@ fn recover_applies_page_patch_after_base_image() {
     wal.flush();
 
     let store = TestRecoveryStore::default();
-    let report = wal.recover(&store, 0, read_test_page_lsn).unwrap();
+    let report = wal.recover_pages(&store, 0, read_test_page_lsn).unwrap();
     assert_eq!(report.records_applied, 2, "image and patch should apply");
     let pages = store.pages.lock().unwrap();
     assert_eq!(
@@ -222,7 +289,7 @@ fn recover_applies_explicit_page_patch_ranges() {
     wal.flush();
 
     let store = TestRecoveryStore::default();
-    let report = wal.recover(&store, 0, read_test_page_lsn).unwrap();
+    let report = wal.recover_pages(&store, 0, read_test_page_lsn).unwrap();
     assert_eq!(report.records_applied, 2);
     assert_eq!(
         store.pages.lock().unwrap().get(&page_id).map(Vec::as_slice),
@@ -267,7 +334,7 @@ fn sharded_recovery_applies_records_in_lsn_order() {
     );
 
     let store = TestRecoveryStore::default();
-    let report = wal.recover(&store, 0, read_test_page_lsn).unwrap();
+    let report = wal.recover_pages(&store, 0, read_test_page_lsn).unwrap();
     assert_eq!(report.records_applied, 2, "image and patch should apply");
     let pages = store.pages.lock().unwrap();
     assert_eq!(
@@ -449,6 +516,217 @@ fn replay_records_interleaves_page_images_and_logical_records() {
         vec![(1, 10, 11), (3, 30, 33)],
         "page-image replay should ignore logical records"
     );
+}
+
+#[test]
+fn page_recovery_rejects_caller_defined_logical_records() {
+    let path = tmp_path("recover_rejects_caller_logical");
+    let _cleanup = Cleanup(path.clone());
+    let wal = Wal::open(&path).unwrap();
+    wal.append_logical(42, b"must not disappear").unwrap();
+    wal.flush();
+
+    let store = TestRecoveryStore::default();
+    let error = wal
+        .recover_pages(&store, 0, read_test_page_lsn)
+        .expect_err("page-only recovery must reject caller-defined logical records");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn caller_logical_append_rejects_pagebox_reserved_kinds() {
+    let path = tmp_path("logical_reserved_kinds");
+    let _cleanup = Cleanup(path.clone());
+    let wal = Wal::open(&path).unwrap();
+
+    for kind in [LOGICAL_KIND_PAGE_IMAGE_BYTES, LOGICAL_KIND_PAGE_PATCH] {
+        let error = wal
+            .append_logical(kind, b"caller payload")
+            .expect_err("caller append must reject Pagebox's internal logical kinds");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+    assert_eq!(
+        wal.claim_lsn(),
+        1,
+        "rejected logical kinds must not consume an LSN"
+    );
+}
+
+#[test]
+fn logical_recovery_delivers_packed_and_chunked_records_once() {
+    let path = tmp_path("recover_caller_logical_sizes");
+    let _cleanup = Cleanup(path.clone());
+    let wal = Wal::open(&path).unwrap();
+    let large_payload = (0..PAGE_SIZE * 3 + 17)
+        .map(|idx| (idx % 251) as u8)
+        .collect::<Vec<_>>();
+    assert_eq!(wal.append_logical(42, b"packed").unwrap(), 1);
+    assert_eq!(wal.append_logical(43, &large_payload).unwrap(), 2);
+    wal.flush();
+
+    let store = TestRecoveryStore::default();
+    let mut delivered = Vec::new();
+    let report = wal
+        .recover_with_logical(&store, 0, read_test_page_lsn, |lsn, kind, payload| {
+            delivered.push((lsn, kind, payload.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(
+        delivered,
+        vec![(1, 42, b"packed".to_vec()), (2, 43, large_payload)],
+        "recovery should deliver each complete logical record once after reassembly"
+    );
+    assert_eq!(report.logical_records_delivered, 2);
+    assert_eq!(report.max_lsn, 2);
+}
+
+#[test]
+fn sharded_logical_recovery_merges_pages_and_callbacks_by_lsn() {
+    let path = tmp_path("recover_sharded_logical_order");
+    let _cleanup = Cleanup(path.clone());
+    let wal = Wal::open_with_shards_for_test(&path, 2).unwrap();
+
+    let first_lsn = wal.claim_lsn();
+    assert_eq!(first_lsn, 1);
+    wal.append_page_image_with_lsn(first_lsn, 101, |lsn, page| {
+        write_test_page_lsn(page, lsn);
+    })
+    .unwrap();
+
+    let (command_tx, command_rx) = mpsc::channel();
+    let (result_tx, result_rx) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let worker_wal = &wal;
+        scope.spawn(move || {
+            for _ in 0..2 {
+                command_rx.recv().unwrap();
+                let lsn = worker_wal.claim_lsn();
+                worker_wal
+                    .append_logical_with_lsn(lsn, 70 + lsn, &[lsn as u8])
+                    .unwrap();
+                result_tx.send(lsn).unwrap();
+            }
+        });
+
+        command_tx.send(()).unwrap();
+        assert_eq!(result_rx.recv().unwrap(), 2);
+
+        let third_lsn = wal.claim_lsn();
+        assert_eq!(third_lsn, 3);
+        wal.append_page_image_with_lsn(third_lsn, 103, |lsn, page| {
+            write_test_page_lsn(page, lsn);
+        })
+        .unwrap();
+
+        command_tx.send(()).unwrap();
+        assert_eq!(result_rx.recv().unwrap(), 4);
+    });
+    wal.flush();
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let store = OrderedRecoveryStore::new(Arc::clone(&events));
+    let callback_events = Arc::clone(&events);
+    let report = wal
+        .recover_with_logical(&store, 2, read_test_page_lsn, move |lsn, kind, payload| {
+            callback_events.lock().unwrap().push(RecoveryEvent::Logical(
+                lsn,
+                kind,
+                payload.to_vec(),
+            ));
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            RecoveryEvent::Page(3),
+            RecoveryEvent::Logical(4, 74, vec![4]),
+            RecoveryEvent::Sync,
+        ],
+        "recovery should skip the checkpointed prefix and merge shard records by LSN"
+    );
+    assert_eq!(report.skipped_checkpoint, 2);
+    assert_eq!(report.records_applied, 1);
+    assert_eq!(report.logical_records_delivered, 1);
+    assert_eq!(report.max_lsn, 4);
+}
+
+#[test]
+fn logical_recovery_propagates_callback_failure_without_sync_or_reset() {
+    let path = tmp_path("recover_logical_callback_error");
+    let _cleanup = Cleanup(path.clone());
+    let wal = Wal::open(&path).unwrap();
+    let mut page = [0u8; PAGE_SIZE];
+    write_test_page_lsn(&mut page, 1);
+    assert_eq!(wal.append_page_image(1, &page).unwrap(), 1);
+    assert_eq!(wal.append_logical(80, b"fail").unwrap(), 2);
+    assert_eq!(wal.append_logical(81, b"unreached").unwrap(), 3);
+    wal.flush();
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let store = OrderedRecoveryStore::new(Arc::clone(&events));
+    let callback_events = Arc::clone(&events);
+    let error = wal
+        .recover_with_logical(&store, 0, read_test_page_lsn, move |lsn, kind, payload| {
+            callback_events.lock().unwrap().push(RecoveryEvent::Logical(
+                lsn,
+                kind,
+                payload.to_vec(),
+            ));
+            Err(io::Error::other("model apply failed"))
+        })
+        .expect_err("callback failure must stop recovery");
+
+    assert_eq!(error.kind(), io::ErrorKind::Other);
+    assert_eq!(error.to_string(), "model apply failed");
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            RecoveryEvent::Page(1),
+            RecoveryEvent::Logical(2, 80, b"fail".to_vec()),
+        ],
+        "recovery must stop at the failing callback without syncing page writes"
+    );
+
+    let mut replayed = Vec::new();
+    wal.replay_records(|record| replayed.push(record_lsn(record)))
+        .unwrap();
+    assert_eq!(
+        replayed,
+        vec![1, 2, 3],
+        "callback failure must leave the WAL intact for a later recovery attempt"
+    );
+}
+
+#[test]
+fn repeated_logical_recovery_supports_an_idempotent_model_callback() {
+    let path = tmp_path("recover_logical_twice");
+    let _cleanup = Cleanup(path.clone());
+    let wal = Wal::open(&path).unwrap();
+    assert_eq!(wal.append_logical(90, &[1, 10]).unwrap(), 1);
+    assert_eq!(wal.append_logical(90, &[2, 20]).unwrap(), 2);
+    wal.flush();
+
+    let store = TestRecoveryStore::default();
+    let mut model = HashMap::new();
+    let mut deliveries = Vec::new();
+    for invocation in 0..2 {
+        let report = wal
+            .recover_with_logical(&store, 0, read_test_page_lsn, |lsn, kind, payload| {
+                assert_eq!(kind, 90);
+                model.insert(payload[0], payload[1]);
+                deliveries.push((invocation, lsn));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(report.logical_records_delivered, 2);
+    }
+
+    assert_eq!(model, HashMap::from([(1, 10), (2, 20)]));
+    assert_eq!(deliveries, vec![(0, 1), (0, 2), (1, 1), (1, 2)]);
 }
 
 #[test]
@@ -649,7 +927,7 @@ fn page_image_roundtrips_as_reassembled_record() {
     );
 
     let store = TestRecoveryStore::default();
-    let report = wal.recover(&store, 0, read_test_page_lsn).unwrap();
+    let report = wal.recover_pages(&store, 0, read_test_page_lsn).unwrap();
     assert_eq!(report.records_applied, 1);
 
     let mut recovered = vec![0u8; PAGE_SIZE];
@@ -709,6 +987,20 @@ fn replay_records_skips_abandoned_logical_prefix_after_reopen_append() {
         vec![(1, 12, 44)],
         "replay should ignore the incomplete logical prefix and continue with later records"
     );
+
+    let store = TestRecoveryStore::default();
+    let mut logical = Vec::new();
+    let report = wal
+        .recover_with_logical(&store, 0, read_test_page_lsn, |lsn, kind, payload| {
+            logical.push((lsn, kind, payload.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        logical.is_empty(),
+        "recovery must not deliver the incomplete logical prefix"
+    );
+    assert_eq!(report.records_applied, 1);
 }
 
 #[test]
@@ -1010,7 +1302,7 @@ fn recovery_with_checkpoint_lsn_skips_records_at_or_below_checkpoint() {
     // only LSN 3 should apply.
     let store = TestRecoveryStore::default();
     let wal = Wal::open(&path).unwrap();
-    let report = wal.recover(&store, 2, read_test_page_lsn).unwrap();
+    let report = wal.recover_pages(&store, 2, read_test_page_lsn).unwrap();
 
     assert_eq!(
         report.skipped_checkpoint, 2,
@@ -1058,7 +1350,7 @@ fn recovery_skips_page_when_on_disk_lsn_is_at_least_record_lsn() {
     }
 
     let wal = Wal::open(&path).unwrap();
-    let report = wal.recover(&store, 0, read_test_page_lsn).unwrap();
+    let report = wal.recover_pages(&store, 0, read_test_page_lsn).unwrap();
 
     assert_eq!(
         report.skipped_page_lsn, 1,
@@ -1530,7 +1822,7 @@ mod io_uring_tests {
         // Reopen + recover into a store; every committed page should appear.
         let wal = open_iouring(&path);
         let store = TestRecoveryStore::default();
-        wal.recover(&store, 0, |_| 0).unwrap();
+        wal.recover_pages(&store, 0, |_| 0).unwrap();
         assert_eq!(
             store.pages.lock().unwrap().len(),
             128,
@@ -1559,7 +1851,7 @@ mod io_uring_tests {
 
         let wal = open_iouring(&path);
         let store = TestRecoveryStore::default();
-        wal.recover(&store, 0, |_| 0).unwrap();
+        wal.recover_pages(&store, 0, |_| 0).unwrap();
         let applied = store.pages.lock().unwrap().len();
         assert!(
             applied <= 64,

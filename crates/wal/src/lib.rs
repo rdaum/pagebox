@@ -99,13 +99,16 @@
 //!
 //! ## Recovery
 //!
-//! [`Wal::recover`] drives replay into a [`RecoveryPageStore`]:
+//! [`Wal::recover_pages`] drives page-only replay into a
+//! [`RecoveryPageStore`], while [`Wal::recover_with_logical`] also invokes a
+//! caller callback for application-owned logical records:
 //!
 //! 1. Records with `lsn <= checkpoint_lsn` are skipped.
 //! 2. Page-image records are written to the store if `lsn >
 //!    read_page_lsn(page_bytes)`; otherwise skipped (idempotent recovery).
-//! 3. Logical records are surfaced to a caller callback that applies the
-//!    semantic-level change (page-patch records are decoded and applied here).
+//! 3. Pagebox page-patch records are decoded and applied internally.
+//! 4. `recover_with_logical` delivers caller-owned logical records to its
+//!    callback; `recover_pages` rejects them rather than silently losing them.
 //!
 //! Multi-shard WALs replay in LSN-merged order (records are collected, sorted,
 //! then applied); single-shard WALs stream directly. [`Wal::replay`] /
