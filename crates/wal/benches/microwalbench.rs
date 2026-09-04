@@ -12,7 +12,7 @@ use micromeasure::{
     MeasurementDomain, MetricValue, Throughput, benchmark_main, black_box,
 };
 use pagebox_frame_kernel::PAGE_SIZE;
-use pagebox_wal::{CommitMode, WAL_BUF_RECORDS, Wal};
+use pagebox_wal::{CommitMode, WAL_DEFAULT_BUFFER_RECORDS, Wal};
 
 use benchmark_support::PageboxBenchmarkRunner;
 
@@ -28,7 +28,7 @@ impl BenchContext for AppendBufferOnlyCtx {
     }
 
     fn chunk_size() -> Option<usize> {
-        Some(WAL_BUF_RECORDS)
+        Some(WAL_DEFAULT_BUFFER_RECORDS)
     }
 }
 
@@ -581,7 +581,9 @@ benchmark_main!(|runner| {
             .factory(&|| {
                 let dir = tempfile::tempdir().unwrap();
                 let wal = Wal::open_opts(&dir.path().join("wal")).unwrap();
-                let pages = (0..WAL_BUF_RECORDS as u64).map(page_data).collect();
+                let pages = (0..WAL_DEFAULT_BUFFER_RECORDS as u64)
+                    .map(page_data)
+                    .collect();
                 AppendBufferOnlyCtx {
                     wal,
                     _dir: dir,

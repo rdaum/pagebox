@@ -14,7 +14,8 @@ use crate::format::{
     set_batch_meta_count, write_batch_entry,
 };
 use crate::wal_impl::{
-    LOGICAL_KIND_PAGE_IMAGE_BYTES, LOGICAL_KIND_PAGE_PATCH, configured_wal_shard_count,
+    LOGICAL_KIND_PAGE_IMAGE_BYTES, LOGICAL_KIND_PAGE_PATCH, configured_wal_buffer_records,
+    configured_wal_shard_count,
 };
 use crate::{CommitMode, RecoveryPageStore, Wal, WalReplayRecord};
 
@@ -128,6 +129,67 @@ fn memory_stats_separate_virtual_capacity_from_touched_bytes() {
         reset.known_touched_buffer_bytes, used.known_touched_buffer_bytes,
         "resetting phase high-water marks must retain lifetime touched evidence"
     );
+}
+
+#[test]
+fn configured_buffer_records_are_bounded_by_the_format_capacity() {
+    assert_eq!(
+        configured_wal_buffer_records(None),
+        crate::WAL_DEFAULT_BUFFER_RECORDS
+    );
+    assert_eq!(
+        configured_wal_buffer_records(Some("invalid")),
+        crate::WAL_DEFAULT_BUFFER_RECORDS
+    );
+    assert_eq!(configured_wal_buffer_records(Some("0")), 1);
+    assert_eq!(configured_wal_buffer_records(Some("64")), 64);
+    assert_eq!(
+        configured_wal_buffer_records(Some(&usize::MAX.to_string())),
+        crate::WAL_BUF_RECORDS
+    );
+}
+
+#[test]
+fn small_operational_buffer_replays_records_across_seals() {
+    const BUFFER_RECORDS: usize = 64;
+    const APPENDED_RECORDS: usize = BUFFER_RECORDS * 3 + 1;
+
+    let path = tmp_path("small_operational_buffer");
+    let _cleanup = Cleanup(path.clone());
+    let wal = Wal::open_with_buffer_records_for_test(&path, BUFFER_RECORDS).unwrap();
+    let page = [0x6d; PAGE_SIZE];
+
+    for pid in 0..APPENDED_RECORDS as PageId {
+        wal.append_page_image(pid, &page).unwrap();
+    }
+    wal.flush();
+
+    let stats = wal.memory_stats();
+    assert_eq!(
+        stats.configured_buffer_record_capacity,
+        BUFFER_RECORDS as u64
+    );
+    assert_eq!(
+        stats.configured_buffer_capacity_bytes,
+        ((BUFFER_RECORDS + 1) * PAGE_SIZE) as u64
+    );
+    assert_eq!(stats.max_submitted_buffer_records, BUFFER_RECORDS as u64);
+    assert_eq!(
+        stats.allocated_buffer_count, 2,
+        "append pressure must reuse one active and one spare/in-flight buffer"
+    );
+    assert!(
+        stats.max_submitted_batch_records <= BUFFER_RECORDS as u64,
+        "the operational seal must not alter the on-disk batch limit"
+    );
+
+    let mut replayed = 0usize;
+    wal.replay(|_lsn, _pid, data| {
+        assert_eq!(data, page.as_slice());
+        replayed += 1;
+    })
+    .unwrap();
+    assert_eq!(replayed, APPENDED_RECORDS);
 }
 
 fn read_test_page_lsn(page: &[u8]) -> u64 {
@@ -1199,7 +1261,7 @@ fn torn_page_image_batch_replays_complete_batches_only() {
     // Write enough page images to span two batches, then flush.
     let records_before_tear = BATCH_MAX_RECORDS + 1;
     {
-        let wal = Wal::open(&path).unwrap();
+        let wal = Wal::open_with_buffer_records_for_test(&path, crate::WAL_BUF_RECORDS).unwrap();
         for i in 1..=(records_before_tear as u64) {
             let mut page = [0u8; PAGE_SIZE];
             page[0] = i as u8;
@@ -1964,6 +2026,11 @@ mod io_uring_tests {
             for h in handles {
                 h.join().unwrap();
             }
+            assert_eq!(
+                wal.memory_stats().allocated_buffer_count,
+                3,
+                "io_uring should retain a bounded active-plus-two-spare buffer pool"
+            );
         }
 
         // Reopen + replay: post-hoc invariant scan.

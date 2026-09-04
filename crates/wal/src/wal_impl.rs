@@ -4,8 +4,8 @@
 //! [`Wal`] is a thin outer shell over a primary [`WalInner`] plus zero or
 //! more extra shards. Each shard owns:
 //!
-//! - An `AlignedBuf`-backed `WalBuffer`, sized from the maximum on-disk batch,
-//!   that callers copy record bytes into under a
+//! - An `AlignedBuf`-backed `WalBuffer`, with an operational cap independent
+//!   of the maximum on-disk batch, that callers copy record bytes into under a
 //!   `parking_lot::Mutex<WalState>`.
 //! - A *writer* background thread (always spawned) that drains full or
 //!   deadline-elapsed buffers via `pwrite`.
@@ -88,7 +88,7 @@ use pagebox_threading as threading;
 
 #[cfg(not(feature = "metrics"))]
 use crate::metrics_stub::{LabeledCounter, LabeledHistogram, MetricVisitor};
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use crate::aligned_buf::AlignedBuf;
 use crate::backend::WalIoBackend;
@@ -96,13 +96,13 @@ use crate::format::SEGMENT_SIZE;
 use crate::format::{
     BATCH_MAX_RECORDS, BatchEntry, DIRECT_IO_ALIGN, LOGICAL_CHUNK_MAX_LEN, LOGICAL_FLAG_FIRST,
     LOGICAL_FLAG_LAST, PACKED_LOGICAL_ENTRY_HEADER_LEN, PACKED_LOGICAL_MAX_PAYLOAD_LEN,
-    RECORD_KIND_LOGICAL, RECORD_KIND_LOGICAL_PACKED, RECORD_KIND_PAGE_IMAGE, WAL_BUF_CAPACITY,
-    WAL_GROUP_COMMIT_DELAY_MIN_US, WAL_HEADER_SIZE, WAL_RECORD_SIZE, WAL_RELAXED_SYNC_INTERVAL_US,
-    WAL_RELAXED_SYNC_RECORDS, WAL_RELAXED_WRITE_INTERVAL_US, WAL_RELAXED_WRITE_RECORDS,
-    batch_meta_count, batch_meta_count_unchecked, build_wal_header, env_u64_us,
-    finalize_batch_meta, init_batch_meta, overwrite_batch_entry_crc, overwrite_batch_entry_lsn,
-    page_crc, payload_crc, read_batch_entry, set_batch_meta_count, validate_wal_header,
-    write_batch_entry,
+    RECORD_KIND_LOGICAL, RECORD_KIND_LOGICAL_PACKED, RECORD_KIND_PAGE_IMAGE, WAL_BUF_RECORDS,
+    WAL_DEFAULT_BUFFER_RECORDS, WAL_GROUP_COMMIT_DELAY_MIN_US, WAL_HEADER_SIZE, WAL_RECORD_SIZE,
+    WAL_RELAXED_SYNC_INTERVAL_US, WAL_RELAXED_SYNC_RECORDS, WAL_RELAXED_WRITE_INTERVAL_US,
+    WAL_RELAXED_WRITE_RECORDS, batch_meta_count, batch_meta_count_unchecked, build_wal_header,
+    env_u64_us, finalize_batch_meta, init_batch_meta, overwrite_batch_entry_crc,
+    overwrite_batch_entry_lsn, page_crc, payload_crc, read_batch_entry, set_batch_meta_count,
+    validate_wal_header, wal_buffer_capacity_for_records, write_batch_entry,
 };
 use crate::io::{extend_file, fdatasync_file, fstat_size, pread_all, pwrite_all, round_up_u64};
 
@@ -138,6 +138,8 @@ pub enum WalEvent {
     FlushWait,
     /// Background writer completed one `pwrite` syscall.
     WriteCall,
+    /// An appender waited for one of the bounded WAL buffers to be reused.
+    BufferBackpressure,
     /// The writer waited because the backend's submitted-write window was full.
     WriteBackpressure,
     /// Background writer bytes written (sum across `WriteCall`s).
@@ -200,6 +202,7 @@ pub struct WalStats {
 /// separately when resident memory is the quantity of interest.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct WalShardMemoryStats {
+    pub configured_buffer_record_capacity: u64,
     pub configured_buffer_capacity_bytes: u64,
     pub active_buffer_count: u64,
     pub spare_buffer_count: u64,
@@ -215,6 +218,28 @@ pub struct WalShardMemoryStats {
     pub max_submitted_buffer_records: u64,
     /// Most records in one submitted on-disk batch since open or reset.
     pub max_submitted_batch_records: u64,
+    /// Sealed buffers handed to the write pipeline since open.
+    pub submitted_buffer_count: u64,
+    /// Records across all sealed buffers since open.
+    pub submitted_buffer_records: u64,
+    /// Physical write-group size distribution since open.
+    pub submitted_buffer_record_histogram: WalBufferRecordHistogram,
+    /// Calls into the WAL flush API, when WAL metrics are enabled.
+    pub flush_calls: Option<u64>,
+    /// Condvar wake-ups while waiting for durability, when metrics are enabled.
+    pub flush_waits: Option<u64>,
+    /// Appender waits for bounded buffer reuse, when metrics are enabled.
+    pub buffer_backpressure_waits: Option<u64>,
+    /// Physical WAL write calls, when WAL metrics are enabled.
+    pub write_calls: Option<u64>,
+    /// Bytes passed to physical WAL writes, when WAL metrics are enabled.
+    pub write_bytes: Option<u64>,
+    /// Physical WAL sync calls, when WAL metrics are enabled.
+    pub sync_calls: Option<u64>,
+    /// Durable-LSN advances, when WAL metrics are enabled.
+    pub durable_advances: Option<u64>,
+    /// Page-image records appended, when WAL metrics are enabled.
+    pub page_image_records_appended: Option<u64>,
     /// Page-image payload bytes appended, when WAL metrics are enabled.
     pub page_image_bytes_appended: Option<u64>,
     /// Logical payload bytes appended, when WAL metrics are enabled.
@@ -225,6 +250,7 @@ pub struct WalShardMemoryStats {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct WalMemoryStats {
     pub shard_count: u64,
+    pub configured_buffer_record_capacity: u64,
     pub configured_buffer_capacity_bytes: u64,
     pub active_buffer_count: u64,
     pub spare_buffer_count: u64,
@@ -238,9 +264,80 @@ pub struct WalMemoryStats {
     pub active_used_high_water_bytes: u64,
     pub max_submitted_buffer_records: u64,
     pub max_submitted_batch_records: u64,
+    pub submitted_buffer_count: u64,
+    pub submitted_buffer_records: u64,
+    pub submitted_buffer_record_histogram: WalBufferRecordHistogram,
+    pub flush_calls: Option<u64>,
+    pub flush_waits: Option<u64>,
+    pub buffer_backpressure_waits: Option<u64>,
+    pub write_calls: Option<u64>,
+    pub write_bytes: Option<u64>,
+    pub sync_calls: Option<u64>,
+    pub durable_advances: Option<u64>,
+    pub page_image_records_appended: Option<u64>,
     pub page_image_bytes_appended: Option<u64>,
     pub logical_bytes_appended: Option<u64>,
     pub shards: Vec<WalShardMemoryStats>,
+}
+
+/// Histogram of records per sealed WAL buffer. These buffers are the units
+/// handed to the physical write pipeline.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WalBufferRecordHistogram {
+    pub one: u64,
+    pub two_to_seven: u64,
+    pub eight_to_thirty_one: u64,
+    pub thirty_two_to_sixty_three: u64,
+    pub sixty_four_to_two_fifty_five: u64,
+    pub two_fifty_six_to_one_thousand_twenty_three: u64,
+    pub one_thousand_twenty_four_or_more: u64,
+}
+
+impl WalBufferRecordHistogram {
+    fn record(&mut self, records: usize) {
+        match records {
+            0 => {}
+            1 => self.one = self.one.saturating_add(1),
+            2..=7 => self.two_to_seven = self.two_to_seven.saturating_add(1),
+            8..=31 => self.eight_to_thirty_one = self.eight_to_thirty_one.saturating_add(1),
+            32..=63 => {
+                self.thirty_two_to_sixty_three = self.thirty_two_to_sixty_three.saturating_add(1);
+            }
+            64..=255 => {
+                self.sixty_four_to_two_fifty_five =
+                    self.sixty_four_to_two_fifty_five.saturating_add(1);
+            }
+            256..=1023 => {
+                self.two_fifty_six_to_one_thousand_twenty_three = self
+                    .two_fifty_six_to_one_thousand_twenty_three
+                    .saturating_add(1);
+            }
+            _ => {
+                self.one_thousand_twenty_four_or_more =
+                    self.one_thousand_twenty_four_or_more.saturating_add(1);
+            }
+        }
+    }
+
+    fn saturating_add_assign(&mut self, other: Self) {
+        self.one = self.one.saturating_add(other.one);
+        self.two_to_seven = self.two_to_seven.saturating_add(other.two_to_seven);
+        self.eight_to_thirty_one = self
+            .eight_to_thirty_one
+            .saturating_add(other.eight_to_thirty_one);
+        self.thirty_two_to_sixty_three = self
+            .thirty_two_to_sixty_three
+            .saturating_add(other.thirty_two_to_sixty_three);
+        self.sixty_four_to_two_fifty_five = self
+            .sixty_four_to_two_fifty_five
+            .saturating_add(other.sixty_four_to_two_fifty_five);
+        self.two_fifty_six_to_one_thousand_twenty_three = self
+            .two_fifty_six_to_one_thousand_twenty_three
+            .saturating_add(other.two_fifty_six_to_one_thousand_twenty_three);
+        self.one_thousand_twenty_four_or_more = self
+            .one_thousand_twenty_four_or_more
+            .saturating_add(other.one_thousand_twenty_four_or_more);
+    }
 }
 
 /// One record surfaced by [`Wal::replay`] / [`Wal::replay_records`].
@@ -497,10 +594,16 @@ pub(crate) struct WalState {
     pub(crate) allocated_size: u64,
     pub(crate) flush_waiters: usize,
     pub(crate) next_buffer_epoch: u64,
+    buffer_count_limit: usize,
+    buffer_record_capacity: usize,
+    buffer_capacity_bytes: usize,
     known_touched_buffer_bytes: usize,
     active_used_high_water_bytes: usize,
     max_submitted_buffer_records: usize,
     max_submitted_batch_records: usize,
+    submitted_buffer_count: u64,
+    submitted_buffer_records: u64,
+    submitted_buffer_record_histogram: WalBufferRecordHistogram,
     pub(crate) crash_shutdown: bool,
     pub(crate) shutdown: bool,
 }
@@ -670,9 +773,9 @@ pub(crate) struct PendingWalWrite {
 }
 
 impl WalBuffer {
-    pub(crate) fn new(epoch: u64) -> Self {
+    pub(crate) fn new(epoch: u64, capacity: usize) -> Self {
         Self {
-            buffer: AlignedBuf::new(WAL_BUF_CAPACITY),
+            buffer: AlignedBuf::new(capacity),
             used: 0,
             records: 0,
             epoch,
@@ -1122,6 +1225,16 @@ fn wal_shard_count() -> usize {
     configured_wal_shard_count(std::env::var("PAGEBOX_WAL_SHARDS").ok().as_deref())
 }
 
+fn wal_buffer_records() -> usize {
+    configured_wal_buffer_records(std::env::var("PAGEBOX_WAL_BUFFER_RECORDS").ok().as_deref())
+}
+
+pub(crate) fn configured_wal_buffer_records(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(WAL_DEFAULT_BUFFER_RECORDS)
+        .clamp(1, WAL_BUF_RECORDS)
+}
+
 pub(crate) fn configured_wal_shard_count(raw: Option<&str>) -> usize {
     // Page-image overwrite handles are shard-local. Assigning shards by
     // appending thread therefore fragments repeated images of a shared page
@@ -1204,7 +1317,12 @@ impl Wal {
 
     #[cfg(test)]
     pub(crate) fn open_with_shards_for_test(path: &Path, shard_count: usize) -> io::Result<Self> {
-        Self::open_opts_with_shards(path, WalSyncBackend::Fdatasync, shard_count)
+        Self::open_opts_with_shards_and_buffer_records(
+            path,
+            WalSyncBackend::Fdatasync,
+            shard_count,
+            WAL_DEFAULT_BUFFER_RECORDS,
+        )
     }
 
     #[cfg(test)]
@@ -1212,7 +1330,20 @@ impl Wal {
         path: &Path,
         backend: WalSyncBackend,
     ) -> io::Result<Self> {
-        Self::open_opts_with_shards(path, backend, 1)
+        Self::open_opts_with_shards_and_buffer_records(path, backend, 1, WAL_DEFAULT_BUFFER_RECORDS)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_with_buffer_records_for_test(
+        path: &Path,
+        buffer_records: usize,
+    ) -> io::Result<Self> {
+        Self::open_opts_with_shards_and_buffer_records(
+            path,
+            WalSyncBackend::Fdatasync,
+            1,
+            configured_wal_buffer_records(Some(&buffer_records.to_string())),
+        )
     }
 
     #[cfg(test)]
@@ -1229,7 +1360,23 @@ impl Wal {
         sync_backend: WalSyncBackend,
         shard_count: usize,
     ) -> io::Result<Self> {
+        Self::open_opts_with_shards_and_buffer_records(
+            path,
+            sync_backend,
+            shard_count,
+            wal_buffer_records(),
+        )
+    }
+
+    fn open_opts_with_shards_and_buffer_records(
+        path: &Path,
+        sync_backend: WalSyncBackend,
+        shard_count: usize,
+        buffer_record_capacity: usize,
+    ) -> io::Result<Self> {
         let shard_count = shard_count.clamp(1, 256);
+        let buffer_record_capacity = buffer_record_capacity.clamp(1, WAL_BUF_RECORDS);
+        let buffer_capacity_bytes = wal_buffer_capacity_for_records(buffer_record_capacity);
 
         // io_uring currently uses one shard so every thread contributes to the
         // same write stream and drained durability barrier. The reaper thread
@@ -1268,13 +1415,11 @@ impl Wal {
             let backend =
                 crate::backend::make_backend(sync_backend, file.fd, shared_ring.as_ref())?;
             let inner = Arc::new(WalInner::new(
-                file.fd,
-                file.direct_io,
+                file,
                 backend,
-                file.file_offset,
-                file.allocated_size,
-                file.max_lsn,
                 Arc::clone(&next_lsn),
+                buffer_record_capacity,
+                buffer_capacity_bytes,
             ));
             inners.push(inner);
         }
@@ -1429,7 +1574,12 @@ impl Wal {
 
         let mut aggregate = WalMemoryStats {
             shard_count: shards.len() as u64,
-            configured_buffer_capacity_bytes: WAL_BUF_CAPACITY as u64,
+            configured_buffer_record_capacity: shards
+                .first()
+                .map_or(0, |shard| shard.configured_buffer_record_capacity),
+            configured_buffer_capacity_bytes: shards
+                .first()
+                .map_or(0, |shard| shard.configured_buffer_capacity_bytes),
             shards,
             ..WalMemoryStats::default()
         };
@@ -1467,7 +1617,39 @@ impl Wal {
             aggregate.max_submitted_batch_records = aggregate
                 .max_submitted_batch_records
                 .max(shard.max_submitted_batch_records);
+            aggregate.submitted_buffer_count = aggregate
+                .submitted_buffer_count
+                .saturating_add(shard.submitted_buffer_count);
+            aggregate.submitted_buffer_records = aggregate
+                .submitted_buffer_records
+                .saturating_add(shard.submitted_buffer_records);
+            aggregate
+                .submitted_buffer_record_histogram
+                .saturating_add_assign(shard.submitted_buffer_record_histogram);
         }
+        aggregate.flush_calls =
+            sum_optional(aggregate.shards.iter().map(|shard| shard.flush_calls));
+        aggregate.flush_waits =
+            sum_optional(aggregate.shards.iter().map(|shard| shard.flush_waits));
+        aggregate.buffer_backpressure_waits = sum_optional(
+            aggregate
+                .shards
+                .iter()
+                .map(|shard| shard.buffer_backpressure_waits),
+        );
+        aggregate.write_calls =
+            sum_optional(aggregate.shards.iter().map(|shard| shard.write_calls));
+        aggregate.write_bytes =
+            sum_optional(aggregate.shards.iter().map(|shard| shard.write_bytes));
+        aggregate.sync_calls = sum_optional(aggregate.shards.iter().map(|shard| shard.sync_calls));
+        aggregate.durable_advances =
+            sum_optional(aggregate.shards.iter().map(|shard| shard.durable_advances));
+        aggregate.page_image_records_appended = sum_optional(
+            aggregate
+                .shards
+                .iter()
+                .map(|shard| shard.page_image_records_appended),
+        );
         aggregate.page_image_bytes_appended = sum_optional(
             aggregate
                 .shards
@@ -1627,7 +1809,7 @@ impl Wal {
 
     fn reserve_active_record_slot_locked(
         inner: &WalInner,
-        state: &mut WalState,
+        state: &mut MutexGuard<'_, WalState>,
     ) -> io::Result<(usize, usize, usize)> {
         state.active.packed_logical = None;
         let needs_new_batch = state.active.open_batch_meta_offset.is_none()
@@ -1637,7 +1819,13 @@ impl Wal {
         } else {
             WAL_RECORD_SIZE
         };
-        if state.active.used + needed > WAL_BUF_CAPACITY {
+        if state.active.used + needed > state.buffer_capacity_bytes {
+            while state.spare_buffers.is_empty() {
+                inner.stats.events.inc(WalEvent::BufferBackpressure);
+                inner.flush_requested.notify_all();
+                inner.flush_done.wait(state);
+                inner.panic_if_backend_failed();
+            }
             inner.seal_active_buffer_locked(state)?;
             inner.flush_requested.notify_all();
         }
@@ -2602,20 +2790,37 @@ impl WalInner {
         #[cfg(not(feature = "metrics"))]
         let logical_bytes_appended = None;
 
+        #[cfg(feature = "metrics")]
+        let event = |key| Some(self.stats.events.get(key).max(0) as u64);
+        #[cfg(not(feature = "metrics"))]
+        let event = |_key| None;
+
         WalShardMemoryStats {
-            configured_buffer_capacity_bytes: WAL_BUF_CAPACITY as u64,
+            configured_buffer_record_capacity: state.buffer_record_capacity as u64,
+            configured_buffer_capacity_bytes: state.buffer_capacity_bytes as u64,
             active_buffer_count: 1,
             spare_buffer_count: state.spare_buffers.len() as u64,
             pending_buffer_count: state.pending_writes.len() as u64,
             in_flight_buffer_count: state.writes_in_progress as u64,
             allocated_buffer_count: allocated_buffer_count as u64,
             virtual_buffer_capacity_bytes: (allocated_buffer_count as u64)
-                .saturating_mul(WAL_BUF_CAPACITY as u64),
+                .saturating_mul(state.buffer_capacity_bytes as u64),
             known_touched_buffer_bytes: state.known_touched_buffer_bytes as u64,
             active_used_bytes: state.active.used as u64,
             active_used_high_water_bytes: state.active_used_high_water_bytes as u64,
             max_submitted_buffer_records: state.max_submitted_buffer_records as u64,
             max_submitted_batch_records: state.max_submitted_batch_records as u64,
+            submitted_buffer_count: state.submitted_buffer_count,
+            submitted_buffer_records: state.submitted_buffer_records,
+            submitted_buffer_record_histogram: state.submitted_buffer_record_histogram,
+            flush_calls: event(WalEvent::FlushCall),
+            flush_waits: event(WalEvent::FlushWait),
+            buffer_backpressure_waits: event(WalEvent::BufferBackpressure),
+            write_calls: event(WalEvent::WriteCall),
+            write_bytes: event(WalEvent::WriteBytes),
+            sync_calls: event(WalEvent::SyncCall),
+            durable_advances: event(WalEvent::DurableAdvance),
+            page_image_records_appended: event(WalEvent::PageImageRecords),
             page_image_bytes_appended,
             logical_bytes_appended,
         }
@@ -2716,31 +2921,50 @@ impl WalInner {
     }
 
     fn new(
-        fd: std::os::fd::RawFd,
-        direct_io: bool,
+        file: OpenWalFile,
         backend: Box<dyn WalIoBackend>,
-        file_offset: u64,
-        allocated_size: u64,
-        max_lsn: Lsn,
         next_lsn: Arc<AtomicU64>,
+        buffer_record_capacity: usize,
+        buffer_capacity_bytes: usize,
     ) -> Self {
+        let OpenWalFile {
+            fd,
+            direct_io,
+            file_offset,
+            allocated_size,
+            max_lsn,
+        } = file;
+        let buffer_count_limit = if backend.max_in_flight_writes() > 1 {
+            3
+        } else {
+            2
+        };
+        let spare_buffers = (1..buffer_count_limit)
+            .map(|index| WalBuffer::new(index as u64 + 1, buffer_capacity_bytes))
+            .collect();
         Self {
             state: Mutex::new(WalState {
                 fd,
                 direct_io,
-                active: WalBuffer::new(1),
-                spare_buffers: vec![WalBuffer::new(2)],
+                active: WalBuffer::new(1, buffer_capacity_bytes),
+                spare_buffers,
                 pending_writes: VecDeque::new(),
                 submitted_writes: SubmittedWrites::new(max_lsn),
                 writes_in_progress: 0,
                 file_offset,
                 allocated_size,
                 flush_waiters: 0,
-                next_buffer_epoch: 3,
+                next_buffer_epoch: buffer_count_limit as u64 + 1,
+                buffer_count_limit,
+                buffer_record_capacity,
+                buffer_capacity_bytes,
                 known_touched_buffer_bytes: 0,
                 active_used_high_water_bytes: 0,
                 max_submitted_buffer_records: 0,
                 max_submitted_batch_records: 0,
+                submitted_buffer_count: 0,
+                submitted_buffer_records: 0,
+                submitted_buffer_record_histogram: WalBufferRecordHistogram::default(),
                 crash_shutdown: false,
                 shutdown: false,
             }),
@@ -2947,7 +3171,9 @@ impl WalInner {
                     self.stats.events.inc(WalEvent::WriteBackpressure);
                 }
 
-                let pending_write = write_ready && write_submission_available;
+                let buffer_available =
+                    !state.pending_writes.is_empty() || !state.spare_buffers.is_empty();
+                let pending_write = write_ready && write_submission_available && buffer_available;
 
                 if state.crash_shutdown {
                     return;
@@ -3054,10 +3280,12 @@ impl WalInner {
             let should_write = can_submit_write(
                 state.writes_in_progress,
                 self.backend.max_in_flight_writes(),
-            ) && (requested_write > written
-                || !state.pending_writes.is_empty()
-                || (relaxed_mode && self.should_write_relaxed(&state, last_write))
-                || (state.shutdown && state.active.used > 0));
+            ) && (!state.pending_writes.is_empty()
+                || !state.spare_buffers.is_empty())
+                && (requested_write > written
+                    || !state.pending_writes.is_empty()
+                    || (relaxed_mode && self.should_write_relaxed(&state, last_write))
+                    || (state.shutdown && state.active.used > 0));
             if should_write
                 && state.pending_writes.is_empty()
                 && state.active.used > 0
@@ -3206,11 +3434,12 @@ impl WalInner {
 
     fn empty_buffer_locked(state: &mut WalState) -> WalBuffer {
         let epoch = Self::next_buffer_epoch_locked(state);
-        if let Some(mut buffer) = state.spare_buffers.pop() {
-            buffer.reset(epoch);
-            return buffer;
-        }
-        WalBuffer::new(epoch)
+        let mut buffer = state
+            .spare_buffers
+            .pop()
+            .expect("WAL buffer reuse must be reserved before sealing");
+        buffer.reset(epoch);
+        buffer
     }
 
     fn seal_active_buffer_locked(&self, state: &mut WalState) -> io::Result<bool> {
@@ -3225,6 +3454,13 @@ impl WalInner {
         state.max_submitted_batch_records = state
             .max_submitted_batch_records
             .max(state.active.max_batch_records);
+        state.submitted_buffer_count = state.submitted_buffer_count.saturating_add(1);
+        state.submitted_buffer_records = state
+            .submitted_buffer_records
+            .saturating_add(state.active.records as u64);
+        state
+            .submitted_buffer_record_histogram
+            .record(state.active.records);
         let file_offset = state.file_offset;
         let write_end = file_offset + len as u64;
         if write_end > state.allocated_size {
@@ -3591,8 +3827,13 @@ impl WalInner {
         state.active.reset(epoch);
         state.pending_writes.clear();
         state.spare_buffers.clear();
-        let spare_epoch = Self::next_buffer_epoch_locked(&mut state);
-        state.spare_buffers.push(WalBuffer::new(spare_epoch));
+        let buffer_capacity_bytes = state.buffer_capacity_bytes;
+        for _ in 1..state.buffer_count_limit {
+            let spare_epoch = Self::next_buffer_epoch_locked(&mut state);
+            state
+                .spare_buffers
+                .push(WalBuffer::new(spare_epoch, buffer_capacity_bytes));
+        }
         state.known_touched_buffer_bytes = state.active.known_touched_bytes;
 
         extend_file(state.fd, SEGMENT_SIZE)?;

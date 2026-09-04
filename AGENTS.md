@@ -149,6 +149,8 @@ WAL runtime configuration (environment variables, read in `pagebox-wal`):
   Linux-only).
 - `PAGEBOX_WAL_SHARDS=N`: select WAL shards for the synchronous backends; the default is one because page-image
   overwrite coalescing is shard-local. `io_uring` currently forces one shard.
+- `PAGEBOX_WAL_BUFFER_RECORDS=N`: override the operational records per append buffer. The default is 256 records,
+  clamped to the format-derived maximum for the selected page size.
 - `PAGEBOX_WAL_GROUP_COMMIT_DELAY_MAX_US`, `PAGEBOX_WAL_GROUP_COMMIT_TARGET_RECORDS`: group-commit batching knobs.
 
 Tests, runs, and benchmarks:

@@ -79,6 +79,10 @@
 //! also drives background writes and syncs on time / record-count
 //! thresholds (`PAGEBOX_WAL_RELAXED_*`).
 //!
+//! `PAGEBOX_WAL_BUFFER_RECORDS` overrides the operational append-buffer cap.
+//! The default is 256 records (or the format maximum when smaller); this does
+//! not change the maximum batch-meta layout or any on-disk bytes.
+//!
 //! ### Direct I/O
 //!
 //! `PAGEBOX_WAL_DIRECT_IO=1` opts into Linux `O_DIRECT` (the file header
@@ -150,10 +154,10 @@ mod io_uring;
 mod metrics_stub;
 mod wal_impl;
 
-pub use format::WAL_BUF_RECORDS;
+pub use format::{WAL_BUF_RECORDS, WAL_DEFAULT_BUFFER_RECORDS};
 pub use wal_impl::{
-    BufferedWalRecord, CommitMode, RecoveryPageStore, RecoveryReport, Wal, WalMemoryStats,
-    WalReplayRecord, WalShardMemoryStats, WalStats,
+    BufferedWalRecord, CommitMode, RecoveryPageStore, RecoveryReport, Wal,
+    WalBufferRecordHistogram, WalMemoryStats, WalReplayRecord, WalShardMemoryStats, WalStats,
 };
 
 #[cfg(test)]

@@ -50,12 +50,16 @@
 //!
 //! ## Buffer sizing
 //!
-//! `WAL_BUF_CAPACITY` is the in-memory append-buffer capacity, derived as the
-//! next power of two large enough for one maximum-size batch.
+//! `WAL_BUF_CAPACITY` is the largest supported in-memory append-buffer
+//! capacity, derived as the next power of two large enough for one
+//! maximum-size batch. The operational capacity can be smaller without
+//! changing the on-disk layout.
 //! `wal_buf_records` derives the maximum number of records that fit:
 //! `(BATCH_MAX_RECORDS + 1) × PAGE_SIZE` per full batch, plus a partial final
-//! batch. The re-exported [`WAL_BUF_RECORDS`] constant is the public cap
-//! callers use to size structures that mirror the WAL's record index.
+//! batch. The re-exported [`WAL_BUF_RECORDS`] constant is the format-derived
+//! upper bound.
+//! Production opens default to [`WAL_DEFAULT_BUFFER_RECORDS`], clamped by
+//! that upper bound for smaller page sizes.
 //!
 //! ## Runtime knobs
 //!
@@ -141,8 +145,30 @@ const fn wal_buf_records(capacity: usize) -> usize {
     records
 }
 
+pub(crate) const fn wal_buffer_capacity_for_records(records: usize) -> usize {
+    let records = if records < 1 {
+        1
+    } else if records > WAL_BUF_RECORDS {
+        WAL_BUF_RECORDS
+    } else {
+        records
+    };
+    let batches = records.div_ceil(BATCH_MAX_RECORDS);
+    (records + batches) * WAL_RECORD_SIZE
+}
+
 /// Maximum number of page-image records that fit in the write buffer.
 pub const WAL_BUF_RECORDS: usize = wal_buf_records(WAL_BUF_CAPACITY);
+
+/// Default operational record capacity of one append buffer.
+pub const WAL_DEFAULT_BUFFER_RECORDS: usize = {
+    const TARGET: usize = 256;
+    if TARGET < WAL_BUF_RECORDS {
+        TARGET
+    } else {
+        WAL_BUF_RECORDS
+    }
+};
 
 /// Pre-allocation segment size.
 pub(crate) const SEGMENT_SIZE: u64 = 64 * 1024 * 1024;

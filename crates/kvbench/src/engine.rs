@@ -205,6 +205,7 @@ impl StorageIoStats {
 /// WAL buffer evidence for one shard.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct WalShardMemoryStats {
+    pub configured_buffer_record_capacity: u64,
     pub configured_buffer_capacity_bytes: u64,
     pub active_buffer_count: u64,
     pub spare_buffer_count: u64,
@@ -217,6 +218,17 @@ pub struct WalShardMemoryStats {
     pub active_used_high_water_bytes: u64,
     pub max_submitted_buffer_records: u64,
     pub max_submitted_batch_records: u64,
+    pub submitted_buffer_count: u64,
+    pub submitted_buffer_records: u64,
+    pub submitted_buffer_record_histogram: WalBufferRecordHistogram,
+    pub flush_calls: Option<u64>,
+    pub flush_waits: Option<u64>,
+    pub buffer_backpressure_waits: Option<u64>,
+    pub write_calls: Option<u64>,
+    pub write_bytes: Option<u64>,
+    pub sync_calls: Option<u64>,
+    pub durable_advances: Option<u64>,
+    pub page_image_records_appended: Option<u64>,
     pub page_image_bytes_appended: Option<u64>,
     pub logical_bytes_appended: Option<u64>,
 }
@@ -226,6 +238,7 @@ pub struct WalShardMemoryStats {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct WalMemoryStats {
     pub shard_count: u64,
+    pub configured_buffer_record_capacity: u64,
     pub configured_buffer_capacity_bytes: u64,
     pub active_buffer_count: u64,
     pub spare_buffer_count: u64,
@@ -238,13 +251,82 @@ pub struct WalMemoryStats {
     pub active_used_high_water_bytes: u64,
     pub max_submitted_buffer_records: u64,
     pub max_submitted_batch_records: u64,
+    pub submitted_buffer_count: u64,
+    pub submitted_buffer_records: u64,
+    pub submitted_buffer_record_histogram: WalBufferRecordHistogram,
+    pub flush_calls: Option<u64>,
+    pub flush_waits: Option<u64>,
+    pub buffer_backpressure_waits: Option<u64>,
+    pub write_calls: Option<u64>,
+    pub write_bytes: Option<u64>,
+    pub sync_calls: Option<u64>,
+    pub durable_advances: Option<u64>,
+    pub page_image_records_appended: Option<u64>,
     pub page_image_bytes_appended: Option<u64>,
     pub logical_bytes_appended: Option<u64>,
     pub shards: Vec<WalShardMemoryStats>,
 }
 
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct WalBufferRecordHistogram {
+    pub one: u64,
+    pub two_to_seven: u64,
+    pub eight_to_thirty_one: u64,
+    pub thirty_two_to_sixty_three: u64,
+    pub sixty_four_to_two_fifty_five: u64,
+    pub two_fifty_six_to_one_thousand_twenty_three: u64,
+    pub one_thousand_twenty_four_or_more: u64,
+}
+
+impl WalBufferRecordHistogram {
+    fn phase_delta_since(self, earlier: Self) -> Self {
+        Self {
+            one: self.one.saturating_sub(earlier.one),
+            two_to_seven: self.two_to_seven.saturating_sub(earlier.two_to_seven),
+            eight_to_thirty_one: self
+                .eight_to_thirty_one
+                .saturating_sub(earlier.eight_to_thirty_one),
+            thirty_two_to_sixty_three: self
+                .thirty_two_to_sixty_three
+                .saturating_sub(earlier.thirty_two_to_sixty_three),
+            sixty_four_to_two_fifty_five: self
+                .sixty_four_to_two_fifty_five
+                .saturating_sub(earlier.sixty_four_to_two_fifty_five),
+            two_fifty_six_to_one_thousand_twenty_three: self
+                .two_fifty_six_to_one_thousand_twenty_three
+                .saturating_sub(earlier.two_fifty_six_to_one_thousand_twenty_three),
+            one_thousand_twenty_four_or_more: self
+                .one_thousand_twenty_four_or_more
+                .saturating_sub(earlier.one_thousand_twenty_four_or_more),
+        }
+    }
+}
+
 impl WalMemoryStats {
     fn phase_delta_since(mut self, earlier: &Self) -> Self {
+        self.submitted_buffer_count = self
+            .submitted_buffer_count
+            .saturating_sub(earlier.submitted_buffer_count);
+        self.submitted_buffer_records = self
+            .submitted_buffer_records
+            .saturating_sub(earlier.submitted_buffer_records);
+        self.submitted_buffer_record_histogram = self
+            .submitted_buffer_record_histogram
+            .phase_delta_since(earlier.submitted_buffer_record_histogram);
+        self.flush_calls = option_delta(self.flush_calls, earlier.flush_calls);
+        self.flush_waits = option_delta(self.flush_waits, earlier.flush_waits);
+        self.buffer_backpressure_waits = option_delta(
+            self.buffer_backpressure_waits,
+            earlier.buffer_backpressure_waits,
+        );
+        self.write_calls = option_delta(self.write_calls, earlier.write_calls);
+        self.write_bytes = option_delta(self.write_bytes, earlier.write_bytes);
+        self.sync_calls = option_delta(self.sync_calls, earlier.sync_calls);
+        self.durable_advances = option_delta(self.durable_advances, earlier.durable_advances);
+        self.page_image_records_appended = option_delta(
+            self.page_image_records_appended,
+            earlier.page_image_records_appended,
+        );
         self.page_image_bytes_appended = option_delta(
             self.page_image_bytes_appended,
             earlier.page_image_bytes_appended,
@@ -252,6 +334,30 @@ impl WalMemoryStats {
         self.logical_bytes_appended =
             option_delta(self.logical_bytes_appended, earlier.logical_bytes_appended);
         for (shard, earlier_shard) in self.shards.iter_mut().zip(&earlier.shards) {
+            shard.submitted_buffer_count = shard
+                .submitted_buffer_count
+                .saturating_sub(earlier_shard.submitted_buffer_count);
+            shard.submitted_buffer_records = shard
+                .submitted_buffer_records
+                .saturating_sub(earlier_shard.submitted_buffer_records);
+            shard.submitted_buffer_record_histogram = shard
+                .submitted_buffer_record_histogram
+                .phase_delta_since(earlier_shard.submitted_buffer_record_histogram);
+            shard.flush_calls = option_delta(shard.flush_calls, earlier_shard.flush_calls);
+            shard.flush_waits = option_delta(shard.flush_waits, earlier_shard.flush_waits);
+            shard.buffer_backpressure_waits = option_delta(
+                shard.buffer_backpressure_waits,
+                earlier_shard.buffer_backpressure_waits,
+            );
+            shard.write_calls = option_delta(shard.write_calls, earlier_shard.write_calls);
+            shard.write_bytes = option_delta(shard.write_bytes, earlier_shard.write_bytes);
+            shard.sync_calls = option_delta(shard.sync_calls, earlier_shard.sync_calls);
+            shard.durable_advances =
+                option_delta(shard.durable_advances, earlier_shard.durable_advances);
+            shard.page_image_records_appended = option_delta(
+                shard.page_image_records_appended,
+                earlier_shard.page_image_records_appended,
+            );
             shard.page_image_bytes_appended = option_delta(
                 shard.page_image_bytes_appended,
                 earlier_shard.page_image_bytes_appended,
@@ -381,8 +487,22 @@ mod tests {
             wal_memory: Some(WalMemoryStats {
                 virtual_buffer_capacity_bytes: 1_024,
                 known_touched_buffer_bytes: 128,
+                submitted_buffer_count: 10,
+                submitted_buffer_records: 100,
+                submitted_buffer_record_histogram: WalBufferRecordHistogram {
+                    one: 3,
+                    ..WalBufferRecordHistogram::default()
+                },
+                write_calls: Some(7),
                 page_image_bytes_appended: Some(100),
                 shards: vec![WalShardMemoryStats {
+                    submitted_buffer_count: 10,
+                    submitted_buffer_records: 100,
+                    submitted_buffer_record_histogram: WalBufferRecordHistogram {
+                        one: 3,
+                        ..WalBufferRecordHistogram::default()
+                    },
+                    write_calls: Some(7),
                     page_image_bytes_appended: Some(100),
                     ..WalShardMemoryStats::default()
                 }],
@@ -404,9 +524,23 @@ mod tests {
                 virtual_buffer_capacity_bytes: 2_048,
                 known_touched_buffer_bytes: 512,
                 active_used_high_water_bytes: 256,
+                submitted_buffer_count: 15,
+                submitted_buffer_records: 180,
+                submitted_buffer_record_histogram: WalBufferRecordHistogram {
+                    one: 8,
+                    ..WalBufferRecordHistogram::default()
+                },
+                write_calls: Some(11),
                 page_image_bytes_appended: Some(260),
                 shards: vec![WalShardMemoryStats {
                     active_used_high_water_bytes: 256,
+                    submitted_buffer_count: 15,
+                    submitted_buffer_records: 180,
+                    submitted_buffer_record_histogram: WalBufferRecordHistogram {
+                        one: 8,
+                        ..WalBufferRecordHistogram::default()
+                    },
+                    write_calls: Some(11),
                     page_image_bytes_appended: Some(260),
                     ..WalShardMemoryStats::default()
                 }],
@@ -427,6 +561,10 @@ mod tests {
         assert_eq!(wal.virtual_buffer_capacity_bytes, 2_048);
         assert_eq!(wal.known_touched_buffer_bytes, 512);
         assert_eq!(wal.active_used_high_water_bytes, 256);
+        assert_eq!(wal.submitted_buffer_count, 5);
+        assert_eq!(wal.submitted_buffer_records, 80);
+        assert_eq!(wal.submitted_buffer_record_histogram.one, 5);
+        assert_eq!(wal.write_calls, Some(4));
         assert_eq!(wal.page_image_bytes_appended, Some(160));
         assert_eq!(wal.shards[0].page_image_bytes_appended, Some(160));
     }

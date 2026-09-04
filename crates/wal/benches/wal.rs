@@ -5,7 +5,7 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use pagebox_frame_kernel::PAGE_SIZE;
-use pagebox_wal::{WAL_BUF_RECORDS, Wal};
+use pagebox_wal::{WAL_DEFAULT_BUFFER_RECORDS, Wal};
 
 fn page_data(seed: u64) -> [u8; PAGE_SIZE] {
     let mut buf = [0u8; PAGE_SIZE];
@@ -80,7 +80,7 @@ fn io_group(
 
 fn append_buffer_only(c: &mut Criterion) {
     let mut group = io_group(c, "wal/append_buffer_only".to_string());
-    let n = WAL_BUF_RECORDS as u64;
+    let n = WAL_DEFAULT_BUFFER_RECORDS as u64;
     group.throughput(Throughput::Elements(n));
     group.bench_function(format!("{n}_records"), |b| {
         let pages: Vec<[u8; PAGE_SIZE]> = (0..n).map(page_data).collect();

@@ -5,8 +5,8 @@ use std::path::Path;
 use kvstore::{KvStore, KvStoreOptions, PAGE_SIZE, SyncMode as KvSyncMode, TreeBackend};
 
 use crate::engine::{
-    CacheControl, EngineOpts, EngineStats, KvEngine, StorageIoStats, SyncMode, WalMemoryStats,
-    WalShardMemoryStats,
+    CacheControl, EngineOpts, EngineStats, KvEngine, StorageIoStats, SyncMode,
+    WalBufferRecordHistogram, WalMemoryStats, WalShardMemoryStats,
 };
 
 pub struct KvstoreAdapter {
@@ -228,6 +228,7 @@ impl KvEngine for KvstoreAdapter {
             }),
             wal_memory: Some(WalMemoryStats {
                 shard_count: wal.shard_count,
+                configured_buffer_record_capacity: wal.configured_buffer_record_capacity,
                 configured_buffer_capacity_bytes: wal.configured_buffer_capacity_bytes,
                 active_buffer_count: wal.active_buffer_count,
                 spare_buffer_count: wal.spare_buffer_count,
@@ -240,12 +241,40 @@ impl KvEngine for KvstoreAdapter {
                 active_used_high_water_bytes: wal.active_used_high_water_bytes,
                 max_submitted_buffer_records: wal.max_submitted_buffer_records,
                 max_submitted_batch_records: wal.max_submitted_batch_records,
+                submitted_buffer_count: wal.submitted_buffer_count,
+                submitted_buffer_records: wal.submitted_buffer_records,
+                submitted_buffer_record_histogram: WalBufferRecordHistogram {
+                    one: wal.submitted_buffer_record_histogram.one,
+                    two_to_seven: wal.submitted_buffer_record_histogram.two_to_seven,
+                    eight_to_thirty_one: wal.submitted_buffer_record_histogram.eight_to_thirty_one,
+                    thirty_two_to_sixty_three: wal
+                        .submitted_buffer_record_histogram
+                        .thirty_two_to_sixty_three,
+                    sixty_four_to_two_fifty_five: wal
+                        .submitted_buffer_record_histogram
+                        .sixty_four_to_two_fifty_five,
+                    two_fifty_six_to_one_thousand_twenty_three: wal
+                        .submitted_buffer_record_histogram
+                        .two_fifty_six_to_one_thousand_twenty_three,
+                    one_thousand_twenty_four_or_more: wal
+                        .submitted_buffer_record_histogram
+                        .one_thousand_twenty_four_or_more,
+                },
+                flush_calls: wal.flush_calls,
+                flush_waits: wal.flush_waits,
+                buffer_backpressure_waits: wal.buffer_backpressure_waits,
+                write_calls: wal.write_calls,
+                write_bytes: wal.write_bytes,
+                sync_calls: wal.sync_calls,
+                durable_advances: wal.durable_advances,
+                page_image_records_appended: wal.page_image_records_appended,
                 page_image_bytes_appended: wal.page_image_bytes_appended,
                 logical_bytes_appended: wal.logical_bytes_appended,
                 shards: wal
                     .shards
                     .iter()
                     .map(|shard| WalShardMemoryStats {
+                        configured_buffer_record_capacity: shard.configured_buffer_record_capacity,
                         configured_buffer_capacity_bytes: shard.configured_buffer_capacity_bytes,
                         active_buffer_count: shard.active_buffer_count,
                         spare_buffer_count: shard.spare_buffer_count,
@@ -258,6 +287,35 @@ impl KvEngine for KvstoreAdapter {
                         active_used_high_water_bytes: shard.active_used_high_water_bytes,
                         max_submitted_buffer_records: shard.max_submitted_buffer_records,
                         max_submitted_batch_records: shard.max_submitted_batch_records,
+                        submitted_buffer_count: shard.submitted_buffer_count,
+                        submitted_buffer_records: shard.submitted_buffer_records,
+                        submitted_buffer_record_histogram: WalBufferRecordHistogram {
+                            one: shard.submitted_buffer_record_histogram.one,
+                            two_to_seven: shard.submitted_buffer_record_histogram.two_to_seven,
+                            eight_to_thirty_one: shard
+                                .submitted_buffer_record_histogram
+                                .eight_to_thirty_one,
+                            thirty_two_to_sixty_three: shard
+                                .submitted_buffer_record_histogram
+                                .thirty_two_to_sixty_three,
+                            sixty_four_to_two_fifty_five: shard
+                                .submitted_buffer_record_histogram
+                                .sixty_four_to_two_fifty_five,
+                            two_fifty_six_to_one_thousand_twenty_three: shard
+                                .submitted_buffer_record_histogram
+                                .two_fifty_six_to_one_thousand_twenty_three,
+                            one_thousand_twenty_four_or_more: shard
+                                .submitted_buffer_record_histogram
+                                .one_thousand_twenty_four_or_more,
+                        },
+                        flush_calls: shard.flush_calls,
+                        flush_waits: shard.flush_waits,
+                        buffer_backpressure_waits: shard.buffer_backpressure_waits,
+                        write_calls: shard.write_calls,
+                        write_bytes: shard.write_bytes,
+                        sync_calls: shard.sync_calls,
+                        durable_advances: shard.durable_advances,
+                        page_image_records_appended: shard.page_image_records_appended,
                         page_image_bytes_appended: shard.page_image_bytes_appended,
                         logical_bytes_appended: shard.logical_bytes_appended,
                     })
