@@ -70,13 +70,170 @@ pub(crate) fn validate_page_buf_len(pid: PageId, len: usize) -> io::Result<()> {
     ))
 }
 
+/// Reason for a page-store read, used to separate demand traffic from
+/// prefetch and recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageReadPurpose {
+    Foreground,
+    Prefetch,
+    Recovery,
+}
+
+/// Reason for a page-store write, used to separate foreground traffic from
+/// cleaning, checkpoint, recovery, and metadata maintenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageWritePurpose {
+    Foreground,
+    Background,
+    Checkpoint,
+    Recovery,
+    Metadata,
+}
+
+/// Exact syscall and byte counts for one direction of page-store I/O.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PageStoreOperationStats {
+    pub calls: u64,
+    pub requested_bytes: u64,
+    pub completed_bytes: u64,
+}
+
+impl PageStoreOperationStats {
+    fn saturating_add(self, other: Self) -> Self {
+        Self {
+            calls: self.calls.saturating_add(other.calls),
+            requested_bytes: self.requested_bytes.saturating_add(other.requested_bytes),
+            completed_bytes: self.completed_bytes.saturating_add(other.completed_bytes),
+        }
+    }
+
+    fn delta_since(self, earlier: Self) -> Self {
+        Self {
+            calls: self.calls.saturating_sub(earlier.calls),
+            requested_bytes: self.requested_bytes.saturating_sub(earlier.requested_bytes),
+            completed_bytes: self.completed_bytes.saturating_sub(earlier.completed_bytes),
+        }
+    }
+}
+
+/// Counts for APIs that submit more than one page as one logical batch.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PageStoreBatchStats {
+    pub calls: u64,
+    pub pages: u64,
+}
+
+impl PageStoreBatchStats {
+    fn delta_since(self, earlier: Self) -> Self {
+        Self {
+            calls: self.calls.saturating_sub(earlier.calls),
+            pages: self.pages.saturating_sub(earlier.pages),
+        }
+    }
+}
+
+/// Cumulative exact I/O counters for one [`FilePageStore`].
+///
+/// Take a snapshot before and after a benchmark phase and call
+/// [`PageStoreIoStats::delta_since`] to exclude open, load, and reopen I/O.
+/// `calls` counts positioned I/O operations. Requested and completed byte
+/// counts need not match when an operation fails or reaches EOF. The common
+/// full-page success path requires one relaxed atomic increment; Pagebox's
+/// unified compile-time page size makes the byte totals derivable exactly.
+/// Batch counts cover multi-page `PageStore` calls; the synchronous
+/// `BatchPageStore` adapter still issues one positioned operation per submit,
+/// so it does not report those submissions as multi-page I/O.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PageStoreIoStats {
+    pub reads: PageStoreOperationStats,
+    pub writes: PageStoreOperationStats,
+    pub direct_reads: PageStoreOperationStats,
+    pub direct_writes: PageStoreOperationStats,
+    pub buffered_reads: PageStoreOperationStats,
+    pub buffered_writes: PageStoreOperationStats,
+    pub foreground_reads: PageStoreOperationStats,
+    pub prefetch_reads: PageStoreOperationStats,
+    pub recovery_reads: PageStoreOperationStats,
+    pub foreground_writes: PageStoreOperationStats,
+    pub background_writes: PageStoreOperationStats,
+    pub checkpoint_writes: PageStoreOperationStats,
+    pub recovery_writes: PageStoreOperationStats,
+    pub metadata_writes: PageStoreOperationStats,
+    pub batched_reads: PageStoreBatchStats,
+    pub batched_writes: PageStoreBatchStats,
+    pub sync_calls: u64,
+    pub foreground_sync_calls: u64,
+    pub checkpoint_sync_calls: u64,
+    pub recovery_sync_calls: u64,
+}
+
+impl PageStoreIoStats {
+    /// Return the saturating per-field difference from an earlier snapshot.
+    pub fn delta_since(self, earlier: Self) -> Self {
+        Self {
+            reads: self.reads.delta_since(earlier.reads),
+            writes: self.writes.delta_since(earlier.writes),
+            direct_reads: self.direct_reads.delta_since(earlier.direct_reads),
+            direct_writes: self.direct_writes.delta_since(earlier.direct_writes),
+            buffered_reads: self.buffered_reads.delta_since(earlier.buffered_reads),
+            buffered_writes: self.buffered_writes.delta_since(earlier.buffered_writes),
+            foreground_reads: self.foreground_reads.delta_since(earlier.foreground_reads),
+            prefetch_reads: self.prefetch_reads.delta_since(earlier.prefetch_reads),
+            recovery_reads: self.recovery_reads.delta_since(earlier.recovery_reads),
+            foreground_writes: self
+                .foreground_writes
+                .delta_since(earlier.foreground_writes),
+            background_writes: self
+                .background_writes
+                .delta_since(earlier.background_writes),
+            checkpoint_writes: self
+                .checkpoint_writes
+                .delta_since(earlier.checkpoint_writes),
+            recovery_writes: self.recovery_writes.delta_since(earlier.recovery_writes),
+            metadata_writes: self.metadata_writes.delta_since(earlier.metadata_writes),
+            batched_reads: self.batched_reads.delta_since(earlier.batched_reads),
+            batched_writes: self.batched_writes.delta_since(earlier.batched_writes),
+            sync_calls: self.sync_calls.saturating_sub(earlier.sync_calls),
+            foreground_sync_calls: self
+                .foreground_sync_calls
+                .saturating_sub(earlier.foreground_sync_calls),
+            checkpoint_sync_calls: self
+                .checkpoint_sync_calls
+                .saturating_sub(earlier.checkpoint_sync_calls),
+            recovery_sync_calls: self
+                .recovery_sync_calls
+                .saturating_sub(earlier.recovery_sync_calls),
+        }
+    }
+}
+
 pub trait PageStore: Send + Sync {
     /// Read a page into `buf`. Returns `Ok(true)` if the page existed,
     /// `Ok(false)` if the page has not been allocated, or `Err` on I/O failure.
     fn read_page(&self, pid: PageId, buf: &mut [u8]) -> io::Result<bool>;
 
+    /// Read a page with an explicit accounting purpose.
+    fn read_page_for(
+        &self,
+        pid: PageId,
+        buf: &mut [u8],
+        _purpose: PageReadPurpose,
+    ) -> io::Result<bool> {
+        self.read_page(pid, buf)
+    }
+
     /// Write a page from `buf`.
     fn write_page(&self, pid: PageId, data: &[u8]) -> io::Result<()>;
+
+    /// Write a page with an explicit accounting purpose.
+    fn write_page_for(
+        &self,
+        pid: PageId,
+        data: &[u8],
+        _purpose: PageWritePurpose,
+    ) -> io::Result<()> {
+        self.write_page(pid, data)
+    }
 
     /// Allocate a slot for a new page (zeroed).
     fn allocate(&self, pid: PageId) -> io::Result<()>;
@@ -189,6 +346,22 @@ impl<T: PageStore> PageStore for std::sync::Arc<T> {
     }
     fn write_page(&self, pid: PageId, data: &[u8]) -> io::Result<()> {
         (**self).write_page(pid, data)
+    }
+    fn read_page_for(
+        &self,
+        pid: PageId,
+        buf: &mut [u8],
+        purpose: PageReadPurpose,
+    ) -> io::Result<bool> {
+        (**self).read_page_for(pid, buf, purpose)
+    }
+    fn write_page_for(
+        &self,
+        pid: PageId,
+        data: &[u8],
+        purpose: PageWritePurpose,
+    ) -> io::Result<()> {
+        (**self).write_page_for(pid, data, purpose)
     }
     fn allocate(&self, pid: PageId) -> io::Result<()> {
         (**self).allocate(pid)
@@ -488,6 +661,196 @@ fn open_page_store_fd(c_path: *const libc::c_char) -> io::Result<(std::os::fd::R
     open_buffered_page_store_fd(c_path).map(|fd| (fd, false))
 }
 
+#[cfg(not(miri))]
+#[derive(Debug, Default)]
+struct AtomicOperationStats {
+    successful_calls: AtomicU64,
+    incomplete_calls: AtomicU64,
+    incomplete_completed_bytes: AtomicU64,
+}
+
+#[cfg(not(miri))]
+impl AtomicOperationStats {
+    fn record(&self, requested_bytes: usize, completed_bytes: usize) {
+        debug_assert_eq!(requested_bytes, PAGE_SIZE);
+        if completed_bytes == requested_bytes {
+            self.successful_calls.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.incomplete_calls.fetch_add(1, Ordering::Relaxed);
+        self.incomplete_completed_bytes
+            .fetch_add(completed_bytes as u64, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> PageStoreOperationStats {
+        let successful_calls = self.successful_calls.load(Ordering::Relaxed);
+        let incomplete_calls = self.incomplete_calls.load(Ordering::Relaxed);
+        let calls = successful_calls.saturating_add(incomplete_calls);
+        PageStoreOperationStats {
+            calls,
+            requested_bytes: calls.saturating_mul(PAGE_SIZE as u64),
+            completed_bytes: successful_calls
+                .saturating_mul(PAGE_SIZE as u64)
+                .saturating_add(self.incomplete_completed_bytes.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+#[cfg(not(miri))]
+#[derive(Debug, Default)]
+struct AtomicBatchStats {
+    calls: AtomicU64,
+    pages: AtomicU64,
+}
+
+#[cfg(not(miri))]
+impl AtomicBatchStats {
+    fn record(&self, pages: usize) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.pages.fetch_add(pages as u64, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> PageStoreBatchStats {
+        PageStoreBatchStats {
+            calls: self.calls.load(Ordering::Relaxed),
+            pages: self.pages.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[cfg(not(miri))]
+#[derive(Debug, Default)]
+struct PageStoreIoCounters {
+    foreground_reads: AtomicOperationStats,
+    prefetch_reads: AtomicOperationStats,
+    recovery_reads: AtomicOperationStats,
+    foreground_writes: AtomicOperationStats,
+    background_writes: AtomicOperationStats,
+    checkpoint_writes: AtomicOperationStats,
+    recovery_writes: AtomicOperationStats,
+    metadata_writes: AtomicOperationStats,
+    batched_reads: AtomicBatchStats,
+    batched_writes: AtomicBatchStats,
+    foreground_sync_calls: AtomicU64,
+    checkpoint_sync_calls: AtomicU64,
+    recovery_sync_calls: AtomicU64,
+}
+
+#[cfg(not(miri))]
+impl PageStoreIoCounters {
+    fn record_read(
+        &self,
+        purpose: PageReadPurpose,
+        requested_bytes: usize,
+        completed_bytes: usize,
+    ) {
+        match purpose {
+            PageReadPurpose::Foreground => self
+                .foreground_reads
+                .record(requested_bytes, completed_bytes),
+            PageReadPurpose::Prefetch => {
+                self.prefetch_reads.record(requested_bytes, completed_bytes)
+            }
+            PageReadPurpose::Recovery => {
+                self.recovery_reads.record(requested_bytes, completed_bytes)
+            }
+        }
+    }
+
+    fn record_write(
+        &self,
+        purpose: PageWritePurpose,
+        requested_bytes: usize,
+        completed_bytes: usize,
+    ) {
+        let purpose_stats = match purpose {
+            PageWritePurpose::Foreground => &self.foreground_writes,
+            PageWritePurpose::Background => &self.background_writes,
+            PageWritePurpose::Checkpoint => &self.checkpoint_writes,
+            PageWritePurpose::Recovery => &self.recovery_writes,
+            PageWritePurpose::Metadata => &self.metadata_writes,
+        };
+        purpose_stats.record(requested_bytes, completed_bytes);
+    }
+
+    fn record_sync(&self, purpose: PageWritePurpose) {
+        match purpose {
+            PageWritePurpose::Checkpoint => {
+                self.checkpoint_sync_calls.fetch_add(1, Ordering::Relaxed);
+            }
+            PageWritePurpose::Recovery => {
+                self.recovery_sync_calls.fetch_add(1, Ordering::Relaxed);
+            }
+            PageWritePurpose::Foreground
+            | PageWritePurpose::Background
+            | PageWritePurpose::Metadata => {
+                self.foreground_sync_calls.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn snapshot(&self, direct_io: bool) -> PageStoreIoStats {
+        let foreground_reads = self.foreground_reads.snapshot();
+        let prefetch_reads = self.prefetch_reads.snapshot();
+        let recovery_reads = self.recovery_reads.snapshot();
+        let reads = foreground_reads
+            .saturating_add(prefetch_reads)
+            .saturating_add(recovery_reads);
+        let foreground_writes = self.foreground_writes.snapshot();
+        let background_writes = self.background_writes.snapshot();
+        let checkpoint_writes = self.checkpoint_writes.snapshot();
+        let recovery_writes = self.recovery_writes.snapshot();
+        let metadata_writes = self.metadata_writes.snapshot();
+        let writes = foreground_writes
+            .saturating_add(background_writes)
+            .saturating_add(checkpoint_writes)
+            .saturating_add(recovery_writes)
+            .saturating_add(metadata_writes);
+        let (direct_reads, buffered_reads, direct_writes, buffered_writes) = if direct_io {
+            (
+                reads,
+                PageStoreOperationStats::default(),
+                writes,
+                PageStoreOperationStats::default(),
+            )
+        } else {
+            (
+                PageStoreOperationStats::default(),
+                reads,
+                PageStoreOperationStats::default(),
+                writes,
+            )
+        };
+        let foreground_sync_calls = self.foreground_sync_calls.load(Ordering::Relaxed);
+        let checkpoint_sync_calls = self.checkpoint_sync_calls.load(Ordering::Relaxed);
+        let recovery_sync_calls = self.recovery_sync_calls.load(Ordering::Relaxed);
+        PageStoreIoStats {
+            reads,
+            writes,
+            direct_reads,
+            direct_writes,
+            buffered_reads,
+            buffered_writes,
+            foreground_reads,
+            prefetch_reads,
+            recovery_reads,
+            foreground_writes,
+            background_writes,
+            checkpoint_writes,
+            recovery_writes,
+            metadata_writes,
+            batched_reads: self.batched_reads.snapshot(),
+            batched_writes: self.batched_writes.snapshot(),
+            sync_calls: foreground_sync_calls
+                .saturating_add(checkpoint_sync_calls)
+                .saturating_add(recovery_sync_calls),
+            foreground_sync_calls,
+            checkpoint_sync_calls,
+            recovery_sync_calls,
+        }
+    }
+}
+
 /// File-backed page store. Pages are stored at offset `page_offset(pid)` in a
 /// single file. Uses `pread`/`pwrite` for positioned I/O (no fd-level mutex
 /// needed — the kernel handles concurrent positioned reads/writes).
@@ -509,6 +872,7 @@ pub struct FilePageStore {
     user_meta_1: AtomicU64,
     user_meta_2: AtomicU64,
     alloc_lock: Mutex<()>,
+    io_counters: PageStoreIoCounters,
 }
 
 #[cfg(not(miri))]
@@ -578,6 +942,7 @@ impl FilePageStore {
             user_meta_1: AtomicU64::new(user_meta_1),
             user_meta_2: AtomicU64::new(user_meta_2),
             alloc_lock: Mutex::new(()),
+            io_counters: PageStoreIoCounters::default(),
         })
     }
 
@@ -608,8 +973,56 @@ impl FilePageStore {
         page_offset(pid)
     }
 
+    fn pread_exact_for(
+        &self,
+        buf: &mut [u8],
+        offset: i64,
+        purpose: PageReadPurpose,
+    ) -> io::Result<()> {
+        pread_exact_observed(self.fd, buf, offset, |requested, completed| {
+            self.io_counters.record_read(purpose, requested, completed);
+        })
+    }
+
+    fn pwrite_exact_for(
+        &self,
+        data: &[u8],
+        offset: i64,
+        purpose: PageWritePurpose,
+    ) -> io::Result<()> {
+        pwrite_exact_observed(self.fd, data, offset, |requested, completed| {
+            self.io_counters.record_write(purpose, requested, completed);
+        })
+    }
+
+    fn read_page_for_purpose(
+        &self,
+        pid: PageId,
+        buf: &mut [u8],
+        purpose: PageReadPurpose,
+    ) -> io::Result<bool> {
+        validate_page_buf_len(pid, buf.len())?;
+        let off = Self::page_offset(pid);
+        match self.pread_exact_for(buf, off, purpose) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn write_page_for_purpose(
+        &self,
+        pid: PageId,
+        data: &[u8],
+        purpose: PageWritePurpose,
+    ) -> io::Result<()> {
+        validate_page_buf_len(pid, data.len())?;
+        let off = Self::page_offset(pid);
+        self.pwrite_exact_for(data, off, purpose)
+    }
+
     /// Flush the header page with the current page count and checkpoint LSN.
-    fn sync_header(&self) -> io::Result<()> {
+    fn sync_header_for(&self, purpose: PageWritePurpose) -> io::Result<()> {
         let count = self.page_count.load(Ordering::Relaxed);
         let ckpt = self.checkpoint_lsn.load(Ordering::Relaxed);
         let tmeta = self.user_meta_0.load(Ordering::Relaxed);
@@ -618,7 +1031,21 @@ impl FilePageStore {
         let hdr_data = Self::build_header(count, ckpt, tmeta, cmeta, extra);
         let mut hdr = AlignedPage([0u8; PAGE_SIZE]);
         hdr.0.copy_from_slice(&hdr_data);
-        pwrite_exact(self.fd, &hdr.0, 0)
+        self.pwrite_exact_for(&hdr.0, 0, purpose)
+    }
+
+    fn sync_for(&self, purpose: PageWritePurpose) -> io::Result<()> {
+        self.sync_header_for(purpose)?;
+        self.io_counters.record_sync(purpose);
+        if unsafe { libc::fsync(self.fd) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Return a cumulative snapshot of this store's exact I/O counters.
+    pub fn io_stats(&self) -> PageStoreIoStats {
+        self.io_counters.snapshot(self.direct_io)
     }
 
     /// Get the persisted checkpoint LSN.
@@ -663,19 +1090,29 @@ impl FilePageStore {
 #[cfg(not(miri))]
 impl PageStore for FilePageStore {
     fn read_page(&self, pid: PageId, buf: &mut [u8]) -> io::Result<bool> {
-        validate_page_buf_len(pid, buf.len())?;
-        let off = Self::page_offset(pid);
-        match pread_exact(self.fd, buf, off) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
-            Err(e) => Err(e),
-        }
+        self.read_page_for_purpose(pid, buf, PageReadPurpose::Foreground)
     }
 
     fn write_page(&self, pid: PageId, data: &[u8]) -> io::Result<()> {
-        validate_page_buf_len(pid, data.len())?;
-        let off = Self::page_offset(pid);
-        pwrite_exact(self.fd, data, off)
+        self.write_page_for_purpose(pid, data, PageWritePurpose::Foreground)
+    }
+
+    fn read_page_for(
+        &self,
+        pid: PageId,
+        buf: &mut [u8],
+        purpose: PageReadPurpose,
+    ) -> io::Result<bool> {
+        self.read_page_for_purpose(pid, buf, purpose)
+    }
+
+    fn write_page_for(
+        &self,
+        pid: PageId,
+        data: &[u8],
+        purpose: PageWritePurpose,
+    ) -> io::Result<()> {
+        self.write_page_for_purpose(pid, data, purpose)
     }
 
     fn allocate(&self, pid: PageId) -> io::Result<()> {
@@ -688,16 +1125,28 @@ impl PageStore for FilePageStore {
                 return Err(io::Error::last_os_error());
             }
             self.page_count.store(new_count, Ordering::Relaxed);
-            self.sync_header()?;
+            self.sync_header_for(PageWritePurpose::Metadata)?;
         }
 
         Ok(())
     }
 
     fn sync(&self) -> io::Result<()> {
-        self.sync_header()?;
-        if unsafe { libc::fsync(self.fd) } != 0 {
-            return Err(io::Error::last_os_error());
+        self.sync_for(PageWritePurpose::Foreground)
+    }
+
+    fn write_pages_and_sync(&self, pages: &[(PageId, &[u8])]) -> io::Result<()> {
+        self.io_counters.batched_writes.record(pages.len());
+        for &(pid, data) in pages {
+            self.write_page_for_purpose(pid, data, PageWritePurpose::Checkpoint)?;
+        }
+        self.sync_for(PageWritePurpose::Checkpoint)
+    }
+
+    fn write_pages(&self, pages: &[(PageId, &[u8])]) -> io::Result<()> {
+        self.io_counters.batched_writes.record(pages.len());
+        for &(pid, data) in pages {
+            self.write_page_for_purpose(pid, data, PageWritePurpose::Background)?;
         }
         Ok(())
     }
@@ -753,7 +1202,7 @@ impl BatchPageStore for FilePageStore {
 impl Drop for FilePageStore {
     fn drop(&mut self) {
         // Best-effort: ignore errors during drop.
-        let _ = self.sync_header();
+        let _ = self.sync_header_for(PageWritePurpose::Metadata);
         unsafe {
             libc::fsync(self.fd);
             libc::close(self.fd);
@@ -764,11 +1213,11 @@ impl Drop for FilePageStore {
 #[cfg(not(miri))]
 impl RecoveryPageStore for FilePageStore {
     fn read_page(&self, pid: PageId, buf: &mut [u8]) -> io::Result<bool> {
-        PageStore::read_page(self, pid, buf)
+        self.read_page_for_purpose(pid, buf, PageReadPurpose::Recovery)
     }
 
     fn write_page(&self, pid: PageId, data: &[u8]) -> io::Result<()> {
-        PageStore::write_page(self, pid, data)
+        self.write_page_for_purpose(pid, data, PageWritePurpose::Recovery)
     }
 
     fn allocate(&self, pid: PageId) -> io::Result<()> {
@@ -776,7 +1225,7 @@ impl RecoveryPageStore for FilePageStore {
     }
 
     fn sync(&self) -> io::Result<()> {
-        PageStore::sync(self)
+        self.sync_for(PageWritePurpose::Recovery)
     }
 
     fn next_page_id(&self) -> PageId {
@@ -790,13 +1239,25 @@ impl RecoveryPageStore for FilePageStore {
 
 #[cfg(not(miri))]
 fn pread_exact(fd: std::os::fd::RawFd, buf: &mut [u8], offset: i64) -> io::Result<()> {
+    pread_exact_observed(fd, buf, offset, |_, _| {})
+}
+
+#[cfg(not(miri))]
+fn pread_exact_observed(
+    fd: std::os::fd::RawFd,
+    buf: &mut [u8],
+    offset: i64,
+    mut observe: impl FnMut(usize, usize),
+) -> io::Result<()> {
+    let requested = buf.len();
     let mut done = 0usize;
     while done < buf.len() {
+        let remaining = buf.len() - done;
         let n = unsafe {
             libc::pread(
                 fd,
                 buf[done..].as_mut_ptr() as *mut libc::c_void,
-                buf.len() - done,
+                remaining,
                 offset + done as i64,
             )
         };
@@ -805,9 +1266,11 @@ fn pread_exact(fd: std::os::fd::RawFd, buf: &mut [u8], offset: i64) -> io::Resul
             if err.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
+            observe(requested, done);
             return Err(err);
         }
         if n == 0 {
+            observe(requested, done);
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 format!("pread: eof at offset {} (got {done}/{})", offset, buf.len()),
@@ -815,18 +1278,31 @@ fn pread_exact(fd: std::os::fd::RawFd, buf: &mut [u8], offset: i64) -> io::Resul
         }
         done += n as usize;
     }
+    observe(requested, done);
     Ok(())
 }
 
 #[cfg(not(miri))]
 fn pwrite_exact(fd: std::os::fd::RawFd, data: &[u8], offset: i64) -> io::Result<()> {
+    pwrite_exact_observed(fd, data, offset, |_, _| {})
+}
+
+#[cfg(not(miri))]
+fn pwrite_exact_observed(
+    fd: std::os::fd::RawFd,
+    data: &[u8],
+    offset: i64,
+    mut observe: impl FnMut(usize, usize),
+) -> io::Result<()> {
+    let requested = data.len();
     let mut done = 0usize;
     while done < data.len() {
+        let remaining = data.len() - done;
         let n = unsafe {
             libc::pwrite(
                 fd,
                 data[done..].as_ptr() as *const libc::c_void,
-                data.len() - done,
+                remaining,
                 offset + done as i64,
             )
         };
@@ -835,9 +1311,11 @@ fn pwrite_exact(fd: std::os::fd::RawFd, data: &[u8], offset: i64) -> io::Result<
             if err.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
+            observe(requested, done);
             return Err(err);
         }
         if n == 0 {
+            observe(requested, done);
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
                 format!(
@@ -849,6 +1327,7 @@ fn pwrite_exact(fd: std::os::fd::RawFd, data: &[u8], offset: i64) -> io::Result<
         }
         done += n as usize;
     }
+    observe(requested, done);
     Ok(())
 }
 
@@ -927,6 +1406,109 @@ mod tests {
                 "last byte of the page should roundtrip"
             );
         }
+    }
+
+    #[test]
+    fn io_stats_count_actual_syscall_requests_and_completions() {
+        let path = tmp_path("io_stats_exact_bytes");
+        let _c = Cleanup(path.clone());
+        let store = FilePageStore::open(&path).unwrap();
+        assert_eq!(
+            store.io_stats(),
+            PageStoreIoStats::default(),
+            "opening I/O should not pollute phase counters"
+        );
+        let before = store.io_stats();
+
+        let mut buf = vec![0u8; PAGE_SIZE];
+        assert!(
+            !PageStore::read_page(&store, 1, &mut buf).unwrap(),
+            "read beyond the file should report a miss"
+        );
+        PageStore::allocate(&store, 1).unwrap();
+        PageStore::write_page(&store, 1, &buf).unwrap();
+        assert!(PageStore::read_page(&store, 1, &mut buf).unwrap());
+
+        let stats = store.io_stats().delta_since(before);
+        assert_eq!(
+            stats.reads,
+            PageStoreOperationStats {
+                calls: 2,
+                requested_bytes: (PAGE_SIZE * 2) as u64,
+                completed_bytes: PAGE_SIZE as u64,
+            },
+            "the EOF syscall should count requested but not completed bytes"
+        );
+        assert_eq!(
+            stats.writes,
+            PageStoreOperationStats {
+                calls: 2,
+                requested_bytes: (PAGE_SIZE * 2) as u64,
+                completed_bytes: (PAGE_SIZE * 2) as u64,
+            },
+            "allocation metadata and the data page should both count"
+        );
+        assert_eq!(stats.foreground_reads, stats.reads);
+        assert_eq!(stats.foreground_writes.calls, 1);
+        assert_eq!(stats.metadata_writes.calls, 1);
+        assert_eq!(
+            stats.direct_reads.calls + stats.buffered_reads.calls,
+            stats.reads.calls
+        );
+        assert_eq!(
+            stats.direct_writes.calls + stats.buffered_writes.calls,
+            stats.writes.calls
+        );
+        assert_eq!(
+            store.io_stats().delta_since(store.io_stats()),
+            PageStoreIoStats::default(),
+            "equal snapshots should produce an empty phase delta"
+        );
+    }
+
+    #[test]
+    fn io_stats_separate_prefetch_background_checkpoint_and_recovery() {
+        let path = tmp_path("io_stats_purposes");
+        let _c = Cleanup(path.clone());
+        let store = FilePageStore::open(&path).unwrap();
+        PageStore::allocate(&store, 2).unwrap();
+        let before = store.io_stats();
+        let first = [1u8; PAGE_SIZE];
+        let second = [2u8; PAGE_SIZE];
+        let pages = [(1, first.as_slice()), (2, second.as_slice())];
+
+        PageStore::write_pages(&store, &pages).unwrap();
+        PageStore::write_pages_and_sync(&store, &pages).unwrap();
+        let mut buf = [0u8; PAGE_SIZE];
+        assert!(PageStore::read_page_for(&store, 1, &mut buf, PageReadPurpose::Prefetch).unwrap());
+        assert!(RecoveryPageStore::read_page(&store, 2, &mut buf).unwrap());
+        RecoveryPageStore::write_page(&store, 2, &second).unwrap();
+        RecoveryPageStore::sync(&store).unwrap();
+
+        let stats = store.io_stats().delta_since(before);
+        assert_eq!(stats.prefetch_reads.calls, 1);
+        assert_eq!(stats.recovery_reads.calls, 1);
+        assert_eq!(stats.foreground_reads.calls, 0);
+        assert_eq!(stats.background_writes.calls, 2);
+        assert_eq!(
+            stats.checkpoint_writes.calls, 3,
+            "checkpoint should count two pages and its header write"
+        );
+        assert_eq!(
+            stats.recovery_writes.calls, 2,
+            "recovery should count its page and final header write"
+        );
+        assert_eq!(stats.batched_reads, PageStoreBatchStats::default());
+        assert_eq!(
+            stats.batched_writes,
+            PageStoreBatchStats { calls: 2, pages: 4 }
+        );
+        assert_eq!(stats.sync_calls, 2);
+        assert_eq!(stats.checkpoint_sync_calls, 1);
+        assert_eq!(stats.recovery_sync_calls, 1);
+        assert_eq!(stats.writes.calls, 7);
+        assert_eq!(stats.writes.requested_bytes, (PAGE_SIZE * 7) as u64);
+        assert_eq!(stats.writes.completed_bytes, (PAGE_SIZE * 7) as u64);
     }
 
     #[test]

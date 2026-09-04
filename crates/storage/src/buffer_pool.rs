@@ -125,7 +125,7 @@ use crate::buffer_frame::{Lsn, PageId};
 use crate::free_page_allocator::{FreeExtent, FreePageAllocator};
 use crate::page_header::{self, PageType};
 use crate::page_provider;
-use crate::page_store::{InMemoryPageStore, PageStore};
+use crate::page_store::{InMemoryPageStore, PageReadPurpose, PageStore};
 use pagebox_swip_kernel::{AtomicSwipWord as AtomicSwip, SwipWord as Swip};
 
 static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
@@ -1568,7 +1568,7 @@ fn try_claim_prefetch_frame(
 fn read_prefetch_page(pool: &BufferPool, bf: *mut BufferFrame, pid: PageId) -> bool {
     let page = unsafe { (*bf).page_bytes_mut() };
     pool.page_store
-        .read_page(pid, page)
+        .read_page_for(pid, page, PageReadPurpose::Prefetch)
         .expect("prefetch read failed")
 }
 

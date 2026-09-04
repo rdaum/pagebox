@@ -13,7 +13,7 @@ use std::path::Path;
 use pagebox_btree::BTree;
 use pagebox_storage::buffer_pool::{BufferPool, BufferPoolHandle};
 use pagebox_storage::page_header::read_page_lsn;
-use pagebox_storage::page_store::{FilePageStore, PageStore};
+use pagebox_storage::page_store::{FilePageStore, PageStore, PageStoreIoStats};
 use pagebox_wal::Wal;
 
 pub use pagebox_frame_kernel::PAGE_SIZE;
@@ -298,6 +298,11 @@ impl KvStore {
     /// Whether the page-store data file is using direct I/O.
     pub fn direct_io_enabled(&self) -> bool {
         self.store.direct_io_enabled()
+    }
+
+    /// Cumulative exact data-file I/O counters since this store was opened.
+    pub fn page_store_io_stats(&self) -> PageStoreIoStats {
+        self.store.io_stats()
     }
 }
 
