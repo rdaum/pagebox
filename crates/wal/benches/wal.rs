@@ -73,7 +73,7 @@ fn io_group(
 }
 
 // ---------------------------------------------------------------------------
-// 1. Append-only — pure serialization + memcpy into the 256KB buffer
+// 1. Append-only — pure serialization + memcpy into the configured WAL buffer
 //
 // Not parameterized over backend because no I/O happens.
 // ---------------------------------------------------------------------------

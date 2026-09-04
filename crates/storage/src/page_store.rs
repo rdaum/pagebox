@@ -14,7 +14,7 @@
 //!   the `kvstore` binary's recovery dry-runs.
 //! - [`FilePageStore`] — single-file, positioned `pread`/`pwrite` backend with
 //!   `O_DIRECT` support and a header page at page 0 carrying the magic, page
-//!   count, checkpoint LSN, and two user-meta slots used by reopened trees.
+//!   count, checkpoint LSN, and three user-meta slots used by reopened trees.
 //!
 //! ## Header page layout (page 0)
 //!
@@ -29,13 +29,15 @@
 //!   bytes 40..48:  user_meta_2        (u64 LE) — user meta slot 2 (0 = unset)
 //! ```
 //!
-//! The `user_meta_*` slots are how reopened trees find their root: the
-//! B+tree writes its root page ID to `user_meta_0` and its height to
-//! `user_meta_1` on close, and the same is read back on reopen via
-//! `validate_header`. The constants and helpers live in this module under
-//! `pub(crate)`; the public face is on [`FilePageStore`] itself
-//! (`checkpoint_lsn` / `set_checkpoint_lsn` and the three `user_meta_*`
-//! getter/setter pairs).
+//! The `user_meta_*` slots are application-owned persistent metadata. The
+//! `kvstore` composition writes the B+tree's stable physical root page ID to
+//! `user_meta_0`, checkpointed height to `user_meta_1`, and checkpointed
+//! reachable-page count to `user_meta_2`. It updates these slots during an
+//! explicit checkpoint, not on close. After WAL replay, the B+tree derives
+//! height and reachability from the recovered physical root before serving
+//! requests. The constants and helpers live in this module under `pub(crate)`;
+//! the public face is on [`FilePageStore`] itself (`checkpoint_lsn` /
+//! `set_checkpoint_lsn` and the three `user_meta_*` getter/setter pairs).
 //!
 //! ## Direct I/O
 //!

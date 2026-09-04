@@ -1,9 +1,9 @@
+#[cfg(not(loom))]
+use crate::AtomicSwipWord;
 use crate::state::{COOL_BIT, EVICTED_BIT, classify_raw};
 use crate::word::{page_id_of, pointer_bits_of};
-use crate::{AtomicSwipWord, SwipState, SwipWord};
+use crate::{SwipState, SwipWord};
 
-#[cfg(loom)]
-use loom::sync::atomic::Ordering;
 #[cfg(not(loom))]
 use std::sync::atomic::Ordering;
 
@@ -43,6 +43,7 @@ fn cool_to_evicted_to_hot() {
 }
 
 #[test]
+#[cfg(not(loom))]
 fn atomic_compare_exchange_failure_preserves_current_value() {
     let atomic = AtomicSwipWord::new(SwipWord::evicted_page(7));
     let wrong = SwipWord::evicted_page(8);
@@ -104,6 +105,7 @@ fn resolve_ptr_roundtrip_preserves_pointer() {
 }
 
 #[test]
+#[cfg(not(loom))]
 fn cas_evicted_to_hot_succeeds() {
     let atomic = AtomicSwipWord::new(SwipWord::evicted_page(5));
     let result = atomic.compare_exchange(
@@ -119,6 +121,7 @@ fn cas_evicted_to_hot_succeeds() {
 }
 
 #[test]
+#[cfg(not(loom))]
 fn cas_hot_to_evicted_succeeds() {
     let atomic = AtomicSwipWord::new(SwipWord::hot_ptr(0x4000));
     let result = atomic.compare_exchange(

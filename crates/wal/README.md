@@ -26,6 +26,22 @@ WAL benchmarking support without depending on the storage crate.
 - `src/bin/profile_wal.rs` profiles WAL throughput and latency.
 - `benches/` contains WAL benchmarks.
 
+## Recovery and shutdown
+
+`Wal::recover_pages` applies Pagebox page images and page patches and returns
+an error if an uncheckpointed caller-defined logical record is present; it
+never silently discards that record. `Wal::recover_with_logical` performs the
+same page recovery and delivers each complete caller record above the
+checkpoint LSN to a callback in LSN order. Chunked records are reassembled,
+torn tails are ignored, and callback errors stop recovery without advancing a
+checkpoint or resetting the WAL.
+
+Dropping a WAL is a clean WAL shutdown: background work is drained, appended
+records are synced, and worker threads and file descriptors are closed. It is
+not a database checkpoint. The embedding layer remains responsible for
+flushing data pages, persisting structural metadata, advancing its checkpoint,
+and calling `Wal::reset` once the old records are obsolete.
+
 ## Used By
 
 - `pagebox-storage` for storage-level durability integration.

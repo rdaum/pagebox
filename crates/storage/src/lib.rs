@@ -33,7 +33,7 @@
 //!   [`page_store::InMemoryPageStore`] (tests) and
 //!   [`page_store::FilePageStore`] (single file, positioned `pread`/`pwrite`,
 //!   optional `O_DIRECT`). The header page (page 0) carries the magic, page
-//!   count, checkpoint LSN, and two user-meta slots used by reopened trees.
+//!   count, checkpoint LSN, and three user-meta slots used by reopened trees.
 //! - [`free_page_allocator`]: a sharded allocator with a central best-fit
 //!   freelist plus per-shard monotonic reservation. Reusable (promoted)
 //!   extents are consumed before monotonic growth; retired pages return to the

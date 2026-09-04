@@ -23,6 +23,11 @@ database-level types.
 - Hybrid latches protect concurrent traversal, updates, and publication.
 - Ordered, prefix, ascending-range, and descending-range scans are part of the
   public byte-oriented API.
+- The physical root page ID is stable for the tree's lifetime. A root split
+  WAL-logs two new child images before rewriting that same root page as an
+  inner node; root collapse copies the surviving child back into the same root
+  page. Recovery therefore uses the root page as structural authority and
+  derives height and reachable-page count after replay.
 
 ## Used By
 

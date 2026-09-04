@@ -59,8 +59,8 @@ that possible:
   access, and ordered range and prefix scans.
 - A **write-ahead log** with group commit, configurable sync backends, streaming
   replay, and crash recovery.
-- A **file-backed page store** with a free-page allocator, header-resident user
-  meta slots, and sync/fsync control.
+- A **file-backed page store** with a free-page allocator, three
+  header-resident user-meta slots, and sync/fsync control.
 - A single compile-time page size shared by the page store, buffer frames, WAL
   records, slotted pages, and B+tree nodes. Builds use 64 KiB by default;
   enable `page-4k` to build the complete workspace with 4 KiB pages.
@@ -117,7 +117,10 @@ cargo run -p kvstore -- checkpoint
 ```
 
 Data persists across process restarts via WAL recovery. Killing the process
-mid-write and reopening will recover committed page images from the WAL.
+mid-write and reopening recovers durable page images from the WAL. A clean WAL
+drop drains buffered appends and syncs them, but it does not flush dirty data
+pages, advance the page-store checkpoint, or reset the WAL; those are explicit
+`sync`/`checkpoint` operations at the composed `kvstore` layer.
 
 ## Telemetry
 
@@ -149,9 +152,19 @@ metrics = ["pagebox-storage/metrics", "pagebox-wal/metrics", "pagebox-btree/metr
 `kvstore` is a standalone durable key-value store built on top of pagestore.
 It's here to demonstrate the API. `cargo run -p kvstore` will exercise it.
 
-The open path mirrors a full database recovery sequence. Checkpoint flushes
-dirty pages, persists tree metadata into the store's user meta slots, 
-advances the checkpoint LSN, and resets the WAL.
+The open path mirrors a full database recovery sequence. The page store has
+three user-meta slots: `user_meta_0` names the B+tree's stable physical root,
+`user_meta_1` stores its checkpointed height, and `user_meta_2` stores its
+checkpointed reachable-page count. Root splits and collapses rewrite that same
+physical root page, so the root ID does not change. Recovery treats the root
+page as structural authority and rebuilds height and reachability after replay;
+the latter two slots are checkpoint hints rather than authoritative post-crash
+state.
+
+`checkpoint` flushes the WAL and dirty pages, writes the three tree metadata
+values, advances the checkpoint LSN, syncs the page-store header, and then
+resets the WAL. This is distinct from a clean process exit, which makes the WAL
+durable but deliberately leaves checkpoint establishment to the caller.
 
 ## Research Background
 

@@ -10,6 +10,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+    - name: Clippy (64 KiB)
+      run: cargo clippy --workspace --all-targets -- -D warnings
+    - name: Clippy (4 KiB)
+      run: cargo clippy --workspace --all-targets --features page-4k -- -D warnings
+
   build:
     runs-on: ubuntu-latest
     strategy:
@@ -26,3 +37,17 @@ jobs:
       run: cargo build --workspace --verbose ${{ matrix.feature_args }}
     - name: Run tests (${{ matrix.page_size }})
       run: cargo test --workspace --verbose ${{ matrix.feature_args }}
+
+  loom:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        crate:
+          - pagebox-hybrid-latch
+          - pagebox-swip-kernel
+    steps:
+    - uses: actions/checkout@v4
+    - name: Run loom models (${{ matrix.crate }})
+      env:
+        RUSTFLAGS: --cfg loom
+      run: cargo test -p ${{ matrix.crate }}
