@@ -176,11 +176,8 @@ impl KvStore {
     /// Insert or update a key-value pair. Returns `true` if the key was
     /// newly inserted, `false` if an existing value was updated.
     pub fn put(&self, key: &[u8], value: &[u8]) -> bool {
-        let inserted = self.tree.upsert(key, value);
-        if self.sync_mode == SyncMode::Strict {
-            self.wal.flush();
-        }
-        inserted
+        let result = self.tree.upsert(key, value);
+        self.finish_mutation(result)
     }
 
     /// Look up a key, returning an owned copy of the value.
@@ -190,7 +187,18 @@ impl KvStore {
 
     /// Delete a key. Returns `true` if the key was present.
     pub fn del(&self, key: &[u8]) -> bool {
-        self.tree.remove(key)
+        let result = self.tree.remove(key);
+        self.finish_mutation(result)
+    }
+
+    /// Complete one visible mutation according to this store's durability
+    /// mode. Strict completion means the mutation's WAL records are durable;
+    /// dirty data pages may remain buffered until sync or checkpoint.
+    fn finish_mutation<T>(&self, result: T) -> T {
+        if self.sync_mode == SyncMode::Strict {
+            self.wal.flush();
+        }
+        result
     }
 
     /// Ordered scan over all entries. Calls `f` per `(key, value)` pair.

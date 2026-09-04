@@ -8,7 +8,6 @@ use crate::engine::{CacheControl, EngineOpts, EngineStats, KvEngine, SyncMode};
 
 pub struct KvstoreAdapter {
     inner: KvStore,
-    sync_mode: SyncMode,
 }
 
 impl KvEngine for KvstoreAdapter {
@@ -59,10 +58,7 @@ impl KvEngine for KvstoreAdapter {
             })
             .tree_backend(tree_backend);
         let inner = KvStore::open_with(dir, &kv_opts)?;
-        Ok(Self {
-            inner,
-            sync_mode: opts.sync_mode,
-        })
+        Ok(Self { inner })
     }
 
     fn put(&self, key: &[u8], value: &[u8]) {
@@ -75,9 +71,6 @@ impl KvEngine for KvstoreAdapter {
 
     fn del(&self, key: &[u8]) {
         let _ = self.inner.del(key);
-        if self.sync_mode == SyncMode::Strict {
-            self.inner.flush_wal();
-        }
     }
 
     fn scan_range(&self, start: &[u8], end: &[u8], f: &mut dyn FnMut(&[u8], &[u8])) {
