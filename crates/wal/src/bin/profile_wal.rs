@@ -36,7 +36,7 @@ fn process_memory_kib() -> Vec<(&'static str, u64)> {
 fn page_data(seed: u64) -> [u8; PAGE_SIZE] {
     let mut buf = [0u8; PAGE_SIZE];
     let bytes = seed.to_le_bytes();
-    for chunk in buf.chunks_exact_mut(8) {
+    for chunk in buf.as_chunks_mut::<8>().0 {
         chunk.copy_from_slice(&bytes);
     }
     buf
