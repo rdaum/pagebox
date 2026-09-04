@@ -163,6 +163,9 @@ impl KvStore {
             BTree::open_with_page_count(pool.clone(), root, height, reachable_pages, opts.domain_id)
         });
         pool.register_dt(opts.domain_id, tree.clone());
+        if root != 0 {
+            tree.rebuild_recovered_metadata();
+        }
 
         Ok(Self {
             pool,

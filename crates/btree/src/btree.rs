@@ -98,6 +98,15 @@ impl BTree {
         }
     }
 
+    fn unswizzle_copied_inner_edges(node: &mut ResidentFrame<'_>) {
+        for pos in 0..node.num_slots() {
+            let child_pid = Self::swip_page_id(node.child_swip_at(pos));
+            node.set_child_swip_at(pos, Swip::evicted(child_pid));
+        }
+        let upper_pid = Self::swip_page_id(node.upper_swip());
+        node.set_upper(Swip::evicted(upper_pid));
+    }
+
     unsafe fn set_parent_link_for_edge(
         &self,
         child: &mut ResidentFrame<'_>,
@@ -219,13 +228,12 @@ impl BTree {
         drop(parent);
     }
 
-    fn clear_split_child_parent_link(&self, child: &SplitChild<'_>) {
-        let mut frame = child.clone_pin().exclusive();
-        frame.set_parent_link_none();
-    }
-
     unsafe fn try_pin_exclusive_resident_child(&self, swip: Swip) -> Option<ExclusiveFrame<'_>> {
-        let child = unsafe { self.pool().try_pin_resident_child(swip) }?;
+        let child = if swip.is_hot() || swip.is_cool() {
+            unsafe { self.pool().try_pin_resident_child(swip) }
+        } else {
+            unsafe { self.pool().try_fix_orphan_frame(swip.as_page_id()) }
+        }?;
         child.try_exclusive().ok()
     }
 
@@ -234,11 +242,15 @@ impl BTree {
         root: &mut ResidentFrame<'_>,
         child: &mut ResidentFrame<'_>,
     ) {
-        unsafe { self.meta_swip.store(child.hot_swip(), Ordering::Release) };
-        unsafe { self.set_root_parent_link(child) };
+        let mut child_page = TmpBuf::new();
+        child.copy_page_to(&mut child_page.0);
+        root.replace_page(&child_page.0);
+        if !root.is_leaf() {
+            Self::unswizzle_copied_inner_edges(root);
+        }
+        child.set_parent_link_none();
         self.height.fetch_sub(1, Ordering::Relaxed);
         self.reachable_pages.fetch_sub(1, Ordering::Relaxed);
-        root.set_parent_link_none();
     }
 
     unsafe fn unlink_merged_right_leaf(
@@ -490,65 +502,51 @@ impl BTree {
         seen.into_iter().collect()
     }
 
+    /// Rebuild process-local structural metadata from the recovered root.
+    ///
+    /// The physical root page is the durable structural authority. Height and
+    /// reachability counters are derived values and may have been checkpointed
+    /// before later WAL-recovered splits or collapses.
+    pub fn rebuild_recovered_metadata(&self) {
+        let recovered_height = self.recovered_height();
+        let recovered_pages = self.owned_page_ids().len() as u64;
+        self.height.store(recovered_height, Ordering::Relaxed);
+        self.reachable_pages
+            .store(recovered_pages, Ordering::Relaxed);
+    }
+
+    fn recovered_height(&self) -> u32 {
+        let pool = self.pool();
+        let mut page = pool.fix_stable(&self.meta_swip, unsafe { NoLatches::new(pool) });
+        let mut height = 0u32;
+        let mut seen = BTreeSet::new();
+
+        loop {
+            assert!(
+                seen.insert(page.pid()),
+                "cycle while deriving B+tree height from recovered root"
+            );
+            let frame = page.shared();
+            let resident = ResidentFrame::from_shared(&frame);
+            if resident.is_leaf() {
+                return height;
+            }
+            let child_pid = Self::swip_page_id(resident.upper_swip());
+            assert_ne!(child_pid, 0, "recovered inner root path has no upper child");
+            drop(frame);
+            page = unsafe { pool.fix_orphan_frame(child_pid, unsafe { NoLatches::new(pool) }) };
+            height = height
+                .checked_add(1)
+                .expect("recovered B+tree height exceeds u32");
+        }
+    }
+
     fn pool(&self) -> &BufferPool {
         self.pool.as_pool()
     }
 
     fn debug_child_page_ids(&self, node: &ExclusiveNode<'_, Inner>) -> Vec<u64> {
         node.child_page_ids()
-    }
-
-    unsafe fn set_root_parent_link(&self, root: &mut ResidentFrame<'_>) {
-        unsafe { root.set_parent_link_stable(&self.meta_swip) };
-    }
-
-    /// Atomically transfer the one stable root edge from the old pinned root
-    /// to `new_root`, then publish both old-root children as inner edges before
-    /// releasing any of the three pins.
-    ///
-    /// On CAS failure ownership is unchanged and the still-latched candidate
-    /// root is returned to the caller for unpublished-page retirement.
-    unsafe fn try_transfer_split_root<'pool>(
-        &self,
-        expected_root: Swip,
-        new_root: ExclusiveNode<'pool, Inner>,
-        left: &SplitChild<'pool>,
-        right: &mut SplitChild<'pool>,
-    ) -> Result<(), ExclusiveNode<'pool, Inner>> {
-        let new_root_word = new_root.resident_frame().hot_swip();
-        if unsafe {
-            self.meta_swip.compare_exchange(
-                expected_root,
-                new_root_word,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-        }
-        .is_err()
-        {
-            return Err(new_root);
-        }
-
-        // All three frames remain pinned. An evictor therefore cannot use the
-        // old root's stable backlink after the routing word has moved.
-        let mut root_frame = new_root.resident_frame();
-        unsafe { self.set_root_parent_link(&mut root_frame) };
-        unsafe { right.mark_published() };
-        let parent_count = new_root.num_slots();
-        let parent = new_root.into_pinned();
-        unsafe {
-            self.install_split_parent_hints(
-                left,
-                right,
-                parent,
-                SplitParentEdges {
-                    left: ParentEdge::Slot(0),
-                    right: ParentEdge::Upper,
-                },
-                parent_count,
-            )
-        };
-        Ok(())
     }
 
     unsafe fn set_inner_parent_link(
@@ -1142,6 +1140,9 @@ impl BTree {
                 }
                 let leaf =
                     ExclusiveNode::from_leaf_frame(shared.into_frame().into_pinned().exclusive());
+                if !leaf.resident_frame().is_leaf() {
+                    return Err(Restart);
+                }
                 if leaf.resident_frame().should_chase_right(key) {
                     let right_pid = leaf.right_pid();
                     if right_pid == 0 {
@@ -1195,6 +1196,9 @@ impl BTree {
                 }
                 let leaf =
                     ExclusiveNode::from_leaf_frame(shared.into_frame().into_pinned().exclusive());
+                if !leaf.resident_frame().is_leaf() {
+                    return Err(Restart);
+                }
                 if leaf.resident_frame().should_chase_right(key) {
                     let right_pid = leaf.right_pid();
                     if right_pid == 0 {
@@ -1310,6 +1314,8 @@ impl BTree {
         }
         let sp = node_frame.sp();
         let count = sp.num_slots();
+        let root_pid = self.root_page_id();
+        let is_root = root_pid == node_frame.pid();
         let mut successor_to_relink = 0;
         if count < 2 {
             // A leaf with a single entry that fills the page cannot be split
@@ -1333,6 +1339,18 @@ impl BTree {
             } else {
                 (existing_key.to_vec(), false)
             };
+            if is_root {
+                unsafe {
+                    self.split_single_entry_stable_root(
+                        node,
+                        &sep_key,
+                        move_existing_to_right,
+                        pre_root,
+                        pre_sibling,
+                    )
+                };
+                return;
+            }
             unsafe {
                 self.split_single_entry_leaf(
                     node,
@@ -1347,6 +1365,10 @@ impl BTree {
 
         let split_pos = count / 2;
         let sep_key = sp.get_key(split_pos).to_vec();
+        if is_root {
+            unsafe { self.split_stable_root(node, split_pos, &sep_key, pre_root, pre_sibling) };
+            return;
+        }
 
         // Use pre-allocated sibling frame if available (allocated before
         // the exclusive latch was acquired). Otherwise allocate under
@@ -1449,10 +1471,7 @@ impl BTree {
         node.mark_dirty();
         self.reachable_pages.fetch_add(1, Ordering::Relaxed);
 
-        // Now insert separator into parent.
-        // Check if this is a root split by CAS on meta_swip.
-        let current_root = self.meta_swip.load(Ordering::Acquire);
-        let is_root = Self::swip_page_id(current_root) == node_frame.pid();
+        // Now insert the separator into the parent. Root splits returned above.
         let left = SplitChild::from_exclusive(node);
         let mut right = SplitChild::from_unlinked(new_sibling.into_unlatched());
         if is_leaf {
@@ -1464,50 +1483,207 @@ impl BTree {
             unsafe { self.update_leaf_left_sibling(successor_to_relink, right.pid()) };
         }
 
-        if is_root {
-            // Root split: create new root.
-            let new_root = match pre_root {
-                Some(pre_root) => pre_root,
-                None => pool.allocate_unlinked(unsafe { NoLatches::new(pool) }),
-            };
-            let new_root = unsafe { new_root.exclusive().into_exclusive_frame() };
-            let mut new_root_frame = ResidentFrame::from_exclusive(&new_root);
-            new_root_frame.init(false);
-            let mut new_root = ExclusiveNode::from_inner_frame(new_root);
-            new_root.insert_separator(0, &sep_key, left.swip());
-            new_root.set_child_edge_swip(ParentEdge::Upper, right.swip());
-            new_root.mark_dirty();
-
-            match unsafe { self.try_transfer_split_root(current_root, new_root, &left, &mut right) }
-            {
-                Ok(()) => {
-                    self.height.fetch_add(1, Ordering::Relaxed);
-                    self.reachable_pages.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(new_root) => {
-                    // Another thread already changed the root.
-                    // Our split is still valid but we need to insert into
-                    // the actual parent instead. Keep both child latches held
-                    // until the parent routing is updated so the new left node
-                    // never becomes temporarily unreachable.
-                    let new_root = new_root.into_pinned();
-                    self.clear_split_child_parent_link(&left);
-                    self.clear_split_child_parent_link(&right);
-                    unsafe { pool.retire_unlinked_exclusive_frame(new_root.exclusive()) };
-                    unsafe {
-                        self.publish_leaf_split_to_parent(&sep_key, &left, &mut right, parent_path)
-                    };
-                }
-            }
-        } else {
-            // Non-root: find parent, latch it exclusively, then insert separator.
-            // Keep node_guard held until parent is updated so no traversal sees
-            // the split node without the parent routing correctly.
-            if let Some(pre_root) = pre_root {
-                drop(pre_root);
-            }
-            unsafe { self.publish_leaf_split_to_parent(&sep_key, &left, &mut right, parent_path) };
+        // Keep the node guard held until the parent is updated so no traversal
+        // sees the split node without the parent routing correctly.
+        if let Some(pre_root) = pre_root {
+            drop(pre_root);
         }
+        unsafe { self.publish_leaf_split_to_parent(&sep_key, &left, &mut right, parent_path) };
+    }
+
+    /// Split the stable physical root by copying both halves into new child
+    /// pages, then WAL-logging the root-page rewrite as the publication record.
+    /// Every durable prefix therefore contains either the complete old root or
+    /// both new children followed by the complete new root.
+    unsafe fn split_stable_root(
+        &self,
+        root: ExclusiveFrame<'_>,
+        split_pos: u16,
+        sep_key: &[u8],
+        pre_left: Option<NewUnlinkedPage<'_>>,
+        pre_right: Option<NewUnlinkedPage<'_>>,
+    ) {
+        let pool = self.pool();
+        let mut root_frame = ResidentFrame::from_exclusive(&root);
+        let root_pid = root_frame.pid();
+        let is_leaf = root_frame.is_leaf();
+        let count = root_frame.num_slots();
+
+        let left =
+            pre_left.unwrap_or_else(|| pool.allocate_unlinked(unsafe { NoLatches::new(pool) }));
+        let right =
+            pre_right.unwrap_or_else(|| pool.allocate_unlinked(unsafe { NoLatches::new(pool) }));
+        let left = left.exclusive();
+        let right = right.exclusive();
+        let mut left_frame = ResidentFrame::from_exclusive(left.frame());
+        let mut right_frame = ResidentFrame::from_exclusive(right.frame());
+        left_frame.init(is_leaf);
+        right_frame.init(is_leaf);
+
+        let mut successor_to_relink = 0;
+        if is_leaf {
+            let left_count = split_pos + 1;
+            let right_start = split_pos + 1;
+            let right_count = count - right_start;
+            let old_left_pid = root_frame.leaf_left_pid();
+            let old_right_pid = root_frame.leaf_right_pid();
+            let left_pid = left_frame.pid();
+            let right_pid = right_frame.pid();
+
+            {
+                let source = root_frame.sp();
+                left_frame
+                    .with_sp_mut(|target| source.copy_key_value_range(target, 0, 0, left_count));
+                right_frame.with_sp_mut(|target| {
+                    source.copy_key_value_range(target, 0, right_start, right_count)
+                });
+            }
+            left_frame.set_leaf_left_pid(old_left_pid);
+            left_frame.set_leaf_right_pid(right_pid);
+            right_frame.set_leaf_left_pid(left_pid);
+            right_frame.set_leaf_right_pid(old_right_pid);
+            successor_to_relink = old_right_pid;
+        } else {
+            let left_sep_count = split_pos;
+            let right_sep_start = split_pos + 1;
+            let right_sep_count = count - right_sep_start;
+            {
+                let source = root_frame.sp();
+                if left_sep_count > 0 {
+                    left_frame.with_sp_mut(|target| {
+                        source.copy_key_value_range(target, 0, 0, left_sep_count)
+                    });
+                }
+                if right_sep_count > 0 {
+                    right_frame.with_sp_mut(|target| {
+                        source.copy_key_value_range(target, 0, right_sep_start, right_sep_count)
+                    });
+                }
+            }
+            left_frame.set_upper(root_frame.child_swip_at(split_pos));
+            right_frame.set_upper(root_frame.upper_swip());
+            // The old root owns the live HOT edges until publication. The
+            // copied pages use page IDs so there is never a second HOT owner
+            // whose parent backlink an evictor could update independently.
+            Self::unswizzle_copied_inner_edges(&mut left_frame);
+            Self::unswizzle_copied_inner_edges(&mut right_frame);
+        }
+
+        // Child page images precede the root publication image in the WAL.
+        left.frame().mark_dirty();
+        right.frame().mark_dirty();
+        let left = left.into_unlatched();
+        let right = right.into_unlatched();
+        let left_swip = left.hot_swip();
+        let right_swip = right.hot_swip();
+        let right_pid = right.pid();
+
+        root_frame.init(false);
+        let mut root = ExclusiveNode::from_inner_frame(root);
+        root.insert_separator(0, sep_key, left_swip);
+        root.set_child_edge_swip(ParentEdge::Upper, right_swip);
+        root.mark_dirty();
+
+        let left = unsafe { left.finish_publication() };
+        let right = unsafe { right.finish_publication() };
+        drop(root);
+
+        let left = left.exclusive();
+        let mut left_frame = ResidentFrame::from_exclusive(&left);
+        left_frame.set_parent_link_inner(root_pid, 0, false, self.dt_id);
+        if !is_leaf {
+            let left = ExclusiveNode::from_inner_frame(left);
+            unsafe { self.refresh_inner_child_parent_links(&left) };
+        } else {
+            drop(left);
+        }
+
+        let right = right.exclusive();
+        let mut right_frame = ResidentFrame::from_exclusive(&right);
+        right_frame.set_parent_link_inner(root_pid, 1, true, self.dt_id);
+        if !is_leaf {
+            let right = ExclusiveNode::from_inner_frame(right);
+            unsafe { self.refresh_inner_child_parent_links(&right) };
+        } else {
+            drop(right);
+        }
+
+        if successor_to_relink != 0 {
+            unsafe { self.update_leaf_left_sibling(successor_to_relink, right_pid) };
+        }
+        self.height.fetch_add(1, Ordering::Relaxed);
+        self.reachable_pages.fetch_add(2, Ordering::Relaxed);
+    }
+
+    unsafe fn split_single_entry_stable_root(
+        &self,
+        root: ExclusiveFrame<'_>,
+        sep_key: &[u8],
+        move_existing_to_right: bool,
+        pre_left: Option<NewUnlinkedPage<'_>>,
+        pre_right: Option<NewUnlinkedPage<'_>>,
+    ) {
+        let pool = self.pool();
+        let root_frame = ResidentFrame::from_exclusive(&root);
+        let root_pid = root_frame.pid();
+        let old_left_pid = root_frame.leaf_left_pid();
+        let old_right_pid = root_frame.leaf_right_pid();
+
+        let left =
+            pre_left.unwrap_or_else(|| pool.allocate_unlinked(unsafe { NoLatches::new(pool) }));
+        let right =
+            pre_right.unwrap_or_else(|| pool.allocate_unlinked(unsafe { NoLatches::new(pool) }));
+        let left = left.exclusive();
+        let right = right.exclusive();
+        let mut left_frame = ResidentFrame::from_exclusive(left.frame());
+        let mut right_frame = ResidentFrame::from_exclusive(right.frame());
+        left_frame.init(true);
+        right_frame.init(true);
+
+        if move_existing_to_right {
+            let source = root_frame.sp();
+            right_frame.with_sp_mut(|target| source.copy_key_value_range(target, 0, 0, 1));
+        } else {
+            let source = root_frame.sp();
+            left_frame.with_sp_mut(|target| source.copy_key_value_range(target, 0, 0, 1));
+        }
+        let left_pid = left_frame.pid();
+        let right_pid = right_frame.pid();
+        left_frame.set_leaf_left_pid(old_left_pid);
+        left_frame.set_leaf_right_pid(right_pid);
+        right_frame.set_leaf_left_pid(left_pid);
+        right_frame.set_leaf_right_pid(old_right_pid);
+
+        left.frame().mark_dirty();
+        right.frame().mark_dirty();
+        let left = left.into_unlatched();
+        let right = right.into_unlatched();
+        let left_swip = left.hot_swip();
+        let right_swip = right.hot_swip();
+
+        let mut root_frame = ResidentFrame::from_exclusive(&root);
+        root_frame.init(false);
+        let mut root = ExclusiveNode::from_inner_frame(root);
+        root.insert_separator(0, sep_key, left_swip);
+        root.set_child_edge_swip(ParentEdge::Upper, right_swip);
+        root.mark_dirty();
+
+        let left = unsafe { left.finish_publication() };
+        let right = unsafe { right.finish_publication() };
+        drop(root);
+
+        let left = left.exclusive();
+        ResidentFrame::from_exclusive(&left).set_parent_link_inner(root_pid, 0, false, self.dt_id);
+        drop(left);
+        let right = right.exclusive();
+        ResidentFrame::from_exclusive(&right).set_parent_link_inner(root_pid, 1, true, self.dt_id);
+        drop(right);
+
+        if old_right_pid != 0 {
+            unsafe { self.update_leaf_left_sibling(old_right_pid, right_pid) };
+        }
+        self.height.fetch_add(1, Ordering::Relaxed);
+        self.reachable_pages.fetch_add(2, Ordering::Relaxed);
     }
 
     /// Handle the overflow case where a leaf has a single entry that fills
@@ -1587,8 +1763,6 @@ impl BTree {
         node.mark_dirty();
         self.reachable_pages.fetch_add(1, Ordering::Relaxed);
 
-        let current_root = self.meta_swip.load(Ordering::Acquire);
-        let is_root = Self::swip_page_id(current_root) == node_frame.pid();
         let left = SplitChild::from_exclusive(node);
         let mut right = SplitChild::from_unlinked(new_sibling.into_unlatched());
         // The left leaf's B-link already owns the sibling.
@@ -1597,35 +1771,7 @@ impl BTree {
             unsafe { self.update_leaf_left_sibling(old_right_pid, right.pid()) };
         }
 
-        if is_root {
-            let new_root = pool.allocate_unlinked(unsafe { NoLatches::new(pool) });
-            let new_root = unsafe { new_root.exclusive().into_exclusive_frame() };
-            let mut new_root_frame = ResidentFrame::from_exclusive(&new_root);
-            new_root_frame.init(false);
-            let mut new_root = ExclusiveNode::from_inner_frame(new_root);
-            new_root.insert_separator(0, sep_key, left.swip());
-            new_root.set_child_edge_swip(ParentEdge::Upper, right.swip());
-            new_root.mark_dirty();
-
-            match unsafe { self.try_transfer_split_root(current_root, new_root, &left, &mut right) }
-            {
-                Ok(()) => {
-                    self.height.fetch_add(1, Ordering::Relaxed);
-                    self.reachable_pages.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(new_root) => {
-                    let new_root = new_root.into_pinned();
-                    self.clear_split_child_parent_link(&left);
-                    self.clear_split_child_parent_link(&right);
-                    unsafe { pool.retire_unlinked_exclusive_frame(new_root.exclusive()) };
-                    unsafe {
-                        self.publish_leaf_split_to_parent(sep_key, &left, &mut right, parent_path)
-                    };
-                }
-            }
-        } else {
-            unsafe { self.publish_leaf_split_to_parent(sep_key, &left, &mut right, parent_path) };
-        }
+        unsafe { self.publish_leaf_split_to_parent(sep_key, &left, &mut right, parent_path) };
     }
 
     unsafe fn publish_leaf_split_to_parent(
@@ -2516,8 +2662,6 @@ impl BTree {
                         pos,
                     )
                 };
-                parent.mark_dirty();
-
                 drop(right);
 
                 let parent_is_root =
@@ -2527,8 +2671,10 @@ impl BTree {
                     unsafe {
                         self.collapse_empty_root_to_child(&mut parent_frame, &mut leaf_frame)
                     };
+                    parent.mark_dirty();
                     drop(parent);
                 } else if !parent_is_root && parent.is_underfull() {
+                    parent.mark_dirty();
                     drop(leaf);
                     let _ = unsafe { self.try_merge_inner_with_path(parent_path, parent) };
                     if successor_pid != 0 {
@@ -2536,6 +2682,7 @@ impl BTree {
                     }
                     return true;
                 } else {
+                    parent.mark_dirty();
                     drop(parent);
                 }
                 drop(leaf);
@@ -2575,8 +2722,6 @@ impl BTree {
                         replacement_key.as_deref(),
                     )
                 };
-                parent.mark_dirty();
-
                 leaf_frame.set_parent_link_none();
 
                 let parent_is_root =
@@ -2586,8 +2731,10 @@ impl BTree {
                     unsafe {
                         self.collapse_empty_root_to_child(&mut parent_frame, &mut left_frame)
                     };
+                    parent.mark_dirty();
                     drop(parent);
                 } else if !parent_is_root && parent.is_underfull() {
+                    parent.mark_dirty();
                     drop(left);
                     drop(leaf);
                     let _ = unsafe { self.try_merge_inner_with_path(parent_path, parent) };
@@ -2596,6 +2743,7 @@ impl BTree {
                     }
                     return true;
                 } else {
+                    parent.mark_dirty();
                     drop(parent);
                 }
                 drop(left);
@@ -2666,7 +2814,6 @@ impl BTree {
                         )
                     };
                 }
-                parent.mark_dirty();
                 drop(right);
 
                 let parent_is_root =
@@ -2676,9 +2823,13 @@ impl BTree {
                     unsafe {
                         self.collapse_empty_root_to_child(&mut parent_frame, &mut node_frame)
                     };
+                    parent.mark_dirty();
                     drop(parent);
                 } else if !parent_is_root && parent.is_underfull() {
+                    parent.mark_dirty();
                     let _ = unsafe { self.try_merge_inner_with_path(parent_path, parent) };
+                } else {
+                    parent.mark_dirty();
                 }
                 return true;
             }
@@ -2710,8 +2861,6 @@ impl BTree {
                         replacement_key.as_deref(),
                     )
                 };
-                parent.mark_dirty();
-
                 let parent_is_root =
                     Self::swip_page_id(self.meta_swip.load(Ordering::Acquire)) == parent.pid();
                 let parent_count = parent.num_slots();
@@ -2719,9 +2868,13 @@ impl BTree {
                     unsafe {
                         self.collapse_empty_root_to_child(&mut parent_frame, &mut left_frame)
                     };
+                    parent.mark_dirty();
                     drop(parent);
                 } else if !parent_is_root && parent.is_underfull() {
+                    parent.mark_dirty();
                     let _ = unsafe { self.try_merge_inner_with_path(parent_path, parent) };
+                } else {
+                    parent.mark_dirty();
                 }
                 return true;
             }
@@ -2803,6 +2956,10 @@ impl BTree {
 
             let _structural_guard = self.structural_lock.lock();
             let mut leaf = ExclusiveNode::from_leaf_frame(protected_leaf.exclusive());
+            if !leaf.resident_frame().is_leaf() {
+                attempts += 1;
+                continue;
+            }
             if leaf.resident_frame().should_chase_right(key) {
                 attempts += 1;
                 continue;
@@ -2820,6 +2977,8 @@ impl BTree {
             // reconstruction immediately needs to fault back in.
             let pool = self.pool();
             let pre_sibling = pool.allocate_unlinked(unsafe { NoLatches::new(pool) });
+            let pre_root_child = (protected_leaf.pid() == self.root_page_id())
+                .then(|| pool.allocate_unlinked(unsafe { NoLatches::new(pool) }));
 
             let (mut parent_path, mut leaf) = if attempts >= WRITE_BLOCKING_FALLBACK_THRESHOLD {
                 match unsafe { self.find_leaf_exclusive_with_path_fallback(key) } {
@@ -2827,6 +2986,7 @@ impl BTree {
                     Err(Restart) => {
                         drop(protected_leaf);
                         drop(pre_sibling);
+                        drop(pre_root_child);
                         self.stats.inc(BTreeEvent::InsertRestarts);
                         attempts += 1;
                         std::thread::yield_now();
@@ -2839,6 +2999,7 @@ impl BTree {
                     Err(Restart) => {
                         drop(protected_leaf);
                         drop(pre_sibling);
+                        drop(pre_root_child);
                         self.stats.inc(BTreeEvent::InsertRestarts);
                         attempts += 1;
                         continue;
@@ -2851,11 +3012,13 @@ impl BTree {
                 UpsertLeafAction::UpdatedExisting => {
                     drop(leaf);
                     drop(pre_sibling);
+                    drop(pre_root_child);
                     return false;
                 }
                 UpsertLeafAction::Inserted => {
                     drop(leaf);
                     drop(pre_sibling);
+                    drop(pre_root_child);
                     return true;
                 }
                 UpsertLeafAction::SplitRequired => unsafe {
@@ -2864,7 +3027,7 @@ impl BTree {
                         &mut parent_path,
                         Some(key),
                         Some(pre_sibling),
-                        None,
+                        pre_root_child,
                     );
                 },
             }
@@ -2917,6 +3080,10 @@ impl BTree {
 
             let _structural_guard = self.structural_lock.lock();
             let mut leaf = ExclusiveNode::from_leaf_frame(protected_leaf.exclusive());
+            if !leaf.resident_frame().is_leaf() {
+                attempts += 1;
+                continue;
+            }
             if leaf.resident_frame().should_chase_right(key) {
                 attempts += 1;
                 continue;
@@ -2932,6 +3099,8 @@ impl BTree {
             // the following path reconstruction.
             let pool = self.pool();
             let pre_sibling = pool.allocate_unlinked(unsafe { NoLatches::new(pool) });
+            let pre_root_child = (protected_leaf.pid() == self.root_page_id())
+                .then(|| pool.allocate_unlinked(unsafe { NoLatches::new(pool) }));
 
             let (mut parent_path, mut leaf) = if attempts >= WRITE_BLOCKING_FALLBACK_THRESHOLD {
                 match unsafe { self.find_leaf_exclusive_with_path_fallback(key) } {
@@ -2939,6 +3108,7 @@ impl BTree {
                     Err(Restart) => {
                         drop(protected_leaf);
                         drop(pre_sibling);
+                        drop(pre_root_child);
                         self.stats.inc(BTreeEvent::InsertRestarts);
                         attempts += 1;
                         std::thread::yield_now();
@@ -2951,6 +3121,7 @@ impl BTree {
                     Err(Restart) => {
                         drop(protected_leaf);
                         drop(pre_sibling);
+                        drop(pre_root_child);
                         self.stats.inc(BTreeEvent::InsertRestarts);
                         attempts += 1;
                         continue;
@@ -2963,11 +3134,13 @@ impl BTree {
                 InsertLeafAction::ReturnFalse => {
                     drop(leaf);
                     drop(pre_sibling);
+                    drop(pre_root_child);
                     return false;
                 }
                 InsertLeafAction::Inserted => {
                     drop(leaf);
                     drop(pre_sibling);
+                    drop(pre_root_child);
                     return true;
                 }
                 InsertLeafAction::SplitRequired => unsafe {
@@ -2976,7 +3149,7 @@ impl BTree {
                         &mut parent_path,
                         Some(key),
                         Some(pre_sibling),
-                        None,
+                        pre_root_child,
                     );
                 },
             }
@@ -3992,7 +4165,7 @@ mod tests {
     }
 
     #[test]
-    fn root_split_transfers_stable_backlink_to_new_root() {
+    fn root_split_keeps_stable_backlink_on_physical_root() {
         use pagebox_storage::buffer_frame::ParentLink;
 
         let pool = std::sync::Arc::new(BufferPool::new(32));
@@ -4005,75 +4178,29 @@ mod tests {
         }
 
         let new_root_pid = tree.root_page_id();
-        assert_ne!(new_root_pid, old_root_pid, "workload must split the root");
+        assert_eq!(new_root_pid, old_root_pid, "physical root must stay stable");
 
-        let new_root = pool
+        let root = pool
             .fix_stable(&tree.meta_swip, unsafe { NoLatches::new(&pool) })
             .shared();
         assert!(matches!(
-            new_root.read_ref().parent_link(),
+            root.read_ref().parent_link(),
             ParentLink::Stable(_)
         ));
-        drop(new_root);
-
-        let old_root =
-            unsafe { pool.fix_orphan_frame(old_root_pid, unsafe { NoLatches::new(&pool) }) }
-                .shared();
-        assert!(matches!(
-            old_root.read_ref().parent_link(),
-            ParentLink::InnerNode(_)
-        ));
-    }
-
-    #[test]
-    fn failed_root_transfer_preserves_owner_and_returns_unpublished_candidate() {
-        use pagebox_storage::buffer_frame::ParentLink;
-
-        let pool = std::sync::Arc::new(BufferPool::new(8));
-        let tree = BTree::new(&pool, 0);
-        let current_root = tree.meta_swip.load(Ordering::Acquire);
-
-        let left_edge = pool.allocate_page();
-        let right_edge = pool.allocate_page();
-        let left = SplitChild::from_exclusive(
-            pool.fix_stable(&left_edge, unsafe { NoLatches::new(&pool) })
-                .exclusive(),
-        );
-        let mut right = SplitChild::from_exclusive(
-            pool.fix_stable(&right_edge, unsafe { NoLatches::new(&pool) })
-                .exclusive(),
-        );
-
-        let candidate = pool.allocate_unlinked(unsafe { NoLatches::new(&pool) });
-        let candidate_pid = candidate.pid();
-        let candidate = unsafe { candidate.exclusive().into_exclusive_frame() };
-        let mut candidate_frame = ResidentFrame::from_exclusive(&candidate);
-        candidate_frame.init(false);
-        let candidate = ExclusiveNode::from_inner_frame(candidate);
-
-        let stale_expected = Swip::evicted(tree.root_page_id().wrapping_add(1));
-        let candidate =
-            unsafe { tree.try_transfer_split_root(stale_expected, candidate, &left, &mut right) }
-                .expect_err("stale root expectation must fail the ownership transfer");
-
-        assert_eq!(tree.meta_swip.load(Ordering::Acquire), current_root);
-        let candidate = candidate.into_frame();
-        assert!(matches!(
-            candidate.read_ref().parent_link(),
-            ParentLink::None
-        ));
-        assert!(matches!(
-            pool.try_fix_stable(&tree.meta_swip)
-                .expect("current root must remain resident")
-                .shared()
-                .read_ref()
-                .parent_link(),
-            ParentLink::Stable(_)
-        ));
-
-        let candidate = candidate.into_pinned().exclusive();
-        assert_eq!(candidate.pid(), candidate_pid);
-        unsafe { pool.retire_unlinked_exclusive_frame(candidate) };
+        let root = ResidentFrame::from_shared(&root);
+        assert!(!root.is_leaf(), "workload must split the root");
+        for child_pid in [
+            BTree::swip_page_id(root.child_swip_at(0)),
+            BTree::swip_page_id(root.upper_swip()),
+        ] {
+            let child =
+                unsafe { pool.fix_orphan_frame(child_pid, unsafe { NoLatches::new(&pool) }) }
+                    .shared();
+            assert!(matches!(
+                child.read_ref().parent_link(),
+                ParentLink::InnerNode(_)
+            ));
+        }
     }
 
     #[test]

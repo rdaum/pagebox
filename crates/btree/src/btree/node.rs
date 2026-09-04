@@ -4,7 +4,6 @@ use pagebox_hybrid_latch::{OptimisticGuard, Restart};
 
 use pagebox_storage::buffer_frame::{
     BufferFrameReadRef, BufferFrameRef, BufferFrameWriteRef, EvictingFrame, PAGE_SIZE, ParentLink,
-    StableSwip,
 };
 use pagebox_storage::buffer_pool::{
     BufferPool, ExclusiveFrame, NoLatches, OptimisticFrame, PinnedFrame, SharedFrame,
@@ -539,10 +538,6 @@ impl<'g> ResidentFrame<'g> {
         self.write_ref().set_parent_link_none();
     }
 
-    pub(crate) unsafe fn set_parent_link_stable(&mut self, meta_swip: &StableSwip) {
-        unsafe { self.write_ref().set_parent_link_stable(meta_swip) };
-    }
-
     pub(crate) fn set_parent_link_inner(
         &mut self,
         parent_pid: u64,
@@ -569,6 +564,10 @@ impl<'g> ResidentFrame<'g> {
 
     pub(crate) fn replace_page(&mut self, page: &[u8; PAGE_SIZE]) {
         self.write_ref().page_mut().copy_from_slice(page);
+    }
+
+    pub(crate) fn copy_page_to(&self, target: &mut [u8; PAGE_SIZE]) {
+        target.copy_from_slice(self.read_ref().page());
     }
 }
 
