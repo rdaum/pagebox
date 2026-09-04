@@ -54,6 +54,12 @@ enum UpsertLeafAction {
 }
 
 #[derive(Clone, Copy)]
+struct PendingLeafEntry<'a> {
+    key: &'a [u8],
+    value: &'a [u8],
+}
+
+#[derive(Clone, Copy)]
 struct SplitParentEdges {
     left: ParentEdge,
     right: ParentEdge,
@@ -1292,6 +1298,8 @@ impl BTree {
 
     /// Split a full node. The node must be exclusively latched.
     /// After return, the original node is unlatched and unpinned.
+    /// Returns `true` when a small-leaf split installed the pending entry
+    /// as part of the structural change; otherwise the caller must retry it.
     ///
     /// For non-root splits: finds the parent, latches parent exclusively,
     /// performs the split, inserts separator, then releases everything.
@@ -1300,10 +1308,10 @@ impl BTree {
         &self,
         node: ExclusiveFrame<'_>,
         parent_path: &mut Vec<PinnedFrame<'_>>,
-        pending_key: Option<&[u8]>,
+        pending_entry: Option<PendingLeafEntry<'_>>,
         pre_sibling: Option<NewUnlinkedPage<'_>>,
         pre_root: Option<NewUnlinkedPage<'_>>,
-    ) {
+    ) -> bool {
         let pool = self.pool();
         let mut node_frame = ResidentFrame::from_exclusive(&node);
         let is_leaf = node_frame.is_leaf();
@@ -1319,23 +1327,20 @@ impl BTree {
         let mut successor_to_relink = 0;
         if count < 2 {
             // A leaf with a single entry that fills the page cannot be split
-            // into two halves. Instead, allocate an empty sibling so the
-            // pending insert routes to the empty side. If no pending key is
-            // provided (inner node recursion), bail out — the caller will
-            // retry or the parent will be split instead.
+            // into two existing halves. Install the pending entry into the
+            // empty half before publication so concurrent split waiters
+            // cannot repeatedly split the same one-entry leaf into empty
+            // siblings. If no pending entry is provided (inner-node
+            // recursion), bail out and let the caller retry the parent split.
             if !is_leaf {
-                return;
+                return false;
             }
-            let Some(pending) = pending_key else {
-                return;
+            let Some(pending) = pending_entry else {
+                return false;
             };
             let existing_key = sp.get_key(0);
-            // If the pending key is less than the existing key, move the
-            // existing entry to the right sibling so the new entry lands in
-            // the (now empty) left node. Otherwise, keep the existing entry
-            // left and the new entry will route to the empty right sibling.
-            let (sep_key, move_existing_to_right) = if pending < existing_key {
-                (pending.to_vec(), true)
+            let (sep_key, move_existing_to_right) = if pending.key < existing_key {
+                (pending.key.to_vec(), true)
             } else {
                 (existing_key.to_vec(), false)
             };
@@ -1345,11 +1350,12 @@ impl BTree {
                         node,
                         &sep_key,
                         move_existing_to_right,
+                        pending,
                         pre_root,
                         pre_sibling,
                     )
                 };
-                return;
+                return true;
             }
             unsafe {
                 self.split_single_entry_leaf(
@@ -1357,17 +1363,37 @@ impl BTree {
                     parent_path,
                     &sep_key,
                     move_existing_to_right,
+                    pending,
                     pre_sibling,
                 );
             }
-            return;
+            return true;
         }
 
-        let split_pos = count / 2;
+        // A two-entry leaf needs special handling: the ordinary midpoint
+        // keeps both existing entries on the left. Choose the side from the
+        // pending key and install it during this split so the right page is
+        // never published empty. Larger leaves retain the established split
+        // rule and retry the pending insert after publication.
+        let pending_small_leaf = (is_leaf && count == 2).then_some(pending_entry).flatten();
+        let split_pos = if let Some(pending) = pending_small_leaf {
+            usize::from(pending.key >= sp.get_key(1)) as u16
+        } else {
+            count / 2
+        };
         let sep_key = sp.get_key(split_pos).to_vec();
         if is_root {
-            unsafe { self.split_stable_root(node, split_pos, &sep_key, pre_root, pre_sibling) };
-            return;
+            unsafe {
+                self.split_stable_root(
+                    node,
+                    split_pos,
+                    &sep_key,
+                    pending_small_leaf,
+                    pre_root,
+                    pre_sibling,
+                )
+            };
+            return pending_small_leaf.is_some();
         }
 
         // Use pre-allocated sibling frame if available (allocated before
@@ -1419,6 +1445,17 @@ impl BTree {
             );
 
             node_frame.replace_page(&tmp.0);
+            if let Some(pending) = pending_small_leaf {
+                if pending.key <= sep_key.as_slice() {
+                    let (pos, exact) = node_frame.lower_bound(pending.key);
+                    assert!(!exact, "split pending key must be absent");
+                    node_frame.insert(pos, pending.key, pending.value);
+                } else {
+                    let (pos, exact) = new_sibling_frame.lower_bound(pending.key);
+                    assert!(!exact, "split pending key must be absent");
+                    new_sibling_frame.insert(pos, pending.key, pending.value);
+                }
+            }
             successor_to_relink = old_right_pid;
         } else {
             // Inner node split:
@@ -1489,6 +1526,7 @@ impl BTree {
             drop(pre_root);
         }
         unsafe { self.publish_leaf_split_to_parent(&sep_key, &left, &mut right, parent_path) };
+        pending_small_leaf.is_some()
     }
 
     /// Split the stable physical root by copying both halves into new child
@@ -1500,6 +1538,7 @@ impl BTree {
         root: ExclusiveFrame<'_>,
         split_pos: u16,
         sep_key: &[u8],
+        pending_entry: Option<PendingLeafEntry<'_>>,
         pre_left: Option<NewUnlinkedPage<'_>>,
         pre_right: Option<NewUnlinkedPage<'_>>,
     ) {
@@ -1542,6 +1581,17 @@ impl BTree {
             left_frame.set_leaf_right_pid(right_pid);
             right_frame.set_leaf_left_pid(left_pid);
             right_frame.set_leaf_right_pid(old_right_pid);
+            if let Some(pending) = pending_entry {
+                if pending.key <= sep_key {
+                    let (pos, exact) = left_frame.lower_bound(pending.key);
+                    assert!(!exact, "split pending key must be absent");
+                    left_frame.insert(pos, pending.key, pending.value);
+                } else {
+                    let (pos, exact) = right_frame.lower_bound(pending.key);
+                    assert!(!exact, "split pending key must be absent");
+                    right_frame.insert(pos, pending.key, pending.value);
+                }
+            }
             successor_to_relink = old_right_pid;
         } else {
             let left_sep_count = split_pos;
@@ -1620,6 +1670,7 @@ impl BTree {
         root: ExclusiveFrame<'_>,
         sep_key: &[u8],
         move_existing_to_right: bool,
+        pending: PendingLeafEntry<'_>,
         pre_left: Option<NewUnlinkedPage<'_>>,
         pre_right: Option<NewUnlinkedPage<'_>>,
     ) {
@@ -1643,9 +1694,11 @@ impl BTree {
         if move_existing_to_right {
             let source = root_frame.sp();
             right_frame.with_sp_mut(|target| source.copy_key_value_range(target, 0, 0, 1));
+            left_frame.insert(0, pending.key, pending.value);
         } else {
             let source = root_frame.sp();
             left_frame.with_sp_mut(|target| source.copy_key_value_range(target, 0, 0, 1));
+            right_frame.insert(0, pending.key, pending.value);
         }
         let left_pid = left_frame.pid();
         let right_pid = right_frame.pid();
@@ -1688,19 +1741,19 @@ impl BTree {
 
     /// Handle the overflow case where a leaf has a single entry that fills
     /// the page and a new entry cannot fit alongside it. Allocates a sibling
-    /// leaf and publishes the split to the parent, so the pending insert
-    /// can route to the empty side on retry.
+    /// leaf and publishes both entries as part of the split.
     ///
     /// If `move_existing_to_right` is true, the existing entry is moved to
-    /// the right sibling and the left node is left empty (for cases where
-    /// the pending key is smaller than the existing key). Otherwise the
-    /// existing entry stays in the left node and the right sibling is empty.
+    /// the right sibling and the pending entry is installed in the left.
+    /// Otherwise the existing entry stays left and the pending entry is
+    /// installed in the right sibling.
     unsafe fn split_single_entry_leaf(
         &self,
         node: ExclusiveFrame<'_>,
         parent_path: &mut Vec<PinnedFrame<'_>>,
         sep_key: &[u8],
         move_existing_to_right: bool,
+        pending: PendingLeafEntry<'_>,
         pre_sibling: Option<NewUnlinkedPage<'_>>,
     ) {
         let pool = self.pool();
@@ -1739,8 +1792,10 @@ impl BTree {
                 pagebox_storage::slotted_page::PageType::Index,
             );
             node_frame.replace_page(&tmp.0);
+            node_frame.insert(0, pending.key, pending.value);
         } else {
-            // Keep the existing entry in the left node; right sibling is empty.
+            // Keep the existing entry in the left node and install the
+            // pending entry in the right sibling.
             let mut tmp = TmpBuf::new();
             let tmp_sp = SlottedPage::init(&mut tmp.0);
             tmp_sp.reserve_suffix(16);
@@ -1755,6 +1810,7 @@ impl BTree {
                 pagebox_storage::slotted_page::PageType::Index,
             );
             node_frame.replace_page(&tmp.0);
+            new_sibling_frame.insert(0, pending.key, pending.value);
         }
 
         new_sibling_frame.set_leaf_left_pid(node_pid);
@@ -3022,13 +3078,15 @@ impl BTree {
                     return true;
                 }
                 UpsertLeafAction::SplitRequired => unsafe {
-                    self.split_node(
+                    if self.split_node(
                         leaf.into_frame(),
                         &mut parent_path,
-                        Some(key),
+                        Some(PendingLeafEntry { key, value }),
                         Some(pre_sibling),
                         pre_root_child,
-                    );
+                    ) {
+                        return true;
+                    }
                 },
             }
         }
@@ -3144,13 +3202,15 @@ impl BTree {
                     return true;
                 }
                 InsertLeafAction::SplitRequired => unsafe {
-                    self.split_node(
+                    if self.split_node(
                         leaf.into_frame(),
                         &mut parent_path,
-                        Some(key),
+                        Some(PendingLeafEntry { key, value }),
                         Some(pre_sibling),
                         pre_root_child,
-                    );
+                    ) {
+                        return true;
+                    }
                 },
             }
         }
@@ -4891,6 +4951,82 @@ mod tests {
             0,
             "split retries must not leave allocated resident frames unreachable"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "page-4k")]
+    fn concurrent_fat_value_growth_completes_under_eviction_pressure() {
+        const KEYS: u64 = 2_048;
+        const THREADS: usize = 4;
+        const POOL_FRAMES: usize = 512;
+
+        let pool = Arc::new(BufferPool::new(POOL_FRAMES));
+        let tree = Arc::new(BTree::new(&pool, 0));
+        pool.register_dt(0, tree.clone());
+        let next = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let tree = tree.clone();
+                let next = next.clone();
+                let done_tx = done_tx.clone();
+                thread::spawn(move || {
+                    let value = [0x5c; FAT_VALUE_SIZE];
+                    loop {
+                        let key = next.fetch_add(1, Ordering::Relaxed);
+                        if key >= KEYS {
+                            break;
+                        }
+                        assert!(tree.upsert(&key.to_be_bytes(), &value));
+                    }
+                    done_tx.send(()).unwrap();
+                })
+            })
+            .collect();
+        drop(done_tx);
+
+        for _ in 0..THREADS {
+            if done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_err()
+            {
+                eprintln!(
+                    "concurrent fat-value growth stalled: next_key={} height={} reachable={:?} tree={:?} pool={:?}",
+                    next.load(Ordering::Relaxed),
+                    tree.height(),
+                    tree.reachable_page_count(),
+                    tree.diagnostic_stats(),
+                    pool.diagnostic_stats(),
+                );
+                std::process::abort();
+            }
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let mut count = 0usize;
+        tree.scan(|key, value| {
+            assert_eq!(value, &[0x5c; FAT_VALUE_SIZE]);
+            assert_eq!(key.len(), 8);
+            count += 1;
+        });
+        assert_eq!(count, KEYS as usize, "concurrent growth lost keys");
+        let reachable = tree.reachable_page_count().unwrap() as usize;
+        assert_eq!(
+            reachable,
+            tree.owned_page_ids().len(),
+            "maintained reachability must match a quiescent tree walk"
+        );
+        assert!(
+            reachable <= KEYS as usize + 64,
+            "balanced splits must not amplify {KEYS} keys into {reachable} pages"
+        );
+        assert!(
+            pool.eviction_count() > 0,
+            "test must exercise eviction during concurrent growth"
+        );
+        pool.unregister_dt(0);
     }
 
     #[test]
