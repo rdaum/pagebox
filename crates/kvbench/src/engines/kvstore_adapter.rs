@@ -143,17 +143,57 @@ impl KvEngine for KvstoreAdapter {
                 buffer.eviction_final_lock_wait_ns,
             ),
             ("dirty_flush_batches", buffer.dirty_flush_batches),
+            (
+                "foreground_dirty_flush_batches",
+                buffer.foreground_dirty_flush_batches,
+            ),
+            (
+                "background_dirty_flush_batches",
+                buffer.background_dirty_flush_batches,
+            ),
             ("dirty_flush_pages", buffer.dirty_flush_pages),
+            (
+                "foreground_dirty_flush_pages",
+                buffer.foreground_dirty_flush_pages,
+            ),
+            (
+                "background_dirty_flush_pages",
+                buffer.background_dirty_flush_pages,
+            ),
             ("dirty_flush_wal_wait_ns", buffer.dirty_flush_wal_wait_ns),
             (
                 "dirty_flush_data_write_ns",
                 buffer.dirty_flush_data_write_ns,
             ),
             (
+                "foreground_dirty_flush_data_write_ns",
+                buffer.foreground_dirty_flush_data_write_ns,
+            ),
+            (
+                "background_dirty_flush_data_write_ns",
+                buffer.background_dirty_flush_data_write_ns,
+            ),
+            (
                 "dirty_flush_cleaned_pages",
                 buffer.dirty_flush_cleaned_pages,
             ),
+            (
+                "foreground_dirty_flush_cleaned_pages",
+                buffer.foreground_dirty_flush_cleaned_pages,
+            ),
+            (
+                "background_dirty_flush_cleaned_pages",
+                buffer.background_dirty_flush_cleaned_pages,
+            ),
             ("dirty_flush_stale_pages", buffer.dirty_flush_stale_pages),
+            (
+                "foreground_dirty_flush_stale_pages",
+                buffer.foreground_dirty_flush_stale_pages,
+            ),
+            (
+                "background_dirty_flush_stale_pages",
+                buffer.background_dirty_flush_stale_pages,
+            ),
             (
                 "dirty_wal_page_patch_records",
                 buffer.dirty_wal_page_patch_records,

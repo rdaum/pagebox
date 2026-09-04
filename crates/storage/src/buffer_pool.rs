@@ -371,10 +371,12 @@ struct AlignedPageCopy {
     len: usize,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "metrics", derive(DeriveLabel))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "metrics", label_name = "dirty_flush_mode")]
 enum DirtyFlushMode {
-    ForceWal,
-    AlreadyDurable,
+    Foreground,
+    Background,
 }
 
 impl AlignedPageCopy {
@@ -641,8 +643,8 @@ impl BufferPoolHandle {
     pub fn new(pool: Arc<BufferPool>) -> Self {
         let _ = pool.self_weak.set(Arc::downgrade(&pool));
         let handle = Self { inner: pool };
-        if background_page_provider_enabled() {
-            handle.start_background_dirty_cleaner();
+        if let Some(config) = background_page_provider_config(handle.num_frames()) {
+            handle.start_background_dirty_cleaner_with(config);
         }
         handle
     }
@@ -661,6 +663,16 @@ impl BufferPoolHandle {
     pub fn start_background_dirty_cleaner(&self) {
         let weak = Arc::downgrade(&self.inner);
         self.inner.page_provider.lock().unwrap().start(weak);
+    }
+
+    /// Start background dirty-page writeback with an explicit bounded policy.
+    pub fn start_background_dirty_cleaner_with(&self, config: page_provider::DirtyCleanerConfig) {
+        let weak = Arc::downgrade(&self.inner);
+        self.inner
+            .page_provider
+            .lock()
+            .unwrap()
+            .start_with_config(weak, config);
     }
 }
 
@@ -699,21 +711,40 @@ enum UnswizzleParentEvent {
 unsafe impl Send for BufferPool {}
 unsafe impl Sync for BufferPool {}
 
-fn background_page_provider_enabled() -> bool {
-    static VALUE: OnceLock<bool> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        // Disabled by default. Embedders that need continuous no-steal
-        // writeback should use BufferPoolHandle::start_background_dirty_cleaner.
-        // This remains an opt-in experiment switch for standalone use.
-        // Set PAGEBOX_ENABLE_BACKGROUND_PAGE_PROVIDER=1 to enable for
-        // experiments.
-        matches!(
-            std::env::var("PAGEBOX_ENABLE_BACKGROUND_PAGE_PROVIDER")
-                .ok()
-                .as_deref(),
-            Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
-        )
-    })
+fn background_page_provider_config(num_frames: usize) -> Option<page_provider::DirtyCleanerConfig> {
+    // Disabled by default. Embedders should prefer the explicit handle API;
+    // these process-wide knobs exist for standalone controlled experiments.
+    if !matches!(
+        std::env::var("PAGEBOX_ENABLE_BACKGROUND_PAGE_PROVIDER")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    ) {
+        return None;
+    }
+
+    fn env_usize(name: &str, default: usize) -> usize {
+        std::env::var(name).map_or(default, |raw| {
+            raw.parse::<usize>()
+                .unwrap_or_else(|_| panic!("{name} must be a non-negative integer"))
+        })
+    }
+
+    let mut config = page_provider::DirtyCleanerConfig::for_pool(num_frames);
+    config.target_free_frames = env_usize(
+        "PAGEBOX_DIRTY_CLEANER_TARGET_FREE_FRAMES",
+        config.target_free_frames,
+    );
+    config.batch_size = env_usize("PAGEBOX_DIRTY_CLEANER_BATCH_SIZE", config.batch_size);
+    config.min_idle_wait = Duration::from_micros(env_usize(
+        "PAGEBOX_DIRTY_CLEANER_MIN_IDLE_WAIT_US",
+        config.min_idle_wait.as_micros() as usize,
+    ) as u64);
+    config.max_idle_wait = Duration::from_micros(env_usize(
+        "PAGEBOX_DIRTY_CLEANER_MAX_IDLE_WAIT_US",
+        config.max_idle_wait.as_micros() as usize,
+    ) as u64);
+    Some(config)
 }
 
 type EvictionReadGuard<'a> = parking_lot::lock_api::RwLockReadGuard<'a, parking_lot::RawRwLock, ()>;
@@ -844,9 +875,9 @@ struct BufferPoolMetrics {
     #[cfg_attr(feature = "metrics", help = "Encoded bytes in dirty WAL page patches")]
     dirty_wal_page_patch_bytes: Counter,
     #[cfg_attr(feature = "metrics", help = "Dirty writeback batches")]
-    dirty_flush_batches: Counter,
+    dirty_flush_batches: LabeledCounter<DirtyFlushMode>,
     #[cfg_attr(feature = "metrics", help = "Pages copied for dirty writeback")]
-    dirty_flush_pages: Counter,
+    dirty_flush_pages: LabeledCounter<DirtyFlushMode>,
     #[cfg_attr(
         feature = "metrics",
         help = "Nanoseconds spent waiting for WAL durability during dirty writeback"
@@ -856,17 +887,17 @@ struct BufferPoolMetrics {
         feature = "metrics",
         help = "Nanoseconds spent writing dirty pages to the page store"
     )]
-    dirty_flush_data_write_ns: Counter,
+    dirty_flush_data_write_ns: LabeledCounter<DirtyFlushMode>,
     #[cfg_attr(
         feature = "metrics",
         help = "Dirty pages cleaned at their copied mutation generation"
     )]
-    dirty_flush_cleaned_pages: Counter,
+    dirty_flush_cleaned_pages: LabeledCounter<DirtyFlushMode>,
     #[cfg_attr(
         feature = "metrics",
         help = "Dirty-page copies stale after writeback I/O"
     )]
-    dirty_flush_stale_pages: Counter,
+    dirty_flush_stale_pages: LabeledCounter<DirtyFlushMode>,
     #[cfg_attr(
         feature = "metrics",
         help = "Hot frame transition wait latency in nanoseconds"
@@ -926,12 +957,12 @@ impl BufferPoolMetrics {
             dirty_wal_page_image_relog_pages: LabeledCounter::new(shards),
             dirty_wal_page_patch_records: Counter::new(shards),
             dirty_wal_page_patch_bytes: Counter::new(shards),
-            dirty_flush_batches: Counter::new(shards),
-            dirty_flush_pages: Counter::new(shards),
+            dirty_flush_batches: LabeledCounter::new(shards),
+            dirty_flush_pages: LabeledCounter::new(shards),
             dirty_flush_wal_wait_ns: Counter::new(shards),
-            dirty_flush_data_write_ns: Counter::new(shards),
-            dirty_flush_cleaned_pages: Counter::new(shards),
-            dirty_flush_stale_pages: Counter::new(shards),
+            dirty_flush_data_write_ns: LabeledCounter::new(shards),
+            dirty_flush_cleaned_pages: LabeledCounter::new(shards),
+            dirty_flush_stale_pages: LabeledCounter::new(shards),
             hot_frame_transition_wait_latency: Histogram::new(
                 &buffer_pool_latency_bounds_ns(),
                 shards,
@@ -4540,7 +4571,7 @@ impl BufferPool {
         &self,
         max_batch: usize,
     ) -> std::io::Result<usize> {
-        self.try_flush_dirty_batch_inner(max_batch, DirtyFlushMode::AlreadyDurable)
+        self.try_flush_dirty_batch_inner(max_batch, DirtyFlushMode::Background)
     }
 
     pub(crate) fn has_dirty_resident_pages_for_provider(&self) -> bool {
@@ -4774,7 +4805,7 @@ impl BufferPool {
     #[cfg(not(miri))]
     /// Return the number of pages that actually transitioned to clean.
     fn try_flush_dirty_batch(&self, max_batch: usize) -> std::io::Result<usize> {
-        self.try_flush_dirty_batch_inner(max_batch, DirtyFlushMode::ForceWal)
+        self.try_flush_dirty_batch_inner(max_batch, DirtyFlushMode::Foreground)
     }
 
     #[cfg(not(miri))]
@@ -4833,7 +4864,7 @@ impl BufferPool {
 
             let pid = unsafe { (*bf).header.core.pid };
             let page_lsn = unsafe { (*bf).header.core.page_lsn.load(Ordering::Relaxed) };
-            if mode == DirtyFlushMode::AlreadyDurable
+            if mode == DirtyFlushMode::Background
                 && pool
                     .wal
                     .as_ref()
@@ -4910,8 +4941,9 @@ impl BufferPool {
             return Ok(0);
         }
 
-        self.metrics.dirty_flush_batches.inc();
+        self.metrics.dirty_flush_batches.inc(mode);
         self.metrics.dirty_flush_pages.add(
+            mode,
             dirty_pages
                 .len()
                 .min(isize::MAX as usize)
@@ -4920,7 +4952,7 @@ impl BufferPool {
         );
 
         #[cfg(not(miri))]
-        if mode == DirtyFlushMode::ForceWal
+        if mode == DirtyFlushMode::Foreground
             && max_lsn > 0
             && let Some(ref wal) = self.wal
         {
@@ -4941,6 +4973,7 @@ impl BufferPool {
         let write_started = Instant::now();
         self.page_store.write_pages(&pages)?;
         self.metrics.dirty_flush_data_write_ns.add(
+            mode,
             saturating_duration_nanos(write_started.elapsed()).min(isize::MAX as u64) as isize,
         );
 
@@ -4962,10 +4995,10 @@ impl BufferPool {
         let stale = dirty_pages.len() - cleaned;
         self.metrics
             .dirty_flush_cleaned_pages
-            .add(cleaned.min(isize::MAX as usize) as isize);
+            .add(mode, cleaned.min(isize::MAX as usize) as isize);
         self.metrics
             .dirty_flush_stale_pages
-            .add(stale.min(isize::MAX as usize) as isize);
+            .add(mode, stale.min(isize::MAX as usize) as isize);
 
         Ok(cleaned)
     }
@@ -5648,6 +5681,56 @@ impl BufferPool {
                 eviction_allowed_frames += u64::from(eviction_allowed);
             }
         }
+        let foreground_dirty_flush_batches = self
+            .metrics
+            .dirty_flush_batches
+            .get(DirtyFlushMode::Foreground)
+            .max(0) as u64;
+        let background_dirty_flush_batches = self
+            .metrics
+            .dirty_flush_batches
+            .get(DirtyFlushMode::Background)
+            .max(0) as u64;
+        let foreground_dirty_flush_pages = self
+            .metrics
+            .dirty_flush_pages
+            .get(DirtyFlushMode::Foreground)
+            .max(0) as u64;
+        let background_dirty_flush_pages = self
+            .metrics
+            .dirty_flush_pages
+            .get(DirtyFlushMode::Background)
+            .max(0) as u64;
+        let foreground_dirty_flush_data_write_ns = self
+            .metrics
+            .dirty_flush_data_write_ns
+            .get(DirtyFlushMode::Foreground)
+            .max(0) as u64;
+        let background_dirty_flush_data_write_ns = self
+            .metrics
+            .dirty_flush_data_write_ns
+            .get(DirtyFlushMode::Background)
+            .max(0) as u64;
+        let foreground_dirty_flush_cleaned_pages = self
+            .metrics
+            .dirty_flush_cleaned_pages
+            .get(DirtyFlushMode::Foreground)
+            .max(0) as u64;
+        let background_dirty_flush_cleaned_pages = self
+            .metrics
+            .dirty_flush_cleaned_pages
+            .get(DirtyFlushMode::Background)
+            .max(0) as u64;
+        let foreground_dirty_flush_stale_pages = self
+            .metrics
+            .dirty_flush_stale_pages
+            .get(DirtyFlushMode::Foreground)
+            .max(0) as u64;
+        let background_dirty_flush_stale_pages = self
+            .metrics
+            .dirty_flush_stale_pages
+            .get(DirtyFlushMode::Background)
+            .max(0) as u64;
         BufferPoolDiagnosticStats {
             inner_index_loads: loaded(BufferPoolLoadedPageKind::InnerIndex),
             leaf_index_loads: loaded(BufferPoolLoadedPageKind::LeafIndex),
@@ -5693,12 +5776,27 @@ impl BufferPool {
             eviction_final_lock_waits: self.metrics.eviction_final_lock_waits.sum().max(0) as u64,
             eviction_final_lock_wait_ns: self.metrics.eviction_final_lock_wait_ns.sum().max(0)
                 as u64,
-            dirty_flush_batches: self.metrics.dirty_flush_batches.sum().max(0) as u64,
-            dirty_flush_pages: self.metrics.dirty_flush_pages.sum().max(0) as u64,
+            dirty_flush_batches: foreground_dirty_flush_batches
+                .saturating_add(background_dirty_flush_batches),
+            foreground_dirty_flush_batches,
+            background_dirty_flush_batches,
+            dirty_flush_pages: foreground_dirty_flush_pages
+                .saturating_add(background_dirty_flush_pages),
+            foreground_dirty_flush_pages,
+            background_dirty_flush_pages,
             dirty_flush_wal_wait_ns: self.metrics.dirty_flush_wal_wait_ns.sum().max(0) as u64,
-            dirty_flush_data_write_ns: self.metrics.dirty_flush_data_write_ns.sum().max(0) as u64,
-            dirty_flush_cleaned_pages: self.metrics.dirty_flush_cleaned_pages.sum().max(0) as u64,
-            dirty_flush_stale_pages: self.metrics.dirty_flush_stale_pages.sum().max(0) as u64,
+            dirty_flush_data_write_ns: foreground_dirty_flush_data_write_ns
+                .saturating_add(background_dirty_flush_data_write_ns),
+            foreground_dirty_flush_data_write_ns,
+            background_dirty_flush_data_write_ns,
+            dirty_flush_cleaned_pages: foreground_dirty_flush_cleaned_pages
+                .saturating_add(background_dirty_flush_cleaned_pages),
+            foreground_dirty_flush_cleaned_pages,
+            background_dirty_flush_cleaned_pages,
+            dirty_flush_stale_pages: foreground_dirty_flush_stale_pages
+                .saturating_add(background_dirty_flush_stale_pages),
+            foreground_dirty_flush_stale_pages,
+            background_dirty_flush_stale_pages,
             dirty_wal_page_patch_records: self.metrics.dirty_wal_page_patch_records.sum().max(0)
                 as u64,
             dirty_wal_page_patch_bytes: self.metrics.dirty_wal_page_patch_bytes.sum().max(0) as u64,
@@ -5854,11 +5952,21 @@ pub struct BufferPoolDiagnosticStats {
     pub eviction_final_lock_waits: u64,
     pub eviction_final_lock_wait_ns: u64,
     pub dirty_flush_batches: u64,
+    pub foreground_dirty_flush_batches: u64,
+    pub background_dirty_flush_batches: u64,
     pub dirty_flush_pages: u64,
+    pub foreground_dirty_flush_pages: u64,
+    pub background_dirty_flush_pages: u64,
     pub dirty_flush_wal_wait_ns: u64,
     pub dirty_flush_data_write_ns: u64,
+    pub foreground_dirty_flush_data_write_ns: u64,
+    pub background_dirty_flush_data_write_ns: u64,
     pub dirty_flush_cleaned_pages: u64,
+    pub foreground_dirty_flush_cleaned_pages: u64,
+    pub background_dirty_flush_cleaned_pages: u64,
     pub dirty_flush_stale_pages: u64,
+    pub foreground_dirty_flush_stale_pages: u64,
+    pub background_dirty_flush_stale_pages: u64,
     pub dirty_wal_page_patch_records: u64,
     pub dirty_wal_page_patch_bytes: u64,
 }
@@ -6926,10 +7034,20 @@ mod tests {
 
         let diagnostics = pool.diagnostic_stats();
         assert_eq!(diagnostics.dirty_flush_batches, 2);
+        assert_eq!(diagnostics.foreground_dirty_flush_batches, 2);
+        assert_eq!(diagnostics.background_dirty_flush_batches, 0);
         assert_eq!(diagnostics.dirty_flush_pages, 2);
+        assert_eq!(diagnostics.foreground_dirty_flush_pages, 2);
+        assert_eq!(diagnostics.background_dirty_flush_pages, 0);
         assert_eq!(diagnostics.dirty_flush_cleaned_pages, 1);
+        assert_eq!(diagnostics.foreground_dirty_flush_cleaned_pages, 1);
+        assert_eq!(diagnostics.background_dirty_flush_cleaned_pages, 0);
         assert_eq!(diagnostics.dirty_flush_stale_pages, 1);
+        assert_eq!(diagnostics.foreground_dirty_flush_stale_pages, 1);
+        assert_eq!(diagnostics.background_dirty_flush_stale_pages, 0);
         assert!(diagnostics.dirty_flush_data_write_ns > 0);
+        assert!(diagnostics.foreground_dirty_flush_data_write_ns > 0);
+        assert_eq!(diagnostics.background_dirty_flush_data_write_ns, 0);
     }
 
     #[test]
@@ -7014,6 +7132,12 @@ mod tests {
             edges.len() as u64,
             "the cleaner must leave eviction to the foreground parent-unswizzle path"
         );
+        assert!(diagnostics.background_dirty_flush_batches > 0);
+        assert_eq!(diagnostics.foreground_dirty_flush_batches, 0);
+        assert_eq!(
+            diagnostics.background_dirty_flush_cleaned_pages,
+            edges.len() as u64
+        );
     }
 
     #[test]
@@ -7055,6 +7179,11 @@ mod tests {
             );
         }
         assert_eq!(pool.try_flush_dirty_batch_for_provider(1).unwrap(), 0);
+        let diagnostics = pool.diagnostic_stats();
+        assert_eq!(diagnostics.background_dirty_flush_batches, 3);
+        assert_eq!(diagnostics.background_dirty_flush_pages, 3);
+        assert_eq!(diagnostics.background_dirty_flush_cleaned_pages, 3);
+        assert_eq!(diagnostics.foreground_dirty_flush_batches, 0);
     }
 
     #[test]
