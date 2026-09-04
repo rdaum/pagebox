@@ -1,4 +1,4 @@
-//! Key-distribution generators: uniform, zipfian, latest.
+//! Key-distribution generators: uniform, zipfian, hotspot, latest.
 //!
 //! All generators are deterministic given a seed and `record_count`. Per-run
 //! reproducibility is a hard requirement: a failing bench must be exactly
@@ -15,6 +15,12 @@ pub enum Distribution {
     Uniform,
     /// Zipfian: hot-key skew, theta in `(0, 1)`. Default theta = 0.99 (YCSB).
     Zipfian { theta: f64 },
+    /// Hotspot: `hot_operation_fraction` of accesses target the lowest
+    /// `hot_data_fraction` of keys.
+    Hotspot {
+        hot_data_fraction: f64,
+        hot_operation_fraction: f64,
+    },
     /// Latest: recency-biased toward recently-inserted keys.
     Latest,
 }
@@ -31,7 +37,46 @@ impl Distribution {
             Self::Zipfian { theta } => {
                 KeySampler::Zipfian(ZipfianGen::new(record_count, *theta, seed))
             }
+            Self::Hotspot {
+                hot_data_fraction,
+                hot_operation_fraction,
+            } => KeySampler::Hotspot(HotspotGen::new(
+                record_count,
+                *hot_data_fraction,
+                *hot_operation_fraction,
+                seed,
+            )),
             Self::Latest => KeySampler::Latest(LatestGen::new(record_count, seed)),
+        }
+    }
+
+    /// Validate parameters before binding the distribution to a key range.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Uniform | Self::Latest => Ok(()),
+            Self::Zipfian { theta } if theta.is_finite() && *theta > 0.0 && *theta < 1.0 => Ok(()),
+            Self::Zipfian { theta } => Err(format!(
+                "zipfian theta must be finite and in (0, 1), got {theta}"
+            )),
+            Self::Hotspot {
+                hot_data_fraction,
+                hot_operation_fraction,
+            } if hot_data_fraction.is_finite()
+                && *hot_data_fraction > 0.0
+                && *hot_data_fraction < 1.0
+                && hot_operation_fraction.is_finite()
+                && (0.0..=1.0).contains(hot_operation_fraction) =>
+            {
+                Ok(())
+            }
+            Self::Hotspot {
+                hot_data_fraction,
+                hot_operation_fraction,
+            } => Err(format!(
+                "hotspot fractions require finite hot_data_fraction in (0, 1) and \
+                 hot_operation_fraction in [0, 1], got {hot_data_fraction} and \
+                 {hot_operation_fraction}"
+            )),
         }
     }
 }
@@ -41,6 +86,7 @@ impl Distribution {
 pub enum KeySampler {
     Uniform(UniformGen),
     Zipfian(ZipfianGen),
+    Hotspot(HotspotGen),
     Latest(LatestGen),
 }
 
@@ -50,6 +96,7 @@ impl KeySampler {
         match self {
             Self::Uniform(g) => g.sample(op_index),
             Self::Zipfian(g) => g.sample(op_index),
+            Self::Hotspot(g) => g.sample(op_index),
             Self::Latest(g) => g.sample(op_index),
         }
     }
@@ -161,6 +208,53 @@ fn sample_cdf(cdf: &[f64], u: f64) -> usize {
         }
     }
     lo.min(cdf.len().saturating_sub(1))
+}
+
+// ---------------------------------------------------------------------------
+// Hotspot
+// ---------------------------------------------------------------------------
+
+/// Two-region hot/cold generator compatible with the YCSB hotspot model.
+pub struct HotspotGen {
+    record_count: u64,
+    hot_key_count: u64,
+    hot_operation_fraction: f64,
+    seed: u64,
+}
+
+impl HotspotGen {
+    pub fn new(
+        record_count: u64,
+        hot_data_fraction: f64,
+        hot_operation_fraction: f64,
+        seed: u64,
+    ) -> Self {
+        let record_count = record_count.max(1);
+        let hot_key_count =
+            ((record_count as f64 * hot_data_fraction).ceil() as u64).clamp(1, record_count);
+        Self {
+            record_count,
+            hot_key_count,
+            hot_operation_fraction,
+            seed,
+        }
+    }
+
+    pub fn sample(&self, op_index: u64) -> u64 {
+        let region_hash = hash64(self.seed.wrapping_add(op_index));
+        let key_hash = hash64(
+            self.seed
+                .wrapping_add(op_index)
+                .wrapping_add(0xd1b5_4a32_d192_ed03),
+        );
+        let choose_hot = (region_hash as f64) / (u64::MAX as f64) < self.hot_operation_fraction;
+        let cold_key_count = self.record_count - self.hot_key_count;
+        if choose_hot || cold_key_count == 0 {
+            key_hash % self.hot_key_count
+        } else {
+            self.hot_key_count + key_hash % cold_key_count
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +382,37 @@ mod tests {
             pct > 30.0,
             "zipfian top-1% should be >30% of probes, got {:.1}%",
             pct
+        );
+    }
+
+    #[test]
+    fn hotspot_targets_configured_hot_and_cold_regions() {
+        let sampler = HotspotGen::new(10_000, 0.2, 0.8, 123);
+        let hot = (0..100_000).filter(|&i| sampler.sample(i) < 2_000).count();
+        assert!(
+            (78_000..82_000).contains(&hot),
+            "80% hotspot selection should produce about 80k hot accesses, got {hot}"
+        );
+    }
+
+    #[test]
+    fn distribution_parameters_reject_invalid_fractions() {
+        assert!(Distribution::Zipfian { theta: 0.0 }.validate().is_err());
+        assert!(
+            Distribution::Hotspot {
+                hot_data_fraction: 0.0,
+                hot_operation_fraction: 0.8,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Distribution::Hotspot {
+                hot_data_fraction: 0.2,
+                hot_operation_fraction: 1.1,
+            }
+            .validate()
+            .is_err()
         );
     }
 

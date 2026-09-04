@@ -379,6 +379,7 @@ pub fn validate_spec(spec: &WorkloadSpec) -> Result<(), String> {
     if spec.operation_count == 0 {
         return Err("operation_count must be greater than zero".to_string());
     }
+    spec.distribution.validate()?;
     if matches!(spec.workload, Workload::FillRandom | Workload::FillSeq)
         && spec.operation_count != spec.record_count
     {
